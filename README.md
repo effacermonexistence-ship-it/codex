@@ -33,6 +33,20 @@ pnpm run deploy
 The GitHub workflows do not need Cloudflare access keys or repository secrets.
 They obtain short-lived GitHub OIDC tokens for each upload request.
 
+## Claude Code
+
+Claude Code uses the authenticated GitHub CLI for repository operations and the
+official Cloudflare API MCP server or Wrangler for R2 operations. On a new Mac:
+
+```bash
+./scripts/bootstrap-claude-code.sh
+claude auth login
+gh auth login --hostname github.com --git-protocol https --web
+```
+
+Start Claude Code in this repository and run `/mcp` once to authorize the
+`cloudflare-api` server. No GitHub PAT or Cloudflare API token is committed.
+
 ## Restore on a new computer
 
 Install Git, Node.js, and Python 3, then run:
