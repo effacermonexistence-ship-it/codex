@@ -90,6 +90,7 @@ jobs:
                   headers = {
                       "Accept": "application/json",
                       "Authorization": f"Bearer {oidc_token()}",
+                      "User-Agent": "github-actions-r2-backup/1.0",
                   }
                   if data is not None:
                       headers["Content-Type"] = content_type
