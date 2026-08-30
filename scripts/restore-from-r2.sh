@@ -58,7 +58,7 @@ if ! download_manifest; then
   download_manifest
 fi
 
-readarray -t manifest_values < <(
+IFS=$'\t' read -r bundle_key expected_sha256 source_ref < <(
   python3 - "$manifest_path" "$backup_owner/$repository_name" <<'PY'
 import json
 import re
@@ -78,17 +78,16 @@ if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
     raise SystemExit("The R2 manifest has an invalid checksum")
 if not isinstance(ref, str):
     raise SystemExit("The R2 manifest has an invalid ref")
-print(key)
-print(sha256)
-print(ref)
+print(key, sha256, ref, sep="\t")
 PY
 )
 
-readonly bundle_key="${manifest_values[0]}"
-readonly expected_sha256="${manifest_values[1]}"
-readonly source_ref="${manifest_values[2]}"
+readonly bundle_key
+readonly expected_sha256
+readonly source_ref
 readonly bundle_path="$restore_tmp/repository.bundle"
 readonly mirror_path="$restore_tmp/repository.git"
+readonly verify_path="$restore_tmp/verify.git"
 
 "${wrangler_command[@]}" r2 object get \
   "$backup_bucket/$bundle_key" \
@@ -112,7 +111,8 @@ if [[ "$actual_sha256" != "$expected_sha256" ]]; then
   exit 1
 fi
 
-git bundle verify "$bundle_path"
+git init --bare "$verify_path"
+git --git-dir="$verify_path" bundle verify "$bundle_path"
 git clone --bare "$bundle_path" "$mirror_path"
 
 while read -r object_id bundled_ref; do
