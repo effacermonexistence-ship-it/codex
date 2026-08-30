@@ -4,6 +4,29 @@ This project keeps every `effacermonexistence` GitHub repository mirrored as a
 verified Git bundle in the private Cloudflare R2 bucket
 `omar-private-archive`.
 
+## New Mac: one bootstrap command
+
+The durable setup lives in this public repository, not in a laptop or an AI
+account's memory. On a new Mac, download and run the reviewed bootstrap:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/effacermonexistence/codex/main/scripts/bootstrap-new-mac.sh \
+  -o /tmp/omar-bootstrap-new-mac.sh
+sed -n '1,260p' /tmp/omar-bootstrap-new-mac.sh
+bash /tmp/omar-bootstrap-new-mac.sh
+```
+
+It installs the repository under `~/Documents/Codex/codex`, installs Claude
+Code and GitHub CLI when missing, configures the Cloudflare MCP endpoint, and
+copies durable non-secret guidance to `~/.codex/AGENTS.md` and
+`~/.claude/CLAUDE.md`. Existing instruction files are backed up before they are
+replaced.
+
+OAuth credentials are intentionally not copied or committed. Sign in once per
+new Mac to Codex/ChatGPT, GitHub, Claude, and Cloudflare. The GitHub-to-R2
+workflow itself needs no laptop login because it uses GitHub Actions OIDC.
+
 The GitHub workflow uses GitHub Actions OIDC. No long-lived Cloudflare or R2
 credential is stored in GitHub. The Worker accepts only tokens issued for
 `effacermonexistence` repositories running

@@ -7,6 +7,12 @@ readonly gh_version="2.98.0"
 mkdir -p "$install_dir"
 export PATH="$install_dir:$PATH"
 
+profile_file="$HOME/.zprofile"
+path_line='export PATH="$HOME/.local/bin:$PATH"'
+if [[ ! -f "$profile_file" ]] || ! grep -Fqx "$path_line" "$profile_file"; then
+  printf '\n%s\n' "$path_line" >> "$profile_file"
+fi
+
 if ! command -v claude >/dev/null 2>&1; then
   curl -fsSL https://claude.ai/install.sh | bash
 fi
@@ -57,3 +63,4 @@ fi
 echo "Claude Code: $(claude --version)"
 echo "GitHub CLI: $(gh --version | head -1)"
 echo "Cloudflare MCP: configured"
+echo "PATH persistence: $profile_file"
