@@ -6,6 +6,8 @@ readonly repo_name="codex"
 readonly repo_branch="main"
 readonly default_install_root="$HOME/Documents/Codex/codex"
 readonly install_root="${OMAR_CODEX_HOME:-$default_install_root}"
+readonly codex_config_dir="${OMAR_CODEX_CONFIG_DIR:-$HOME/.codex}"
+readonly claude_config_dir="${OMAR_CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 readonly archive_url="https://github.com/${repo_owner}/${repo_name}/archive/refs/heads/${repo_branch}.tar.gz"
 
 bootstrap_tmp="$(mktemp -d)"
@@ -50,13 +52,13 @@ install_with_backup() {
   install -m 0644 "$source_file" "$destination_file"
 }
 
-install_with_backup "$install_root/codex/AGENTS.md" "$HOME/.codex/AGENTS.md"
-install_with_backup "$install_root/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
+install_with_backup "$install_root/codex/AGENTS.md" "$codex_config_dir/AGENTS.md"
+install_with_backup "$install_root/CLAUDE.md" "$claude_config_dir/CLAUDE.md"
 
 echo
 echo "Installed durable setup at: $install_root"
-echo "Installed Codex instructions: $HOME/.codex/AGENTS.md"
-echo "Installed Claude instructions: $HOME/.claude/CLAUDE.md"
+echo "Installed Codex instructions: $codex_config_dir/AGENTS.md"
+echo "Installed Claude instructions: $claude_config_dir/CLAUDE.md"
 echo
 echo "One-time logins still required on each new Mac:"
 echo "  Codex/ChatGPT: sign in to the Codex or ChatGPT desktop app"
