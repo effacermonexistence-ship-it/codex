@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "omar-git-r2-backup",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-29",
+  "compatibility_flags": ["nodejs_compat"],
+  "r2_buckets": [
+    {
+      "binding": "GIT_BACKUPS",
+      "bucket_name": "omar-private-archive"
+    }
+  ],
+  "vars": {
+    "ALLOWED_OWNER": "effacermonexistence",
+    "OIDC_AUDIENCE": "r2-git-backup"
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.1
+    }
+  }
+}
