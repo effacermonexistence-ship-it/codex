@@ -83,8 +83,28 @@ check_file "$repo_root/package.json" "project package"
 check_file "$repo_root/wrangler.jsonc" "wrangler config"
 check_file "$repo_root/codex/AGENTS.md" "durable Codex guidance"
 check_file "$repo_root/CLAUDE.md" "durable Claude guidance"
+check_file "$repo_root/claude/settings.json" "durable Claude settings"
+check_file "$repo_root/claude/hooks/remote-backup-guard.mjs" "durable remote guard"
 check_file "$codex_config_dir/AGENTS.md" "installed Codex guidance"
 check_file "$claude_config_dir/CLAUDE.md" "installed Claude guidance"
+check_file "$claude_config_dir/settings.json" "installed Claude settings"
+check_file "$claude_config_dir/hooks/remote-backup-guard.mjs" "installed remote guard"
+
+if [[ -f "$repo_root/CLAUDE.md" && -f "$claude_config_dir/CLAUDE.md" ]]; then
+  if cmp -s "$repo_root/CLAUDE.md" "$claude_config_dir/CLAUDE.md"; then
+    add_check pass "Claude guidance sync" "durable and installed CLAUDE.md match"
+  else
+    add_check fail "Claude guidance sync" "installed CLAUDE.md differs from the durable source"
+  fi
+fi
+
+if [[ -f "$repo_root/claude/hooks/remote-backup-guard.mjs" && -f "$claude_config_dir/hooks/remote-backup-guard.mjs" ]]; then
+  if cmp -s "$repo_root/claude/hooks/remote-backup-guard.mjs" "$claude_config_dir/hooks/remote-backup-guard.mjs"; then
+    add_check pass "remote guard sync" "durable and installed hooks match"
+  else
+    add_check fail "remote guard sync" "installed remote guard differs from the durable source"
+  fi
+fi
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   add_check pass "macOS host" "$(sw_vers -productVersion 2>/dev/null || uname -r)"

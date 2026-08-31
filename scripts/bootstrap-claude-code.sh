@@ -4,6 +4,9 @@ set -euo pipefail
 readonly install_dir="$HOME/.local/bin"
 readonly gh_version="2.98.0"
 readonly node_version="24.20.0"
+readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly project_root="$(cd "$script_dir/.." && pwd)"
+readonly claude_config_dir="${OMAR_CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 bootstrap_tmp="$(mktemp -d)"
 cleanup() {
@@ -12,7 +15,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$install_dir"
-export PATH="$install_dir:$PATH"
+export PATH="$HOME/.local/share/node-v${node_version}/bin:$install_dir:$PATH"
 
 profile_file="$HOME/.zprofile"
 path_line="export PATH=\"\$HOME/.local/share/node-v${node_version}/bin:\$HOME/.local/bin:\$PATH\""
@@ -73,7 +76,26 @@ if ! gh auth status >/dev/null 2>&1; then
   echo "GitHub login is required: gh auth login --hostname github.com --git-protocol https --web"
 fi
 
+for required_path in \
+  "$project_root/claude/hooks/remote-backup-guard.mjs" \
+  "$project_root/claude/settings.json" \
+  "$project_root/scripts/install-claude-remote-backup-hook.mjs"; do
+  if [[ ! -f "$required_path" ]]; then
+    echo "Missing Claude remote completion component: $required_path" >&2
+    exit 1
+  fi
+done
+
+mkdir -p "$claude_config_dir/hooks"
+install -m 0755 \
+  "$project_root/claude/hooks/remote-backup-guard.mjs" \
+  "$claude_config_dir/hooks/remote-backup-guard.mjs"
+node "$project_root/scripts/install-claude-remote-backup-hook.mjs" \
+  "$project_root/claude/settings.json" \
+  "$claude_config_dir/settings.json"
+
 echo "Claude Code: $(claude --version)"
 echo "GitHub CLI: $(gh --version | head -1)"
 echo "Cloudflare MCP: configured (OAuth is checked separately)"
+echo "Remote completion guard: configured"
 echo "PATH persistence: $profile_file"

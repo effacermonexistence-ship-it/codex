@@ -102,6 +102,13 @@ If Claude's browser approval was not completed by the command above, start
 Claude Code in this repository and run `/mcp` once to authorize the
 `cloudflare-api` server. No GitHub PAT or Cloudflare API token is committed.
 
+Claude also installs a user-level SessionStart/Stop guard. For repositories
+owned by `effacermonexistence` or `effacermonexistence-ship-it`, the guard
+records the Git state at session start and prevents Claude from stopping after
+it creates uncommitted or unpushed work. Question-only sessions and unrelated
+repositories are not affected. A fork push is reported separately from the
+upstream merge that triggers the GitHub Actions upload to R2.
+
 Product-specific release and custody coordinates are deliberately kept out of
 the global Codex and Claude instructions. The SCV Instagram v122 custody record
 is documented in `docs/scv-instagram-v122-custody.md`.
