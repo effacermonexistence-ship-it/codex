@@ -3,6 +3,8 @@ set -euo pipefail
 
 readonly backup_bucket="omar-private-archive"
 readonly backup_owner="effacermonexistence"
+readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly project_root="$(cd "$script_dir/.." && pwd)"
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   echo "Usage: $0 <repository-name> [destination]" >&2
@@ -26,17 +28,16 @@ if ! command -v git >/dev/null 2>&1; then
   echo "Git is required." >&2
   exit 1
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Python 3 is required." >&2
+if ! command -v node >/dev/null 2>&1; then
+  echo "Node.js is required. Run ./scripts/bootstrap-new-mac.sh first." >&2
   exit 1
 fi
 
-if command -v wrangler >/dev/null 2>&1; then
-  wrangler_command=(wrangler)
-elif command -v npx >/dev/null 2>&1; then
-  wrangler_command=(npx --yes wrangler@latest)
+if [[ -x "$project_root/node_modules/.bin/wrangler" ]]; then
+  wrangler_command=("$project_root/node_modules/.bin/wrangler")
 else
-  echo "Wrangler or Node.js with npx is required." >&2
+  echo "The repository's pinned Wrangler is not installed." >&2
+  echo "Run: pnpm --dir \"$project_root\" install --frozen-lockfile" >&2
   exit 1
 fi
 
@@ -59,27 +60,30 @@ if ! download_manifest; then
 fi
 
 IFS=$'\t' read -r bundle_key expected_sha256 source_ref < <(
-  python3 - "$manifest_path" "$backup_owner/$repository_name" <<'PY'
-import json
-import re
-import sys
+  node - "$manifest_path" "$backup_owner/$repository_name" <<'JS'
+const fs = require("node:fs");
 
-with open(sys.argv[1], encoding="utf-8") as source:
-    manifest = json.load(source)
+const [manifestPath, expectedRepository] = process.argv.slice(2);
+const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 
-if manifest.get("version") != 1 or manifest.get("repository") != sys.argv[2]:
-    raise SystemExit("The R2 manifest does not match the requested repository")
-key = manifest.get("key")
-sha256 = manifest.get("sha256")
-ref = manifest.get("ref")
-if not isinstance(key, str) or not key.startswith(f"git-bundles/{sys.argv[2]}/"):
-    raise SystemExit("The R2 manifest has an invalid object key")
-if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
-    raise SystemExit("The R2 manifest has an invalid checksum")
-if not isinstance(ref, str):
-    raise SystemExit("The R2 manifest has an invalid ref")
-print(key, sha256, ref, sep="\t")
-PY
+if (manifest.version !== 1 || manifest.repository !== expectedRepository) {
+  throw new Error("The R2 manifest does not match the requested repository");
+}
+const { key, sha256, ref } = manifest;
+if (
+  typeof key !== "string" ||
+  !key.startsWith(`git-bundles/${expectedRepository}/`)
+) {
+  throw new Error("The R2 manifest has an invalid object key");
+}
+if (typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) {
+  throw new Error("The R2 manifest has an invalid checksum");
+}
+if (typeof ref !== "string") {
+  throw new Error("The R2 manifest has an invalid ref");
+}
+process.stdout.write(`${key}\t${sha256}\t${ref}\n`);
+JS
 )
 
 readonly bundle_key
@@ -94,16 +98,19 @@ readonly verify_path="$restore_tmp/verify.git"
   --remote \
   --file "$bundle_path"
 
-actual_sha256="$(python3 - "$bundle_path" <<'PY'
-import hashlib
-import sys
+actual_sha256="$(node - "$bundle_path" <<'JS'
+const fs = require("node:fs");
+const crypto = require("node:crypto");
 
-digest = hashlib.sha256()
-with open(sys.argv[1], "rb") as source:
-    for chunk in iter(lambda: source.read(8 * 1024 * 1024), b""):
-        digest.update(chunk)
-print(digest.hexdigest())
-PY
+const digest = crypto.createHash("sha256");
+const source = fs.createReadStream(process.argv[2]);
+source.on("data", (chunk) => digest.update(chunk));
+source.on("error", (error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});
+source.on("end", () => console.log(digest.digest("hex")));
+JS
 )"
 
 if [[ "$actual_sha256" != "$expected_sha256" ]]; then

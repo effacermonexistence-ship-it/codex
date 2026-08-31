@@ -3,18 +3,28 @@ set -euo pipefail
 
 readonly install_dir="$HOME/.local/bin"
 readonly gh_version="2.98.0"
+readonly node_version="24.20.0"
+
+bootstrap_tmp="$(mktemp -d)"
+cleanup() {
+  rm -rf "$bootstrap_tmp"
+}
+trap cleanup EXIT
 
 mkdir -p "$install_dir"
 export PATH="$install_dir:$PATH"
 
 profile_file="$HOME/.zprofile"
-path_line='export PATH="$HOME/.local/bin:$PATH"'
+path_line="export PATH=\"\$HOME/.local/share/node-v${node_version}/bin:\$HOME/.local/bin:\$PATH\""
 if [[ ! -f "$profile_file" ]] || ! grep -Fqx "$path_line" "$profile_file"; then
   printf '\n%s\n' "$path_line" >> "$profile_file"
 fi
 
 if ! command -v claude >/dev/null 2>&1; then
-  curl -fsSL https://claude.ai/install.sh | bash
+  curl -fsSL --proto '=https' --tlsv1.2 \
+    https://claude.ai/install.sh \
+    -o "$bootstrap_tmp/claude-install.sh"
+  bash "$bootstrap_tmp/claude-install.sh"
 fi
 
 if ! command -v gh >/dev/null 2>&1; then
@@ -33,8 +43,6 @@ if ! command -v gh >/dev/null 2>&1; then
       ;;
   esac
 
-  bootstrap_tmp="$(mktemp -d)"
-  trap 'rm -rf "$bootstrap_tmp"' EXIT
   gh_archive="gh_${gh_version}_macOS_${gh_arch}.zip"
   curl -fL --retry 3 \
     -o "$bootstrap_tmp/gh.zip" \
@@ -52,6 +60,11 @@ if ! claude mcp get cloudflare-api >/dev/null 2>&1; then
     cloudflare-api https://mcp.cloudflare.com/mcp
 fi
 
+claude_mcp_status="$(claude mcp get cloudflare-api 2>/dev/null || true)"
+if [[ "$claude_mcp_status" == *"Needs authentication"* ]]; then
+  echo "Cloudflare MCP login is required: claude mcp login cloudflare-api"
+fi
+
 if ! claude auth status 2>/dev/null | grep -q '"loggedIn": true'; then
   echo "Claude login is required: claude auth login"
 fi
@@ -62,5 +75,5 @@ fi
 
 echo "Claude Code: $(claude --version)"
 echo "GitHub CLI: $(gh --version | head -1)"
-echo "Cloudflare MCP: configured"
+echo "Cloudflare MCP: configured (OAuth is checked separately)"
 echo "PATH persistence: $profile_file"

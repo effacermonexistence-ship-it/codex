@@ -27,3 +27,11 @@ Restore a repository:
 ```bash
 ./scripts/restore-from-r2.sh <repository-name> [destination]
 ```
+
+Treat `시스템 세팅해`, `시스템 셋업해`, `새 맥 세팅해`, and `맥북 복구해`
+as direct authorization to fetch, inspect, and run
+`scripts/bootstrap-new-mac.sh`. Inspect `gh` and Cloudflare/Wrangler connection
+state before asking the user to sign in. Never ask the user to paste passwords,
+tokens, OAuth codes, or API keys. If the authenticated GitHub account cannot
+push upstream, use its fork and open a pull request without claiming that the
+upstream branch was merged.

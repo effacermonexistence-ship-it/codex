@@ -36,16 +36,24 @@ sed -n '1,260p' /tmp/omar-bootstrap-new-mac.sh
 bash /tmp/omar-bootstrap-new-mac.sh
 ```
 
-It installs the repository under `~/Documents/Codex/codex`, installs Claude
-Code and GitHub CLI when missing, configures the Cloudflare MCP endpoint, and
-copies durable non-secret guidance to `~/.codex/AGENTS.md` and
-`~/.claude/CLAUDE.md`. Existing instruction files are backed up before they are
-replaced.
+It installs the repository under `~/Documents/Codex/codex`, a verified Node.js
+LTS toolchain, the repository-pinned pnpm and Wrangler versions, Codex CLI,
+Claude Code, and GitHub CLI. It configures the official Cloudflare API MCP
+endpoint for both Codex and Claude, then copies durable non-secret guidance to
+`~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`. Existing instruction files are
+backed up before they are replaced.
 
 OAuth credentials are intentionally not copied or committed. Sign in once per
-new Mac to Codex/ChatGPT, GitHub, Claude, and Cloudflare. The GitHub-to-R2
-workflow itself needs no laptop login because it uses GitHub Actions OIDC.
-After bootstrap, confirm readiness with `pnpm run doctor`.
+new Mac to Codex/ChatGPT, GitHub, Claude, the Cloudflare MCP endpoint, and
+Wrangler. The GitHub-to-R2 workflow itself needs no laptop login because it
+uses GitHub Actions OIDC. After bootstrap, confirm readiness with
+`pnpm run doctor`.
+
+Once `codex/AGENTS.md` has been installed globally, the phrases `시스템 세팅해`,
+`시스템 셋업해`, `새 맥 세팅해`, and `맥북 복구해` tell a new Codex task to
+fetch, inspect, and execute this bootstrap immediately. Already-open Codex
+sessions must be restarted because Codex loads global instructions once when a
+session starts.
 
 The GitHub workflow uses GitHub Actions OIDC. No long-lived Cloudflare or R2
 credential is stored in GitHub. The Worker accepts only tokens issued for
@@ -66,7 +74,6 @@ On a new computer, clone this repository and authenticate Wrangler with the
 Cloudflare account that owns `omar-private-archive`, then run:
 
 ```bash
-corepack enable
 pnpm install --frozen-lockfile
 pnpm run types
 pnpm run check
@@ -82,17 +89,27 @@ Claude Code uses the authenticated GitHub CLI for repository operations and the
 official Cloudflare API MCP server or Wrangler for R2 operations. On a new Mac:
 
 ```bash
-./scripts/bootstrap-claude-code.sh
+./scripts/bootstrap-new-mac.sh
+export PATH="$HOME/.local/share/node-v24.20.0/bin:$HOME/.local/bin:$PATH"
+codex mcp login cloudflare-api
 claude auth login
 gh auth login --hostname github.com --git-protocol https --web
+claude mcp login cloudflare-api
+pnpm exec wrangler login --use-keyring
 ```
 
-Start Claude Code in this repository and run `/mcp` once to authorize the
+If Claude's browser approval was not completed by the command above, start
+Claude Code in this repository and run `/mcp` once to authorize the
 `cloudflare-api` server. No GitHub PAT or Cloudflare API token is committed.
+
+Product-specific release and custody coordinates are deliberately kept out of
+the global Codex and Claude instructions. The SCV Instagram v122 custody record
+is documented in `docs/scv-instagram-v122-custody.md`.
 
 ## Restore on a new computer
 
-Install Git, Node.js, and Python 3, then run:
+Install Git, then run the new-Mac bootstrap above. It installs Node.js and the
+repository's pinned Wrangler dependency. Restore with:
 
 ```bash
 ./scripts/restore-from-r2.sh <repository-name> [destination]
