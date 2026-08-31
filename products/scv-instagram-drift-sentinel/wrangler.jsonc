@@ -1,0 +1,23 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "scv-instagram-drift-sentinel",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-31",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  },
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE",
+      "bucket_name": "omar-private-archive"
+    }
+  ]
+}
