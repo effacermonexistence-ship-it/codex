@@ -1,7 +1,7 @@
 const SENTINEL_SCHEMA = 'scv-instagram-drift-sentinel-2026-08-31-v1'
-const RELEASE_ID = 'scv-instagram-single-20260831-v123'
-const CONTENT_FINGERPRINT = '740cc56ee25fe33cb2bef82a077814aa595c0e4734c737a8e62dc859f10fc870'
-const RELEASE_MANIFEST = 'dc851f3331cd0aacfa426d24d1e6eedea97d94869ac520bba29a20c98e65b468'
+const RELEASE_ID = 'scv-instagram-single-20260831-v124'
+const CONTENT_FINGERPRINT = 'fd4e7d064e68b27125c2530d9e369080feb0a4ca89db20c47e2f09689fb0da66'
+const RELEASE_MANIFEST = 'afc47a8423f59bb5a3bfd81d2823a5b59fa36a517494021fc360838af2dbce77'
 const VISIBLE_MODEL = 'gpt-5.4-mini-2026-03-17'
 const MAX_CANARY_AGE_MS = 90 * 60 * 1000
 const MAX_DRIFT_AGE_MS = 3 * 60 * 1000
