@@ -7,6 +7,8 @@
     "check": "tsc --noEmit",
     "deploy": "wrangler deploy",
     "deploy:dry-run": "wrangler deploy --dry-run",
+    "doctor": "bash scripts/doctor.sh",
+    "doctor:strict": "bash scripts/doctor.sh --strict",
     "types": "wrangler types"
   },
   "dependencies": {
