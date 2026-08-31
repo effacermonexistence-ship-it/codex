@@ -90,7 +90,7 @@ async function checkTarget(target, fetchImpl = fetch) {
   try {
     const response = await fetchImpl(target.url, {
       method: 'GET', headers: { accept: 'application/json', 'user-agent': SENTINEL_SCHEMA },
-      redirect: 'error', signal: controller.signal
+      redirect: 'manual', signal: controller.signal
     })
     const text = await response.text()
     if (new TextEncoder().encode(text).byteLength > MAX_BODY_BYTES) {
@@ -104,8 +104,17 @@ async function checkTarget(target, fetchImpl = fetch) {
     }
     return evaluateEndpoint(target, response.status, body)
   } catch (error) {
-    return { ok: false, name: target.name, mode: target.mode, http_status: 0,
-      reasons: [error?.name === 'AbortError' ? 'request_timeout' : 'request_failed'] }
+    const failure = {
+      ok: false,
+      name: target.name,
+      mode: target.mode,
+      http_status: 0,
+      reasons: [error?.name === 'AbortError' ? 'request_timeout' : 'request_failed'],
+      error_name: String(error?.name || 'Error').slice(0, 80),
+      error_message: String(error?.message || error || 'request_failed').slice(0, 240)
+    }
+    console.error(JSON.stringify({ event: 'scv_sentinel_target_fetch_failed', ...failure }))
+    return failure
   } finally { clearTimeout(timer) }
 }
 
