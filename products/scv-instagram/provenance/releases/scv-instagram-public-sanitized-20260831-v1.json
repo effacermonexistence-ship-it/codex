@@ -1,0 +1,73 @@
+{
+  "schema": "scv-instagram-public-sanitized-provenance-2026-08-31-v1",
+  "release_id": "scv-instagram-public-sanitized-20260831-v1",
+  "status": "public-source-mirror-only",
+  "deployment_allowed": false,
+  "canonical_behavior_reference": "instagram-dm-mid-april-2026",
+  "source_authority": {
+    "release_id": "scv-instagram-single-20260829-v122",
+    "content_fingerprint_sha256": "89b128ce7161698e017251938b5ccd78953bf066dc546de6adf637fcb45739d1",
+    "release_descriptor_sha256": "cf2740914346c0d4a0419bd0c2672479cf7dc96c178b1d7f427e5d1c2444cf76",
+    "application_archive_sha256": "5b354d78a4c4d19e9013694c6931e75fa56954d88c21a29a2db23980ca526190",
+    "cold_recovery_sha256": "4dbe8262bc1bddd2902e854c405ea9ebb650c10656a143303a6e52decac5fb24",
+    "custody": "access-restricted-r2-only",
+    "contains_customer_derived_identifiers": true,
+    "contains_customer_derived_message_content": true,
+    "public_git_eligible": false
+  },
+  "private_r2_custody": {
+    "bucket": "omar-private-archive",
+    "application_key": "scv-instagram-automation/release-ready/20260830T074050Z/v122/scv-instagram-single-20260830T074050Z-v122-release-ready.tar.gz",
+    "cold_recovery_key": "scv-instagram-automation/cold-recovery/20260830T075106Z/v122/scv-v122-cold-recovery-20260830T075106Z.tar.gz",
+    "custody_manifest_key": "scv-instagram-automation/private-custody/20260830T074050Z/v122/SCV_V122_PRIVATE_CUSTODY_MANIFEST.json",
+    "custody_manifest_sha256": "03a0f820bd4176bab3e02632d29b90de619bdbce001108866842ac76aa76db85",
+    "application_download_roundtrip_verified": true,
+    "cold_recovery_download_roundtrip_verified": true,
+    "cold_recovery_official_checks_passed": 12,
+    "public_r2_dev_enabled": false,
+    "custom_domains": []
+  },
+  "sanitization": {
+    "sanitizer": "scripts/sanitize-public-mirror.mjs",
+    "sanitizer_sha256": "48dd71ea072c7fc84210d5e09dd9b68c58944ebfa31ae4ea1dfc81bd226f7ed2",
+    "source_files": 230,
+    "changed_files": 193,
+    "customer_sensitive_files_classified": 22,
+    "sensitive_string_classes_replaced": 230,
+    "sensitive_number_classes_replaced": 44,
+    "identifier_replacement_groups": 834,
+    "email_replacements": 53,
+    "private_path_replacements": 14,
+    "production_derived_documents_replaced_with_public_summaries": 3,
+    "private_key_or_secret_material_found": false
+  },
+  "public_runtime": {
+    "path": "runtime",
+    "descriptor": "runtime/SCV_SINGLE_RELEASE.json",
+    "descriptor_sha256": "280b13b8fe0d1b9e0d8473f20b403ffa88b7b34d778a50338e081333af1acff7",
+    "descriptor_bytes": 39910,
+    "content_fingerprint_sha256": "7521b2b785fcae44bccefbe9d28089519af01898b3ef7c0b8a8ee2989cce155e",
+    "inventory_files": 229,
+    "inventory_bytes": 5231797,
+    "physical_regular_files": 230,
+    "physical_bytes": 5271707,
+    "node_version": "v20.20.2",
+    "production_target_ids_replaced": true,
+    "production_namespace": "public-sanitized-do-not-deploy",
+    "staging_namespace": "public-sanitized-do-not-deploy-staging"
+  },
+  "public_git": {
+    "repository": "effacermonexistence/codex",
+    "branch": "release/scv-instagram-public-sanitized-20260831-v1",
+    "tag": "scv-instagram-public-sanitized-20260831-v1"
+  },
+  "safety": {
+    "customer_identifiers_included": false,
+    "customer_message_content_included": false,
+    "private_user_paths_included": false,
+    "operational_email_included": false,
+    "runtime_credentials_included": false,
+    "private_keys_included": false,
+    "exact_production_deployment_allowed": false
+  }
+}

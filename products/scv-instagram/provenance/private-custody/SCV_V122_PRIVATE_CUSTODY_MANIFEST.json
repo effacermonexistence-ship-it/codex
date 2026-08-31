@@ -1,0 +1,39 @@
+{
+  "schema": "scv-instagram-private-r2-custody-2026-08-31-v1",
+  "release_id": "scv-instagram-single-20260829-v122",
+  "content_fingerprint_sha256": "89b128ce7161698e017251938b5ccd78953bf066dc546de6adf637fcb45739d1",
+  "release_descriptor_sha256": "cf2740914346c0d4a0419bd0c2672479cf7dc96c178b1d7f427e5d1c2444cf76",
+  "verified_at_utc": "2026-08-31T05:06:22.000Z",
+  "source": {
+    "bucket": "omar-active-vault",
+    "public_r2_dev_enabled": false,
+    "custom_domains": []
+  },
+  "destination": {
+    "bucket": "omar-private-archive",
+    "public_r2_dev_enabled": false,
+    "custom_domains": []
+  },
+  "objects": {
+    "application": {
+      "key": "scv-instagram-automation/release-ready/20260830T074050Z/v122/scv-instagram-single-20260830T074050Z-v122-release-ready.tar.gz",
+      "bytes": 1278617,
+      "sha256": "5b354d78a4c4d19e9013694c6931e75fa56954d88c21a29a2db23980ca526190",
+      "download_roundtrip_verified": true
+    },
+    "cold_recovery": {
+      "key": "scv-instagram-automation/cold-recovery/20260830T075106Z/v122/scv-v122-cold-recovery-20260830T075106Z.tar.gz",
+      "bytes": 67762581,
+      "sha256": "4dbe8262bc1bddd2902e854c405ea9ebb650c10656a143303a6e52decac5fb24",
+      "download_roundtrip_verified": true,
+      "official_restore_checks_passed": 12
+    }
+  },
+  "data_classification": {
+    "contains_secrets_or_private_keys": false,
+    "contains_customer_derived_identifiers": true,
+    "contains_customer_derived_message_content": true,
+    "public_git_eligible": false,
+    "custody": "access-restricted-r2-only"
+  }
+}
