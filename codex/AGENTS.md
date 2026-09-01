@@ -80,16 +80,29 @@ session and must be restarted to see an updated file.
 Before asking the user to sign in, inspect existing connectivity without
 printing secrets:
 
-- GitHub: run `gh auth status --hostname github.com`, `gh api user`, and inspect
-  the target repository's `permissions.push` value. A valid login does not
-  necessarily grant upstream write access.
+- GitHub: first inspect every already-connected authentication surface. Check
+  the GitHub app/connector and its target-repository permissions when that tool
+  is available, then run `gh auth status --hostname github.com`, `gh api user`,
+  and inspect the CLI account's `permissions.push` value. The connector and CLI
+  may represent different GitHub accounts with different permissions.
+- Do not infer that GitHub is disconnected, open a login page, or ask the user
+  to authenticate solely because the CLI account lacks upstream permission.
+  Exhaust the existing GitHub app/connector, CLI accounts, and authorized task
+  context first. When an existing connector has `push` or `admin` permission,
+  use it for the requested repository operation instead of requesting a login.
 - Cloudflare/R2: prefer the official `cloudflare-api` MCP connection. Otherwise
   use the repository-pinned Wrangler and inspect `wrangler whoami` before
   opening a dashboard login.
 
-For an authorized GitHub publication when the connected account has
-`permissions.push: false`, create or reuse that account's fork, push the
-verified branch and tag there, and open a pull request to the source-of-truth
-repository. Clearly distinguish "uploaded to GitHub" from "merged upstream".
-Do not broaden repository permissions or request an account password as a
-workaround.
+When the user explicitly says to ask or use an existing `admin` task, use the
+Codex task-coordination tools to find that task, send the question or requested
+operation directly, and wait for its result. Do not make the user relay state
+between Codex tasks when the app can coordinate them.
+
+For an authorized GitHub publication, use an existing connector or CLI identity
+with upstream `push` permission when one is already available. Only when every
+existing authenticated surface has `permissions.push: false`, create or reuse
+the authenticated account's fork, push the verified branch and tag there, and
+open a pull request to the source-of-truth repository. Clearly distinguish
+"uploaded to GitHub" from "merged upstream". Do not broaden repository
+permissions or request an account password as a workaround.
