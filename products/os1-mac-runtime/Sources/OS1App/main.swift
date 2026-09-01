@@ -44,6 +44,7 @@ private struct NativeSessionSummary: Identifiable, Sendable {
     let provider: ProviderChoice
     let title: String
     let workspace: String
+    let workspaceLabel: String?
     let updatedAt: Date
     let sourcePath: String?
     var linkedTitle: String?
@@ -51,6 +52,12 @@ private struct NativeSessionSummary: Identifiable, Sendable {
     var displayTitle: String {
         let value = (linkedTitle ?? title).trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? "Untitled session" : value
+    }
+
+    var displayWorkspace: String {
+        if let workspaceLabel, !workspaceLabel.isEmpty { return workspaceLabel }
+        let value = URL(fileURLWithPath: workspace).lastPathComponent
+        return value.isEmpty ? "No workspace" : value
     }
 }
 
@@ -63,6 +70,13 @@ private struct NativeSessionMessage: Identifiable, Sendable {
 
 private enum NativeSessionReader {
     nonisolated(unsafe) private static let iso8601 = ISO8601DateFormatter()
+
+    private struct ClaudeDesktopMetadata {
+        let title: String
+        let workspace: String
+        let lastActivityAt: Date?
+        let isArchived: Bool
+    }
 
     static func sessions(for provider: ProviderChoice) throws -> [NativeSessionSummary] {
         switch provider {
@@ -114,6 +128,7 @@ private enum NativeSessionReader {
                 provider: .codex,
                 title: columnText(statement, 1),
                 workspace: columnText(statement, 2),
+                workspaceLabel: nil,
                 updatedAt: Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, 3)) / 1_000),
                 sourcePath: nil,
                 linkedTitle: nil
@@ -179,6 +194,8 @@ private enum NativeSessionReader {
     private static func claudeSessions() throws -> [NativeSessionSummary] {
         let root = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/projects", isDirectory: true)
+        let desktopMetadata = claudeDesktopSessionMetadata()
+        let repositoryLabels = claudeRepositoryLabels()
         guard let enumerator = FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
@@ -191,31 +208,99 @@ private enum NativeSessionReader {
             files.append((url, values?.contentModificationDate ?? .distantPast))
         }
         files.sort { $0.1 > $1.1 }
-        return files.prefix(300).compactMap { url, modifiedAt in
+        return files.compactMap { url, modifiedAt in
             guard let records = try? readJSONLines(url, maximumBytes: 768 * 1_024), !records.isEmpty else { return nil }
             var id = url.deletingPathExtension().lastPathComponent
             var workspace = ""
-            var timestamp = modifiedAt
+            var timestamp: Date?
             var title = ""
+            var isDesktopBridgeSession = false
+            var hasVisibleConversation = false
             for record in records {
                 if let value = record["sessionId"] as? String, !value.isEmpty { id = value }
                 if let value = record["cwd"] as? String, !value.isEmpty { workspace = value }
-                if let value = record["timestamp"] as? String, let date = iso8601.date(from: value) { timestamp = max(timestamp, date) }
-                if title.isEmpty, record["type"] as? String == "user",
-                   let message = record["message"] as? [String: Any] {
-                    title = firstLine(textContent(message["content"]))
+                if let value = record["timestamp"] as? String, let date = iso8601.date(from: value) {
+                    timestamp = timestamp.map { max($0, date) } ?? date
                 }
+                let type = record["type"] as? String
+                if type == "bridge-session" { isDesktopBridgeSession = true }
+                if type == "user" || type == "assistant",
+                   let message = record["message"] as? [String: Any] {
+                    let text = textContent(message["content"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !text.isEmpty {
+                        hasVisibleConversation = true
+                        if title.isEmpty, type == "user" { title = firstLine(text) }
+                    }
+                }
+            }
+            guard isDesktopBridgeSession, hasVisibleConversation else { return nil }
+            if let metadata = desktopMetadata[id] {
+                guard !metadata.isArchived else { return nil }
+                if !metadata.title.isEmpty { title = metadata.title }
+                if workspace.isEmpty, !metadata.workspace.isEmpty { workspace = metadata.workspace }
+                if let activity = metadata.lastActivityAt { timestamp = activity }
             }
             return NativeSessionSummary(
                 id: id,
                 provider: .claude,
                 title: title,
                 workspace: workspace,
-                updatedAt: timestamp,
+                workspaceLabel: claudeProjectLabel(workspace, repositoryLabels: repositoryLabels),
+                updatedAt: timestamp ?? modifiedAt,
                 sourcePath: url.path,
                 linkedTitle: nil
             )
+        }.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private static func claudeDesktopSessionMetadata() -> [String: ClaudeDesktopMetadata] {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Claude/claude-code-sessions", isDirectory: true)
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [:] }
+        var result: [String: ClaudeDesktopMetadata] = [:]
+        for case let url as URL in enumerator where url.pathExtension == "json" && url.lastPathComponent.hasPrefix("local_") {
+            guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+                  let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let cliSessionID = value["cliSessionId"] as? String,
+                  !cliSessionID.isEmpty else { continue }
+            let milliseconds = value["lastActivityAt"] as? Double
+                ?? (value["lastActivityAt"] as? NSNumber)?.doubleValue
+            result[cliSessionID] = ClaudeDesktopMetadata(
+                title: value["title"] as? String ?? "",
+                workspace: value["originCwd"] as? String ?? value["cwd"] as? String ?? "",
+                lastActivityAt: milliseconds.map { Date(timeIntervalSince1970: $0 / 1_000) },
+                isArchived: value["isArchived"] as? Bool ?? false
+            )
         }
+        return result
+    }
+
+    private static func claudeProjectLabel(_ workspace: String, repositoryLabels: [String: String]) -> String {
+        guard !workspace.isEmpty else { return "No folder" }
+        if workspace.contains("/Library/Application Support/Claude/scratch-workspaces/") {
+            return "No folder"
+        }
+        if let label = repositoryLabels[workspace], !label.isEmpty { return label }
+        let name = URL(fileURLWithPath: workspace).lastPathComponent
+        return name.isEmpty ? "No folder" : name
+    }
+
+    private static func claudeRepositoryLabels() -> [String: String] {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let repositories = root["githubRepoPaths"] as? [String: Any] else { return [:] }
+        var result: [String: String] = [:]
+        for (repository, rawPaths) in repositories {
+            guard let paths = rawPaths as? [String] else { continue }
+            let label = repository.split(separator: "/").last.map(String.init) ?? repository
+            for path in paths { result[path] = label }
+        }
+        return result
     }
 
     private static func claudeTranscript(session: NativeSessionSummary) throws -> [NativeSessionMessage] {
@@ -1191,9 +1276,7 @@ private struct NativeSessionRow: View {
                     }
                 }
                 HStack(spacing: 6) {
-                    Text(URL(fileURLWithPath: session.workspace).lastPathComponent.isEmpty
-                         ? "No workspace"
-                         : URL(fileURLWithPath: session.workspace).lastPathComponent)
+                    Text(session.displayWorkspace)
                         .lineLimit(1)
                     Spacer()
                     Text(compactSessionAge(session.updatedAt))
@@ -1239,8 +1322,8 @@ private struct NativeTranscriptView: View {
                     }
                 }
                 Spacer()
-                if let workspace = store.selectedNativeSession?.workspace, !workspace.isEmpty {
-                    Label(URL(fileURLWithPath: workspace).lastPathComponent, systemImage: "folder")
+                if let session = store.selectedNativeSession, !session.workspace.isEmpty {
+                    Label(session.displayWorkspace, systemImage: "folder")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(Theme.muted)
                         .lineLimit(1)
