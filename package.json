@@ -12,7 +12,11 @@
     "os1:deploy": "bash scripts/deploy-os1.sh",
     "os1:publish": "bash scripts/publish-os1-release.sh",
     "os1:redteam": "pnpm --dir products/os1-route-core redteam:deployed",
-    "types": "wrangler types"
+    "types": "wrangler types",
+    "check:scv-instagram": "node products/scv-instagram/scripts/verify-public-mirror.mjs",
+    "check:scv-instagram:syntax": "find products/scv-instagram/runtime -type f -name '*.js' -not -path '*/node_modules/*' -exec node --check {} +",
+    "check:scv-instagram:all": "pnpm run check:scv-instagram && pnpm run check:scv-instagram:syntax",
+    "check:all": "pnpm run types && pnpm run check && pnpm run deploy:dry-run"
   },
   "dependencies": {
     "jose": "6.2.10"
