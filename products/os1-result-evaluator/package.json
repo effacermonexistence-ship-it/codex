@@ -1,0 +1,17 @@
+{
+  "name": "@omar/os1-result-evaluator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run --outdir dist",
+    "types": "wrangler types --env-file .dev.vars.example",
+    "types:check": "wrangler types --env-file .dev.vars.example --check"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "wrangler": "4.127.1"
+  }
+}

@@ -60,8 +60,9 @@ ditto "$bootstrap_tmp/${repo_name}-${repo_branch}" "$install_root"
 chmod 0755 \
   "$install_root/scripts/bootstrap-new-mac.sh" \
   "$install_root/scripts/bootstrap-claude-code.sh" \
+  "$install_root/scripts/restore-from-r2.sh" \
   "$install_root/scripts/doctor.sh" \
-  "$install_root/scripts/restore-from-r2.sh"
+  "$install_root/products/os1-mac-runtime/scripts/install-os1.sh"
 
 mkdir -p "$node_install_parent"
 for interrupted_path in \
@@ -157,6 +158,9 @@ if ! codex_cli_is_usable; then
 fi
 
 "$install_root/scripts/bootstrap-claude-code.sh"
+if [[ "${OMAR_SKIP_OS1:-0}" != "1" ]]; then
+  "$install_root/products/os1-mac-runtime/scripts/install-os1.sh"
+fi
 
 pnpm --dir "$install_root" install --frozen-lockfile
 
@@ -231,6 +235,7 @@ echo
 echo "Installed durable setup at: $install_root"
 echo "Installed Codex instructions: $codex_config_dir/AGENTS.md"
 echo "Installed Claude instructions: $claude_config_dir/CLAUDE.md"
+echo "Installed Open OS-1 Codex: /Applications/Open OS-1 Codex.app"
 echo "Node.js: $(node --version)"
 echo "pnpm: $(pnpm --version)"
 echo "Codex CLI: $(codex --version)"
