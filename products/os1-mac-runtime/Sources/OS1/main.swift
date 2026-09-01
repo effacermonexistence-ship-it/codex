@@ -1141,7 +1141,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.6.2")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.6.3")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":

@@ -214,7 +214,6 @@ private enum NativeSessionReader {
             var workspace = ""
             var timestamp: Date?
             var title = ""
-            var isDesktopBridgeSession = false
             var hasVisibleConversation = false
             for record in records {
                 if let value = record["sessionId"] as? String, !value.isEmpty { id = value }
@@ -223,7 +222,6 @@ private enum NativeSessionReader {
                     timestamp = timestamp.map { max($0, date) } ?? date
                 }
                 let type = record["type"] as? String
-                if type == "bridge-session" { isDesktopBridgeSession = true }
                 if type == "user" || type == "assistant",
                    let message = record["message"] as? [String: Any] {
                     let text = textContent(message["content"]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -233,7 +231,13 @@ private enum NativeSessionReader {
                     }
                 }
             }
-            guard isDesktopBridgeSession, hasVisibleConversation else { return nil }
+            // Claude Code print-mode sessions are genuine persistent backend
+            // sessions but do not carry Claude Desktop's `bridge-session`
+            // marker. The previous marker gate hid every session created or
+            // resumed by OS-1 even though its JSONL transcript existed. Show
+            // every persistent Claude conversation with visible user/assistant
+            // turns so the backend surface mirrors Claude Code itself.
+            guard hasVisibleConversation else { return nil }
             if let metadata = desktopMetadata[id] {
                 guard !metadata.isArchived else { return nil }
                 if !metadata.title.isEmpty { title = metadata.title }
@@ -333,7 +337,25 @@ private enum NativeSessionReader {
         if let maximumBytes {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
-            data = try handle.read(upToCount: maximumBytes) ?? Data()
+            let fileSize = try handle.seekToEnd()
+            if fileSize <= UInt64(maximumBytes) {
+                try handle.seek(toOffset: 0)
+                data = try handle.readToEnd() ?? Data()
+            } else {
+                // Keep session identity/title context from the beginning and
+                // current activity from the end. Reading only the first bytes
+                // made long-running Claude sessions look stale after resume.
+                let headBytes = max(64 * 1_024, maximumBytes / 4)
+                let tailBytes = max(64 * 1_024, maximumBytes - headBytes)
+                try handle.seek(toOffset: 0)
+                let head = try handle.read(upToCount: headBytes) ?? Data()
+                try handle.seek(toOffset: fileSize - UInt64(tailBytes))
+                var tail = try handle.readToEnd() ?? Data()
+                if let newline = tail.firstIndex(of: 0x0A) {
+                    tail = Data(tail[tail.index(after: newline)...])
+                }
+                data = head + Data("\n".utf8) + tail
+            }
         } else {
             data = try Data(contentsOf: url, options: [.mappedIfSafe])
         }
