@@ -235,7 +235,7 @@ echo "Node.js: $(node --version)"
 echo "pnpm: $(pnpm --version)"
 echo "Codex CLI: $(codex --version)"
 echo "Pinned Wrangler: $(pnpm --dir "$install_root" exec wrangler --version)"
-echo "New Codex tasks now know the GitHub, R2, and system-recovery procedure."
+echo "New Codex tasks now know the GitHub, R2, recovery, and completion-persistence procedures."
 echo "Restart already-open Codex sessions to reload the global instructions."
 echo
 echo "One-time logins still required on each new Mac:"

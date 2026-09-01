@@ -90,6 +90,21 @@ check_file "$claude_config_dir/CLAUDE.md" "installed Claude guidance"
 check_file "$claude_config_dir/settings.json" "installed Claude settings"
 check_file "$claude_config_dir/hooks/remote-backup-guard.mjs" "installed remote guard"
 
+if [[ -f "$repo_root/codex/AGENTS.md" && -f "$codex_config_dir/AGENTS.md" ]]; then
+  if cmp -s "$repo_root/codex/AGENTS.md" "$codex_config_dir/AGENTS.md"; then
+    add_check pass "Codex guidance sync" "durable and installed AGENTS.md match"
+  else
+    add_check fail "Codex guidance sync" "installed AGENTS.md differs from the durable source"
+  fi
+fi
+
+if [[ -f "$repo_root/codex/AGENTS.md" ]] &&
+   grep -Fq '## Global completion persistence' "$repo_root/codex/AGENTS.md"; then
+  add_check pass "completion persistence" "global completion rule is present"
+else
+  add_check fail "completion persistence" "global completion rule is missing"
+fi
+
 if [[ -f "$repo_root/CLAUDE.md" && -f "$claude_config_dir/CLAUDE.md" ]]; then
   if cmp -s "$repo_root/CLAUDE.md" "$claude_config_dir/CLAUDE.md"; then
     add_check pass "Claude guidance sync" "durable and installed CLAUDE.md match"

@@ -35,6 +35,30 @@ OIDC; it must not depend on a laptop credential. Validate changes with the
 repository checks and verify the resulting R2 manifest when access is
 available.
 
+## Global completion persistence
+
+This rule applies to every Codex task on this machine. Treat terminal phrases
+such as `finish`, `complete`, `끝까지 해`, `완료해`, `다 끝내`, `멈추지 마`,
+and `100%가 될 때까지` as explicit persistence requirements.
+
+- Do not end the turn with a success or completion claim until every in-scope
+  completion criterion has been implemented and verified with evidence.
+- After each intermediate success, immediately continue to the next unmet
+  criterion without waiting for the user to say `continue` again.
+- Never use `done`, `complete`, `100%`, `완료`, or equivalent language to mean
+  started, mostly complete, uploaded but not merged, deployed but not verified,
+  or blocked.
+- For long-running builds, deployments, backups, restores, and monitors, keep
+  waiting or checking with the available task mechanism until they reach a
+  terminal state. An intermediate milestone is not a terminal state.
+- Before the final response, run a completion audit against the user's requested
+  outcome and report only verified results and genuine limitations.
+- If an unavoidable blocker requires new user authority, user-only input, or an
+  external state change, first exhaust safe in-scope alternatives. Then state
+  the exact blocker and remaining work; never describe a blocker as completion.
+- Persistence does not expand the user's authorized scope and does not override
+  safety, security, privacy, or destructive-action constraints.
+
 ## Direct setup and recovery phrases
 
 Treat `시스템 세팅해`, `시스템 셋업해`, `새 맥 세팅해`, `맥 세팅해`,
