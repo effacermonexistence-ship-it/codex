@@ -332,7 +332,57 @@ func executorInstructions(contract: ExecutorContract, ticket: Ticket) -> String 
     - backend: \(ticket.provider)
     - action: \(ticket.action)
     - permission profile: \(ticket.permissionProfile)
+    - OS-1 owns permission orchestration. Do not ask the user to approve provider-native tools.
+    - Execute only actions allowed by the assigned permission profile. If an action is denied, stop and report the blocker truthfully.
     """
+}
+
+func claudePermissionArguments(_ permissionProfile: String) throws -> [String] {
+    switch permissionProfile {
+    case "read_only":
+        return ["--permission-mode", "plan"]
+    case "workspace_write":
+        // Claude Auto mode approves ordinary project-local work while retaining
+        // its hard/soft safety boundaries. OS-1 separately rejects any denied
+        // tool call before the server can record the step as verified.
+        return ["--permission-mode", "auto"]
+    case "full_access":
+        return ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"]
+    default:
+        throw OS1Error.message("Server ticket permission profile rejected")
+    }
+}
+
+struct ClaudePrintResult {
+    let output: Data
+    let sessionID: String
+}
+
+func parseClaudePrintResult(_ data: Data, requestedSessionID: String) throws -> ClaudePrintResult {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let value = object["result"] as? String,
+          let returnedSessionID = object["session_id"] as? String,
+          let normalizedReturned = try normalizedSessionID(returnedSessionID),
+          normalizedReturned == requestedSessionID else {
+        throw OS1Error.message("Claude did not return the requested persistent session ID")
+    }
+
+    if object["is_error"] as? Bool == true {
+        throw OS1Error.message("Claude reported an execution failure. OS-1 did not verify this step.")
+    }
+
+    let denials = (object["permission_denials"] as? [[String: Any]] ?? [])
+        .compactMap { $0["tool_name"] as? String }
+    if !denials.isEmpty {
+        let tools = Array(Set(denials)).sorted().joined(separator: ", ")
+        throw OS1Error.message(
+            "OS-1 blocked \(denials.count) Claude tool action(s)" +
+            (tools.isEmpty ? "" : " (\(tools))") +
+            " under the assigned permission policy. This step was not verified."
+        )
+    }
+
+    return ClaudePrintResult(output: Data(value.utf8), sessionID: normalizedReturned)
 }
 
 func tomlStringLiteral(_ value: String) throws -> String {
@@ -826,11 +876,7 @@ func execute(
         } else {
             arguments += ["--resume", requestedSessionID]
         }
-        switch ticket.permissionProfile {
-        case "read_only": arguments += ["--permission-mode", "plan"]
-        case "full_access": arguments += ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"]
-        default: arguments += ["--permission-mode", "acceptEdits"]
-        }
+        arguments += try claudePermissionArguments(ticket.permissionProfile)
         arguments.append(prompt)
         let raw = try commandOutput(
             claude,
@@ -838,18 +884,12 @@ func execute(
             timeout: timeout,
             currentDirectory: workspace
         )
-        var output = raw.1
-        if let object = try? JSONSerialization.jsonObject(with: raw.1) as? [String: Any],
-           let value = object["result"] as? String,
-           let returnedSessionID = object["session_id"] as? String,
-           let normalizedReturned = try normalizedSessionID(returnedSessionID),
-           normalizedReturned == requestedSessionID {
-            output = Data(value.utf8)
-            sessionID = normalizedReturned
-        } else {
-            throw OS1Error.message("Claude did not return the requested persistent session ID")
+        guard raw.0 == 0 else {
+            throw OS1Error.message("Claude execution failed. OS-1 did not verify this step.")
         }
-        result = (raw.0, output, raw.2)
+        let parsed = try parseClaudePrintResult(raw.1, requestedSessionID: requestedSessionID)
+        sessionID = parsed.sessionID
+        result = (raw.0, parsed.output, raw.2)
     }
     return ProviderExecution(
         artifact: Artifact(
@@ -1014,6 +1054,32 @@ func selfTest() throws {
           codexThreadID(from: Data("not json\n{}\n".utf8)) == nil else {
         throw OS1Error.message("Codex native thread event validation failed")
     }
+    let claudeSessionID = "01a05b4d-f206-7c71-bd11-128b24e755e0"
+    let allowedClaudeResult = Data("""
+    {"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"\(claudeSessionID)","permission_denials":[]}
+    """.utf8)
+    let parsedClaudeResult = try parseClaudePrintResult(
+        allowedClaudeResult,
+        requestedSessionID: claudeSessionID
+    )
+    let deniedClaudeResult = Data("""
+    {"type":"result","subtype":"success","is_error":false,"result":"approval required","session_id":"\(claudeSessionID)","permission_denials":[{"tool_name":"Bash","tool_use_id":"tool-1","tool_input":{"command":"/bin/pwd"}}]}
+    """.utf8)
+    var rejectedClaudeDenial = false
+    do {
+        _ = try parseClaudePrintResult(deniedClaudeResult, requestedSessionID: claudeSessionID)
+    } catch {
+        rejectedClaudeDenial = true
+    }
+    guard String(decoding: parsedClaudeResult.output, as: UTF8.self) == "ok",
+          parsedClaudeResult.sessionID == claudeSessionID,
+          rejectedClaudeDenial,
+          try claudePermissionArguments("read_only") == ["--permission-mode", "plan"],
+          try claudePermissionArguments("workspace_write") == ["--permission-mode", "auto"],
+          try claudePermissionArguments("full_access") == ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"],
+          (try? claudePermissionArguments("unknown")) == nil else {
+        throw OS1Error.message("Claude OS-1 permission orchestration validation failed")
+    }
     let config = RuntimeConfig(
         apiURL: "https://example.com",
         ticketVerifyingKeyRaw: String(repeating: "A", count: 43),
@@ -1051,7 +1117,7 @@ func selfTest() throws {
           try tomlStringLiteral("line one\n\"line two\"").hasPrefix("\"") else {
         throw OS1Error.message("Model or effort profile resolution failed")
     }
-    print("OS-1 native session, model, effort, and executor contract self-test: OK")
+    print("OS-1 native session, permission orchestration, model, effort, and executor contract self-test: OK")
 }
 
 func usage() {
@@ -1075,7 +1141,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.4.0")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.6.3")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":

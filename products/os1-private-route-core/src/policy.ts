@@ -20,6 +20,47 @@ export type Policy = {
   rules: Rule[];
 };
 
+const explicitProviderPatterns: ReadonlyArray<readonly [Provider, RegExp]> = [
+  ["codex", /(?:^|[\s,:;([{])(?:codex|코덱스|코드엑스)(?=$|[\s,:;.!?\])}]|은|는|이|가|을|를|에|에게|한테|로|와|과)/iu],
+  ["claude", /(?:^|[\s,:;([{])(?:claude(?:\s+code)?|클로드(?:\s*코드)?|클라우드\s*코드)(?=$|[\s,:;.!?\])}]|은|는|이|가|을|를|에|에게|한테|로|와|과)/iu],
+];
+
+const directedProviderPatterns: ReadonlyArray<readonly [Provider, RegExp[]]> = [
+  ["codex", [
+    /(?:codex|코덱스|코드엑스)\s*(?:한테|에게|로|으로)\s*[^\n.!?]{0,32}(?:말|시켜|시키|맡겨|맡기|보내|돌려|실행|요청|부탁)/iu,
+    /(?:ask|use|run|route|send|delegate)(?:\s+this|\s+it|\s+the\s+task)?\s+(?:to\s+|with\s+)?codex\b/iu,
+    /\bcodex\s+(?:should|must|please|can\s+you)\b/iu,
+  ]],
+  ["claude", [
+    /(?:claude(?:\s+code)?|클로드(?:\s*코드)?|클라우드\s*코드)\s*(?:한테|에게|로|으로)\s*[^\n.!?]{0,32}(?:말|시켜|시키|맡겨|맡기|보내|돌려|실행|요청|부탁)/iu,
+    /(?:ask|use|run|route|send|delegate)(?:\s+this|\s+it|\s+the\s+task)?\s+(?:to\s+|with\s+)?claude(?:\s+code)?\b/iu,
+    /\bclaude(?:\s+code)?\s+(?:should|must|please|can\s+you)\b/iu,
+  ]],
+];
+
+/**
+ * Treat an explicit backend named by the user as a manual selection even when
+ * the UI is in Auto mode. Ambiguous mentions of both backends remain governed
+ * by RCC policy; only a directed target wins in that case.
+ */
+export function resolveProviderPreference(
+  task: string,
+  requested: ProviderPreference,
+): ProviderPreference {
+  if (requested !== "auto") return requested;
+  const normalized = task.normalize("NFKC");
+  const directed = directedProviderPatterns.filter(([, patterns]) =>
+    patterns.some((pattern) => pattern.test(normalized)),
+  ).map(([provider]) => provider);
+  if (directed.length === 1) return directed[0];
+  if (directed.length > 1) return "auto";
+
+  const mentioned = explicitProviderPatterns.filter(([, pattern]) =>
+    pattern.test(normalized),
+  ).map(([provider]) => provider);
+  return mentioned.length === 1 ? mentioned[0] : "auto";
+}
+
 const providers = new Set<Provider>(["codex", "claude"]);
 const permissions = new Set<PermissionProfile>([
   "read_only",
@@ -105,7 +146,10 @@ export function select(
   if (preference !== "auto") {
     return {
       provider: preference,
-      fallback_provider: preference === "codex" ? "claude" : "codex",
+      // A provider selected by the user (either in the UI or in the task text)
+      // is a hard target. Retries must not silently run the same request on the
+      // other backend and make the session label lie about where it executed.
+      fallback_provider: preference,
       permission_profile: policy.default_permission_profile,
       max_steps: policy.max_steps,
       budget_protected: true,

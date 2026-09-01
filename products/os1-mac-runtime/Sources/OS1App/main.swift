@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SQLite3
 import SwiftUI
 
 private enum ProviderChoice: String, CaseIterable, Codable, Identifiable, Sendable {
@@ -32,9 +33,350 @@ private enum ProviderChoice: String, CaseIterable, Codable, Identifiable, Sendab
     var tint: Color {
         switch self {
         case .auto: return Color(red: 0.38, green: 0.86, blue: 0.58)
-        case .codex: return Color(red: 0.82, green: 0.51, blue: 0.94)
-        case .claude: return Color(red: 0.93, green: 0.49, blue: 0.34)
+        case .codex: return Color(red: 0.95, green: 0.64, blue: 0.80)
+        case .claude: return Color(red: 0.98, green: 0.53, blue: 0.68)
         }
+    }
+}
+
+private struct NativeSessionSummary: Identifiable, Sendable {
+    let id: String
+    let provider: ProviderChoice
+    let title: String
+    let workspace: String
+    let workspaceLabel: String?
+    let updatedAt: Date
+    let sourcePath: String?
+    var linkedTitle: String?
+
+    var displayTitle: String {
+        let value = (linkedTitle ?? title).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? "Untitled session" : value
+    }
+
+    var displayWorkspace: String {
+        if let workspaceLabel, !workspaceLabel.isEmpty { return workspaceLabel }
+        let value = URL(fileURLWithPath: workspace).lastPathComponent
+        return value.isEmpty ? "No workspace" : value
+    }
+}
+
+private struct NativeSessionMessage: Identifiable, Sendable {
+    let id: String
+    let role: MessageRole
+    let text: String
+    let timestamp: Date?
+}
+
+private enum NativeSessionReader {
+    nonisolated(unsafe) private static let iso8601 = ISO8601DateFormatter()
+
+    private struct ClaudeDesktopMetadata {
+        let title: String
+        let workspace: String
+        let lastActivityAt: Date?
+        let isArchived: Bool
+    }
+
+    static func sessions(for provider: ProviderChoice) throws -> [NativeSessionSummary] {
+        switch provider {
+        case .codex: return try codexSessions()
+        case .claude: return try claudeSessions()
+        case .auto: return []
+        }
+    }
+
+    static func transcript(for session: NativeSessionSummary) throws -> [NativeSessionMessage] {
+        switch session.provider {
+        case .codex: return try codexTranscript(sessionID: session.id)
+        case .claude: return try claudeTranscript(session: session)
+        case .auto: return []
+        }
+    }
+
+    private static func codexSessions() throws -> [NativeSessionSummary] {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = "\(home)/.codex/state_5.sqlite"
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let database else {
+            throw RunnerError.message("Codex session index could not be opened.")
+        }
+        defer { sqlite3_close(database) }
+        let query = """
+        SELECT id,
+               COALESCE(NULLIF(name, ''), NULLIF(title, ''), NULLIF(first_user_message, ''), 'Untitled session'),
+               cwd,
+               COALESCE(NULLIF(recency_at_ms, 0), NULLIF(updated_at_ms, 0), updated_at * 1000)
+        FROM threads
+        WHERE archived = 0 AND preview <> ''
+        ORDER BY recency_at_ms DESC, updated_at_ms DESC
+        LIMIT 500
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw RunnerError.message("Codex session index could not be read.")
+        }
+        defer { sqlite3_finalize(statement) }
+        var result: [NativeSessionSummary] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = columnText(statement, 0)
+            guard !id.isEmpty else { continue }
+            result.append(NativeSessionSummary(
+                id: id,
+                provider: .codex,
+                title: columnText(statement, 1),
+                workspace: columnText(statement, 2),
+                workspaceLabel: nil,
+                updatedAt: Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, 3)) / 1_000),
+                sourcePath: nil,
+                linkedTitle: nil
+            ))
+        }
+        return result
+    }
+
+    private static func codexTranscript(sessionID: String) throws -> [NativeSessionMessage] {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = "\(home)/.codex/thread_history_1.sqlite"
+        var database: OpaquePointer?
+        guard sqlite3_open_v2(path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let database else {
+            throw RunnerError.message("Codex transcript database could not be opened.")
+        }
+        defer { sqlite3_close(database) }
+        let query = """
+        SELECT item_type, item_json, created_at_ms
+        FROM (
+          SELECT rollout_ordinal, item_type, item_json, created_at_ms
+          FROM thread_items
+          WHERE thread_id = ? AND item_type IN ('userMessage', 'agentMessage')
+          ORDER BY rollout_ordinal DESC
+          LIMIT 400
+        )
+        ORDER BY rollout_ordinal ASC
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, query, -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw RunnerError.message("Codex transcript could not be read.")
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, sessionID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        var result: [NativeSessionMessage] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let type = columnText(statement, 0)
+            let json = columnText(statement, 1)
+            guard let data = json.data(using: .utf8),
+                  let item = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let text: String
+            let role: MessageRole
+            if type == "userMessage" {
+                role = .user
+                text = textContent(item["content"])
+            } else {
+                role = .assistant
+                text = item["text"] as? String ?? ""
+            }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            result.append(NativeSessionMessage(
+                id: (item["id"] as? String) ?? "codex-\(result.count)",
+                role: role,
+                text: trimmed,
+                timestamp: Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, 2)) / 1_000)
+            ))
+        }
+        return result
+    }
+
+    private static func claudeSessions() throws -> [NativeSessionSummary] {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects", isDirectory: true)
+        let desktopMetadata = claudeDesktopSessionMetadata()
+        let repositoryLabels = claudeRepositoryLabels()
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        var files: [(URL, Date)] = []
+        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey])
+            guard values?.isRegularFile == true else { continue }
+            files.append((url, values?.contentModificationDate ?? .distantPast))
+        }
+        files.sort { $0.1 > $1.1 }
+        return files.compactMap { url, modifiedAt in
+            guard let records = try? readJSONLines(url, maximumBytes: 768 * 1_024), !records.isEmpty else { return nil }
+            var id = url.deletingPathExtension().lastPathComponent
+            var workspace = ""
+            var timestamp: Date?
+            var title = ""
+            var hasVisibleConversation = false
+            for record in records {
+                if let value = record["sessionId"] as? String, !value.isEmpty { id = value }
+                if let value = record["cwd"] as? String, !value.isEmpty { workspace = value }
+                if let value = record["timestamp"] as? String, let date = iso8601.date(from: value) {
+                    timestamp = timestamp.map { max($0, date) } ?? date
+                }
+                let type = record["type"] as? String
+                if type == "user" || type == "assistant",
+                   let message = record["message"] as? [String: Any] {
+                    let text = textContent(message["content"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !text.isEmpty {
+                        hasVisibleConversation = true
+                        if title.isEmpty, type == "user" { title = firstLine(text) }
+                    }
+                }
+            }
+            // Claude Code print-mode sessions are genuine persistent backend
+            // sessions but do not carry Claude Desktop's `bridge-session`
+            // marker. The previous marker gate hid every session created or
+            // resumed by OS-1 even though its JSONL transcript existed. Show
+            // every persistent Claude conversation with visible user/assistant
+            // turns so the backend surface mirrors Claude Code itself.
+            guard hasVisibleConversation else { return nil }
+            if let metadata = desktopMetadata[id] {
+                guard !metadata.isArchived else { return nil }
+                if !metadata.title.isEmpty { title = metadata.title }
+                if workspace.isEmpty, !metadata.workspace.isEmpty { workspace = metadata.workspace }
+                if let activity = metadata.lastActivityAt { timestamp = activity }
+            }
+            return NativeSessionSummary(
+                id: id,
+                provider: .claude,
+                title: title,
+                workspace: workspace,
+                workspaceLabel: claudeProjectLabel(workspace, repositoryLabels: repositoryLabels),
+                updatedAt: timestamp ?? modifiedAt,
+                sourcePath: url.path,
+                linkedTitle: nil
+            )
+        }.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private static func claudeDesktopSessionMetadata() -> [String: ClaudeDesktopMetadata] {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Claude/claude-code-sessions", isDirectory: true)
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [:] }
+        var result: [String: ClaudeDesktopMetadata] = [:]
+        for case let url as URL in enumerator where url.pathExtension == "json" && url.lastPathComponent.hasPrefix("local_") {
+            guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+                  let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let cliSessionID = value["cliSessionId"] as? String,
+                  !cliSessionID.isEmpty else { continue }
+            let milliseconds = value["lastActivityAt"] as? Double
+                ?? (value["lastActivityAt"] as? NSNumber)?.doubleValue
+            result[cliSessionID] = ClaudeDesktopMetadata(
+                title: value["title"] as? String ?? "",
+                workspace: value["originCwd"] as? String ?? value["cwd"] as? String ?? "",
+                lastActivityAt: milliseconds.map { Date(timeIntervalSince1970: $0 / 1_000) },
+                isArchived: value["isArchived"] as? Bool ?? false
+            )
+        }
+        return result
+    }
+
+    private static func claudeProjectLabel(_ workspace: String, repositoryLabels: [String: String]) -> String {
+        guard !workspace.isEmpty else { return "No folder" }
+        if workspace.contains("/Library/Application Support/Claude/scratch-workspaces/") {
+            return "No folder"
+        }
+        if let label = repositoryLabels[workspace], !label.isEmpty { return label }
+        let name = URL(fileURLWithPath: workspace).lastPathComponent
+        return name.isEmpty ? "No folder" : name
+    }
+
+    private static func claudeRepositoryLabels() -> [String: String] {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let repositories = root["githubRepoPaths"] as? [String: Any] else { return [:] }
+        var result: [String: String] = [:]
+        for (repository, rawPaths) in repositories {
+            guard let paths = rawPaths as? [String] else { continue }
+            let label = repository.split(separator: "/").last.map(String.init) ?? repository
+            for path in paths { result[path] = label }
+        }
+        return result
+    }
+
+    private static func claudeTranscript(session: NativeSessionSummary) throws -> [NativeSessionMessage] {
+        guard let sourcePath = session.sourcePath else { return [] }
+        let records = try readJSONLines(URL(fileURLWithPath: sourcePath), maximumBytes: nil)
+        var result: [NativeSessionMessage] = []
+        for record in records {
+            guard let type = record["type"] as? String, type == "user" || type == "assistant",
+                  let message = record["message"] as? [String: Any] else { continue }
+            let text = textContent(message["content"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            let timestamp = (record["timestamp"] as? String).flatMap(iso8601.date(from:))
+            result.append(NativeSessionMessage(
+                id: (record["uuid"] as? String) ?? "claude-\(result.count)",
+                role: type == "user" ? .user : .assistant,
+                text: text,
+                timestamp: timestamp
+            ))
+        }
+        return Array(result.suffix(400))
+    }
+
+    private static func columnText(_ statement: OpaquePointer, _ index: Int32) -> String {
+        guard let value = sqlite3_column_text(statement, index) else { return "" }
+        return String(cString: value)
+    }
+
+    private static func readJSONLines(_ url: URL, maximumBytes: Int?) throws -> [[String: Any]] {
+        let data: Data
+        if let maximumBytes {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let fileSize = try handle.seekToEnd()
+            if fileSize <= UInt64(maximumBytes) {
+                try handle.seek(toOffset: 0)
+                data = try handle.readToEnd() ?? Data()
+            } else {
+                // Keep session identity/title context from the beginning and
+                // current activity from the end. Reading only the first bytes
+                // made long-running Claude sessions look stale after resume.
+                let headBytes = max(64 * 1_024, maximumBytes / 4)
+                let tailBytes = max(64 * 1_024, maximumBytes - headBytes)
+                try handle.seek(toOffset: 0)
+                let head = try handle.read(upToCount: headBytes) ?? Data()
+                try handle.seek(toOffset: fileSize - UInt64(tailBytes))
+                var tail = try handle.readToEnd() ?? Data()
+                if let newline = tail.firstIndex(of: 0x0A) {
+                    tail = Data(tail[tail.index(after: newline)...])
+                }
+                data = head + Data("\n".utf8) + tail
+            }
+        } else {
+            data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        }
+        return String(decoding: data, as: UTF8.self).split(separator: "\n").compactMap { line in
+            guard let lineData = String(line).data(using: .utf8) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: lineData)) as? [String: Any]
+        }
+    }
+
+    private static func textContent(_ value: Any?) -> String {
+        if let value = value as? String { return value }
+        guard let values = value as? [[String: Any]] else { return "" }
+        return values.compactMap { item -> String? in
+            guard item["type"] as? String == "text" || item["type"] as? String == "input_text" || item["type"] as? String == "output_text" else { return nil }
+            return item["text"] as? String
+        }.joined(separator: "\n\n")
+    }
+
+    private static func firstLine(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return String((trimmed.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? trimmed).prefix(90))
     }
 }
 
@@ -159,6 +501,15 @@ private func backendTierLabel(action: String, provider: String) -> String {
     case "agent_run_deep": return "Deep \(engine) backend"
     default: return "Standard \(engine) backend"
     }
+}
+
+private func compactSessionAge(_ date: Date) -> String {
+    let seconds = max(0, Int(Date().timeIntervalSince(date)))
+    if seconds < 60 { return "now" }
+    if seconds < 3_600 { return "\(seconds / 60)m" }
+    if seconds < 86_400 { return "\(seconds / 3_600)h" }
+    if seconds < 2_592_000 { return "\(seconds / 86_400)d" }
+    return date.formatted(date: .abbreviated, time: .omitted)
 }
 
 private enum OS1Runner {
@@ -304,8 +655,14 @@ private enum OS1Runner {
 private final class SessionStore: ObservableObject {
     @Published var sessions: [ConversationSession] = []
     @Published var selectedSessionID: UUID?
+    @Published var surface: ProviderChoice = .auto
     @Published var composer = ""
     @Published var search = ""
+    @Published var nativeSearch = ""
+    @Published var nativeSessions: [NativeSessionSummary] = []
+    @Published var selectedNativeSessionID: String?
+    @Published var nativeMessages: [NativeSessionMessage] = []
+    @Published var isLoadingNativeSessions = false
     @Published var isRunning = false
     @Published var statusText = "Ready"
     @Published var alertMessage: String?
@@ -337,6 +694,20 @@ private final class SessionStore: ObservableObject {
             $0.title.localizedCaseInsensitiveContains(query) ||
             $0.workspace.localizedCaseInsensitiveContains(query)
         }
+    }
+
+    var filteredNativeSessions: [NativeSessionSummary] {
+        let query = nativeSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return nativeSessions }
+        return nativeSessions.filter {
+            $0.displayTitle.localizedCaseInsensitiveContains(query) ||
+            $0.workspace.localizedCaseInsensitiveContains(query) ||
+            $0.id.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var selectedNativeSession: NativeSessionSummary? {
+        nativeSessions.first(where: { $0.id == selectedNativeSessionID })
     }
 
     func createSession(provider: ProviderChoice? = nil) {
@@ -377,6 +748,92 @@ private final class SessionStore: ObservableObject {
             ? "RCC will choose the next engine"
             : "Next turn: \(provider.title)"
         save()
+    }
+
+    func showClaudexHome() {
+        guard !isRunning else { return }
+        surface = .auto
+        chooseProvider(.auto)
+        statusText = "Claudex home · RCC auto routing"
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func inspectBackend(_ provider: ProviderChoice) {
+        guard !isRunning, provider != .auto else { return }
+        surface = provider
+        nativeSearch = ""
+        let preferredID = provider == .codex
+            ? selectedSession?.codexSessionID
+            : selectedSession?.claudeSessionID
+        statusText = "Syncing local \(provider.title) sessions…"
+        isLoadingNativeSessions = true
+        nativeMessages = []
+        Task {
+            do {
+                let loaded = try await Task.detached(priority: .userInitiated) {
+                    try NativeSessionReader.sessions(for: provider)
+                }.value
+                guard surface == provider else { return }
+                var linkedTitles: [String: String] = [:]
+                for session in sessions {
+                    let id = provider == .codex ? session.codexSessionID : session.claudeSessionID
+                    if let id { linkedTitles[id] = session.title }
+                }
+                nativeSessions = loaded.map { value in
+                    var copy = value
+                    copy.linkedTitle = linkedTitles[value.id]
+                    return copy
+                }
+                selectedNativeSessionID = preferredID.flatMap { id in
+                    nativeSessions.contains(where: { $0.id == id }) ? id : nil
+                } ?? nativeSessions.first?.id
+                isLoadingNativeSessions = false
+                statusText = "\(provider.title) backend · \(nativeSessions.count) local sessions synced"
+                loadSelectedNativeTranscript()
+            } catch {
+                guard surface == provider else { return }
+                isLoadingNativeSessions = false
+                nativeSessions = []
+                selectedNativeSessionID = nil
+                nativeMessages = []
+                alertMessage = error.localizedDescription
+                statusText = "Native session sync needs attention"
+            }
+        }
+    }
+
+    func refreshNativeSessions() {
+        guard surface != .auto else { return }
+        inspectBackend(surface)
+    }
+
+    func selectNativeSession(_ id: String) {
+        selectedNativeSessionID = id
+        loadSelectedNativeTranscript()
+    }
+
+    private func loadSelectedNativeTranscript() {
+        guard let session = selectedNativeSession else {
+            nativeMessages = []
+            return
+        }
+        let expectedID = session.id
+        isLoadingNativeSessions = true
+        Task {
+            do {
+                let messages = try await Task.detached(priority: .userInitiated) {
+                    try NativeSessionReader.transcript(for: session)
+                }.value
+                guard selectedNativeSessionID == expectedID else { return }
+                nativeMessages = messages
+                isLoadingNativeSessions = false
+            } catch {
+                guard selectedNativeSessionID == expectedID else { return }
+                nativeMessages = []
+                isLoadingNativeSessions = false
+                alertMessage = error.localizedDescription
+            }
+        }
     }
 
     func setCapacity(_ provider: ProviderChoice, value: Int) {
@@ -530,81 +987,6 @@ private final class SessionStore: ObservableObject {
         return String(text.suffix(180_000))
     }
 
-    func openCodexSession() {
-        guard let value = selectedSession?.codexSessionID,
-              UUID(uuidString: value) != nil,
-              let url = URL(string: "codex://threads/\(value)") else {
-            alertMessage = "Run one Codex turn first. Its native Codex task will be linked here."
-            return
-        }
-        guard NSWorkspace.shared.open(url) else {
-            alertMessage = "Codex could not open this native task."
-            return
-        }
-        statusText = "Opened native Codex task"
-    }
-
-    func openClaudeSession() {
-        guard let session = selectedSession,
-              let value = session.claudeSessionID,
-              UUID(uuidString: value) != nil else {
-            alertMessage = "Run one Claude turn first. Its native Claude Code session will be linked here."
-            return
-        }
-        let home = fileManager.homeDirectoryForCurrentUser.path
-        let candidates = [
-            "\(home)/.local/bin/claude",
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude",
-        ]
-        guard let claude = candidates.first(where: fileManager.isExecutableFile) else {
-            alertMessage = "Claude Code is not installed or signed in on this Mac."
-            return
-        }
-        let command = "cd \(shellQuote(session.workspace)) && exec \(shellQuote(claude)) --resume \(shellQuote(value))"
-        let escaped = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let arguments = [
-            "-e", "tell application \"Terminal\" to activate",
-            "-e", "tell application \"Terminal\" to do script \"\(escaped)\"",
-        ]
-        statusText = "Opening native Claude Code session…"
-        Task {
-            let failure = await Task.detached(priority: .userInitiated) { () -> String? in
-                let process = Process()
-                let stderr = Pipe()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                process.arguments = arguments
-                process.standardError = stderr
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-                    guard process.terminationStatus == 0 else {
-                        let detail = String(
-                            decoding: stderr.fileHandleForReading.readDataToEndOfFile(),
-                            as: UTF8.self
-                        ).trimmingCharacters(in: .whitespacesAndNewlines)
-                        return detail.isEmpty ? "Terminal rejected the session request." : detail
-                    }
-                    return nil
-                } catch {
-                    return error.localizedDescription
-                }
-            }.value
-            if let failure {
-                alertMessage = "Claude Code session could not open: \(failure)"
-                statusText = "Needs attention"
-            } else {
-                statusText = "Opened native Claude Code session"
-            }
-        }
-    }
-
-    private func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
     private var storageURL: URL {
         fileManager.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/OS-1", isDirectory: true)
@@ -659,13 +1041,16 @@ private final class SessionStore: ObservableObject {
 }
 
 private enum Theme {
-    static let background = Color(red: 0.035, green: 0.035, blue: 0.045)
-    static let panel = Color(red: 0.055, green: 0.055, blue: 0.068)
-    static let panelRaised = Color(red: 0.075, green: 0.075, blue: 0.092)
-    static let border = Color.white.opacity(0.09)
-    static let muted = Color.white.opacity(0.48)
-    static let text = Color.white.opacity(0.93)
-    static let green = Color(red: 0.35, green: 0.92, blue: 0.55)
+    static let background = Color(red: 0.008, green: 0.008, blue: 0.011)
+    static let panel = Color(red: 0.015, green: 0.014, blue: 0.017)
+    static let panelRaised = Color(red: 0.035, green: 0.029, blue: 0.034)
+    static let border = Color.white.opacity(0.14)
+    static let borderStrong = Color.white.opacity(0.22)
+    static let muted = Color.white.opacity(0.47)
+    static let text = Color.white.opacity(0.95)
+    static let pink = Color(red: 0.93, green: 0.70, blue: 0.80)
+    static let pinkDeep = Color(red: 0.22, green: 0.10, blue: 0.16)
+    static let green = Color(red: 0.28, green: 0.93, blue: 0.55)
 }
 
 @main
@@ -678,7 +1063,7 @@ private struct OS1DesktopApp: App {
                 .preferredColorScheme(.dark)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1240, height: 780)
+        .defaultSize(width: 1360, height: 760)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New session pair") { store.createSession() }
@@ -692,14 +1077,24 @@ private struct RootView: View {
     @ObservedObject var store: SessionStore
 
     var body: some View {
-        HStack(spacing: 0) {
-            ProviderRail(store: store)
-            Divider().overlay(Theme.border)
-            SessionSidebar(store: store)
-            Divider().overlay(Theme.border)
-            ConversationView(store: store)
+        ZStack {
+            CosmicBackdrop()
+            HStack(spacing: 0) {
+                ProviderRail(store: store)
+                Rectangle().fill(Theme.border).frame(width: 1)
+                if store.surface == .auto {
+                    SessionSidebar(store: store)
+                    Rectangle().fill(Theme.border).frame(width: 1)
+                    ConversationView(store: store)
+                } else {
+                    NativeSessionBrowser(store: store, provider: store.surface)
+                }
+            }
+            .background(Theme.background.opacity(0.97))
+            .overlay(Rectangle().stroke(Theme.borderStrong, lineWidth: 1))
+            .padding(12)
         }
-        .frame(minWidth: 1_040, minHeight: 680)
+        .frame(minWidth: 1_100, minHeight: 680)
         .background(Theme.background)
         .alert("OS-1 Claudex", isPresented: Binding(
             get: { store.alertMessage != nil },
@@ -712,67 +1107,398 @@ private struct RootView: View {
     }
 }
 
+private struct CosmicBackdrop: View {
+    var body: some View {
+        Canvas { context, size in
+            let width = max(size.width, 1)
+            let height = max(size.height, 1)
+            for index in 0..<82 {
+                let x = CGFloat((index * 83 + 17) % 997) / 997 * width
+                let y = CGFloat((index * 47 + 31) % 991) / 991 * height
+                let diameter = CGFloat(index % 4 == 0 ? 1.4 : 0.8)
+                let tint = index % 5 == 0 ? Theme.pink : Color.white
+                context.fill(
+                    Path(ellipseIn: CGRect(x: x, y: y, width: diameter, height: diameter)),
+                    with: .color(tint.opacity(index % 5 == 0 ? 0.16 : 0.10))
+                )
+            }
+            for index in stride(from: 0, to: 28, by: 4) {
+                var path = Path()
+                let start = CGPoint(
+                    x: CGFloat((index * 97 + 23) % 997) / 997 * width,
+                    y: CGFloat((index * 61 + 19) % 991) / 991 * height
+                )
+                let end = CGPoint(
+                    x: min(width, start.x + CGFloat(90 + index * 7)),
+                    y: min(height, start.y + CGFloat(42 + index * 3))
+                )
+                path.move(to: start)
+                path.addLine(to: end)
+                context.stroke(path, with: .color(Theme.pink.opacity(0.035)), lineWidth: 0.6)
+            }
+        }
+        .background(Color.black)
+        .allowsHitTesting(false)
+    }
+}
+
 private struct ProviderRail: View {
     @ObservedObject var store: SessionStore
 
     var body: some View {
-        VStack(spacing: 18) {
-            ZStack {
-                Circle()
-                    .fill(AngularGradient(
-                        colors: [.pink, .purple, .orange, .pink],
-                        center: .center
-                    ))
-                Circle().fill(Theme.background).padding(7)
-                Circle().fill(Color.white.opacity(0.9)).frame(width: 7, height: 7)
+        VStack(spacing: 22) {
+            Button { store.showClaudexHome() } label: {
+                ZStack {
+                    Circle()
+                        .fill(AngularGradient(
+                            colors: [Theme.pink, .pink, .red, Theme.pink],
+                            center: .center
+                        ))
+                    Circle().fill(Theme.background).padding(8)
+                    Circle().fill(Color.white.opacity(0.94)).frame(width: 6, height: 6)
+                }
+                .frame(width: 43, height: 43)
             }
-            .frame(width: 38, height: 38)
-            .padding(.bottom, 5)
+            .buttonStyle(.plain)
+            .disabled(store.isRunning)
+            .help("Claudex home")
+            .accessibilityLabel("Claudex home")
+            .padding(.bottom, 8)
 
             ForEach([ProviderChoice.codex, ProviderChoice.claude]) { provider in
                 BackendStatus(
                     provider: provider,
-                    active: store.selectedSession?.lastProvider == provider.rawValue
-                )
+                    selected: store.surface == provider,
+                    active: store.selectedSession?.lastProvider == provider.rawValue,
+                    linked: provider == .codex
+                        ? store.selectedSession?.codexSessionID != nil
+                        : store.selectedSession?.claudeSessionID != nil,
+                    disabled: store.isRunning
+                ) { store.inspectBackend(provider) }
             }
 
             Spacer()
 
-            RailButton(
-                provider: .auto,
-                selected: store.selectedSession?.provider == .auto,
-                disabled: store.isRunning
-            ) { store.chooseProvider(.auto) }
-
-            VStack(spacing: 5) {
-                Circle().fill(Theme.green).frame(width: 7, height: 7)
-                    .shadow(color: Theme.green.opacity(0.7), radius: 5)
-                Text("RCC")
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
+            VStack(spacing: 6) {
+                Circle().fill(Theme.green).frame(width: 9, height: 9)
+                    .shadow(color: Theme.green.opacity(0.85), radius: 6)
+                Text("RCC\nGOVERNED")
+                    .font(.system(size: 7, weight: .bold, design: .rounded))
+                    .tracking(0.7)
+                    .multilineTextAlignment(.center)
                     .foregroundStyle(Theme.muted)
             }
         }
-        .padding(.vertical, 18)
-        .frame(width: 82)
-        .background(Color.black.opacity(0.2))
+        .padding(.vertical, 24)
+        .frame(width: 78)
+        .background(Color.black.opacity(0.74))
     }
 }
 
 private struct BackendStatus: View {
     let provider: ProviderChoice
+    let selected: Bool
     let active: Bool
+    let linked: Bool
+    let disabled: Bool
+    let action: () -> Void
 
     var body: some View {
-        VStack(spacing: 7) {
-            Image(systemName: provider.symbol).font(.system(size: 17, weight: .semibold))
-            Text("BACKEND").font(.system(size: 7, weight: .bold, design: .rounded))
+        Button(action: action) {
+            VStack(spacing: 9) {
+                Image(systemName: provider.symbol)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(selected ? Color.black.opacity(0.82) : provider.tint)
+                    .frame(width: 27, height: 27)
+                    .background(selected ? provider.tint : provider.tint.opacity(0.16))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                Text(provider == .claude ? "CLAUDE" : "CODEX")
+                    .font(.system(size: 7, weight: .bold, design: .rounded))
+                    .tracking(1.1)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                HStack(spacing: 3) {
+                    Circle().fill(linked ? Theme.green : Theme.muted).frame(width: 4, height: 4)
+                    Text(linked ? "SYNCED" : "CONNECT")
+                        .font(.system(size: 5.5, weight: .bold, design: .rounded))
+                }
+            }
+            .foregroundStyle(linked ? (selected ? Theme.text : provider.tint) : Theme.muted)
+            .frame(width: 58, height: 80)
+            .background(linked ? provider.tint.opacity(selected ? 0.13 : (active ? 0.08 : 0.025)) : Color.black.opacity(0.25))
+            .overlay(
+                Rectangle()
+                    .stroke(linked ? provider.tint.opacity(selected || active ? 0.75 : 0.25) : Theme.border, lineWidth: selected ? 1.3 : 1)
+            )
         }
-        .foregroundStyle(active ? provider.tint : Theme.muted)
-        .frame(width: 58, height: 58)
-        .background(active ? provider.tint.opacity(0.12) : Color.clear)
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(active ? provider.tint : Theme.border))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .help("Managed (provider.title) backend")
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .help("View synchronized \(provider.title) sessions inside Claudex")
+        .accessibilityLabel(provider == .claude ? "Claude Code backend" : "Codex backend")
+    }
+}
+
+private struct NativeSessionBrowser: View {
+    @ObservedObject var store: SessionStore
+    let provider: ProviderChoice
+
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 8) {
+                    Text("OS-1").foregroundStyle(Theme.pink)
+                    Text("CLAUDEX").foregroundStyle(Theme.text)
+                }
+                .font(.system(size: 16, weight: .bold, design: .rounded))
+                .tracking(2.1)
+                .padding(.horizontal, 24)
+                .padding(.top, 34)
+                .padding(.bottom, 24)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(provider == .claude ? "CLAUDE CODE SESSIONS" : "CODEX SESSIONS")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(1.2)
+                        .foregroundStyle(provider.tint)
+                    HStack(spacing: 6) {
+                        Circle().fill(Theme.green).frame(width: 6, height: 6)
+                        Text("SYNCED · \(store.nativeSessions.count)")
+                            .font(.system(size: 9, weight: .bold, design: .rounded))
+                            .foregroundStyle(Theme.muted)
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 16)
+
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(Theme.muted)
+                    TextField("Search \(provider.title) sessions", text: $store.nativeSearch)
+                        .textFieldStyle(.plain)
+                    Button { store.refreshNativeSessions() } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Refresh local sessions")
+                    .accessibilityLabel("Refresh backend sessions")
+                }
+                .padding(.horizontal, 16)
+                .frame(height: 48)
+                .background(Color.black.opacity(0.24))
+                .overlay(Rectangle().stroke(Theme.borderStrong))
+                .padding(.horizontal, 20)
+                .padding(.bottom, 16)
+
+                if store.isLoadingNativeSessions && store.nativeSessions.isEmpty {
+                    Spacer()
+                    ProgressView("Synchronizing local sessions…")
+                        .controlSize(.small)
+                        .foregroundStyle(Theme.muted)
+                        .frame(maxWidth: .infinity)
+                    Spacer()
+                } else if store.filteredNativeSessions.isEmpty {
+                    Spacer()
+                    Text("No local sessions found")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.muted)
+                        .frame(maxWidth: .infinity)
+                    Spacer()
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 6) {
+                            ForEach(store.filteredNativeSessions) { session in
+                                NativeSessionRow(
+                                    session: session,
+                                    selected: store.selectedNativeSessionID == session.id,
+                                    tint: provider.tint
+                                ) { store.selectNativeSession(session.id) }
+                            }
+                        }
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 12)
+                    }
+                }
+            }
+            .frame(width: 315)
+            .background(Color.black.opacity(0.72))
+
+            Rectangle().fill(Theme.border).frame(width: 1)
+
+            NativeTranscriptView(store: store, provider: provider)
+        }
+    }
+}
+
+private struct NativeSessionRow: View {
+    let session: NativeSessionSummary
+    let selected: Bool
+    let tint: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 7) {
+                    Circle().fill(session.linkedTitle == nil ? Theme.muted : Theme.green)
+                        .frame(width: 6, height: 6)
+                    Text(session.displayTitle)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                        .lineLimit(2)
+                    Spacer(minLength: 4)
+                    if session.linkedTitle != nil {
+                        Text("OS1")
+                            .font(.system(size: 7, weight: .bold, design: .rounded))
+                            .foregroundStyle(Theme.green)
+                    }
+                }
+                HStack(spacing: 6) {
+                    Text(session.displayWorkspace)
+                        .lineLimit(1)
+                    Spacer()
+                    Text(compactSessionAge(session.updatedAt))
+                        .lineLimit(1)
+                }
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(Theme.muted)
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 13)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? Theme.panelRaised : Color.clear)
+            .overlay(
+                RoundedRectangle(cornerRadius: 11)
+                    .stroke(selected ? tint.opacity(0.42) : Color.clear, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 11))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(session.displayTitle)
+    }
+}
+
+private struct NativeTranscriptView: View {
+    @ObservedObject var store: SessionStore
+    let provider: ProviderChoice
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Text("\(provider == .claude ? "CLAUDE CODE" : "CODEX") · \(store.selectedNativeSession?.displayTitle ?? "SELECT A SESSION")")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                Spacer()
+                if let session = store.selectedNativeSession, !session.workspace.isEmpty {
+                    Text(session.displayWorkspace)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Theme.muted)
+                        .lineLimit(1)
+                }
+                Circle().fill(Theme.green).frame(width: 8, height: 8)
+                    .shadow(color: Theme.green.opacity(0.75), radius: 5)
+                Text("RCC governed")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.muted)
+            }
+            .padding(.horizontal, 24)
+            .frame(height: 66)
+            .background(Color.black.opacity(0.72))
+
+            Rectangle().fill(Theme.border).frame(height: 1)
+
+            if store.selectedNativeSession == nil {
+                Spacer()
+                Text("Choose a \(provider.title) session from the left")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.muted)
+                Spacer()
+            } else if store.isLoadingNativeSessions && store.nativeMessages.isEmpty {
+                Spacer()
+                ProgressView("Loading synchronized transcript…")
+                    .controlSize(.small)
+                    .foregroundStyle(Theme.muted)
+                Spacer()
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 14) {
+                            ForEach(store.nativeMessages) { message in
+                                NativeMessageCard(message: message, provider: provider)
+                                    .id(message.id)
+                            }
+                            if store.nativeMessages.isEmpty {
+                                Text("This session has no visible user or assistant messages yet.")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(Theme.muted)
+                                    .padding(.top, 60)
+                            }
+                        }
+                        .padding(.horizontal, 40)
+                        .padding(.vertical, 30)
+                        .frame(maxWidth: 1_020)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .onAppear { scrollToBottom(proxy) }
+                    .onChange(of: store.nativeMessages.count) { _ in scrollToBottom(proxy) }
+                }
+            }
+
+            Rectangle().fill(Theme.border).frame(height: 1)
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                Text("READ-ONLY SYNCHRONIZED BACKEND · USE CLAUDEX HOME TO ROUTE THE NEXT TASK")
+                Spacer()
+                Text(provider == .claude ? "CLAUDE CODE" : "CODEX")
+                    .foregroundStyle(provider.tint)
+            }
+            .font(.system(size: 9, weight: .semibold, design: .rounded))
+            .foregroundStyle(Theme.muted)
+            .padding(.horizontal, 14)
+            .frame(height: 38)
+            .background(Color.black.opacity(0.72))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.background)
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        guard let id = store.nativeMessages.last?.id else { return }
+        DispatchQueue.main.async { proxy.scrollTo(id, anchor: .bottom) }
+    }
+}
+
+private struct NativeMessageCard: View {
+    let message: NativeSessionMessage
+    let provider: ProviderChoice
+
+    var body: some View {
+        HStack {
+            if message.role == .user { Spacer(minLength: 100) }
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 7) {
+                    Image(systemName: message.role == .user ? "person.crop.circle.fill" : provider.symbol)
+                    Text(message.role == .user ? "YOU" : (provider == .claude ? "CLAUDE CODE" : "CODEX"))
+                    Spacer()
+                    if let timestamp = message.timestamp {
+                        Text(timestamp, style: .time)
+                    }
+                }
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .foregroundStyle(message.role == .user ? Theme.muted : provider.tint)
+                Text(message.text)
+                    .font(.system(size: 12, weight: .regular, design: .monospaced))
+                    .foregroundStyle(Theme.text)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(16)
+            .background(message.role == .user ? Color.black.opacity(0.5) : provider.tint.opacity(0.025))
+            .overlay(
+                Rectangle()
+                    .stroke(message.role == .user ? Theme.borderStrong : provider.tint.opacity(0.18))
+            )
+            if message.role != .user { Spacer(minLength: 60) }
+        }
     }
 }
 
@@ -810,48 +1536,44 @@ private struct SessionSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
                 Text("OS-1")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .tracking(2.4)
-                    .foregroundStyle(Theme.muted)
+                    .foregroundStyle(Theme.pink)
                 Text("CLAUDEX")
-                    .font(.system(size: 19, weight: .bold, design: .rounded))
-                    .tracking(1.6)
                     .foregroundStyle(Theme.text)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 23)
-            .padding(.bottom, 18)
+            .font(.system(size: 16, weight: .bold, design: .rounded))
+            .tracking(2.1)
+            .padding(.horizontal, 24)
+            .padding(.top, 34)
+            .padding(.bottom, 24)
 
             Button { store.createSession() } label: {
-                Label("New session pair", systemImage: "square.and.pencil")
-                    .font(.system(size: 13, weight: .semibold))
+                Label("New governed task", systemImage: "pencil")
+                    .font(.system(size: 14, weight: .semibold))
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .frame(height: 44)
-                    .background(Theme.panelRaised)
-                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(Theme.border))
-                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                    .padding(.horizontal, 16)
+                    .frame(height: 54)
+                    .background(Color.black.opacity(0.24))
+                    .overlay(Rectangle().stroke(Theme.borderStrong))
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 20)
 
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(Theme.muted)
                 TextField("Search sessions", text: $store.search)
                     .textFieldStyle(.plain)
             }
-            .padding(.horizontal, 12)
-            .frame(height: 38)
-            .background(Color.black.opacity(0.16))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .padding(.horizontal, 14)
-            .padding(.top, 10)
+            .padding(.horizontal, 16)
+            .frame(height: 48)
+            .background(Color.black.opacity(0.24))
+            .overlay(Rectangle().stroke(Theme.borderStrong))
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
 
             HStack {
-                Text("SESSION PAIRS")
+                Text("SYNCED SESSIONS")
                     .font(.system(size: 10, weight: .bold, design: .rounded))
                     .tracking(1.2)
                     .foregroundStyle(Theme.muted)
@@ -860,9 +1582,9 @@ private struct SessionSidebar: View {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Theme.muted)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 20)
-            .padding(.bottom, 8)
+            .padding(.horizontal, 25)
+            .padding(.top, 24)
+            .padding(.bottom, 12)
 
             ScrollView {
                 LazyVStack(spacing: 4) {
@@ -873,26 +1595,13 @@ private struct SessionSidebar: View {
                         ) { store.select(session.id) }
                     }
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 20)
             }
 
             Spacer(minLength: 0)
-
-            HStack(spacing: 8) {
-                Circle().fill(Theme.green).frame(width: 7, height: 7)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Governance active")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Theme.text)
-                    Text("Real native sessions")
-                        .font(.system(size: 10))
-                        .foregroundStyle(Theme.muted)
-                }
-            }
-            .padding(16)
         }
-        .frame(width: 270)
-        .background(Theme.panel)
+        .frame(width: 315)
+        .background(Color.black.opacity(0.72))
     }
 }
 
@@ -903,34 +1612,31 @@ private struct SessionRow: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 7) {
-                    Circle().fill(session.provider.tint).frame(width: 6, height: 6)
                     Text(session.title)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(Theme.text)
                         .lineLimit(1)
                     Spacer(minLength: 0)
                 }
                 HStack(spacing: 6) {
                     Text(URL(fileURLWithPath: session.workspace).lastPathComponent)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: 11))
                         .foregroundStyle(Theme.muted)
                         .lineLimit(1)
                     Spacer(minLength: 0)
-                    NativeBadge(label: "C", linked: session.codexSessionID != nil, tint: ProviderChoice.codex.tint)
-                    NativeBadge(label: "A", linked: session.claudeSessionID != nil, tint: ProviderChoice.claude.tint)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 11)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 13)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(selected ? Color.white.opacity(0.07) : Color.clear)
+            .background(selected ? Theme.panelRaised : Color.clear)
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(selected ? Theme.border : Color.clear)
+                RoundedRectangle(cornerRadius: 11)
+                    .stroke(selected ? Theme.border.opacity(0.45) : Color.clear)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .clipShape(RoundedRectangle(cornerRadius: 11))
         }
         .buttonStyle(.plain)
     }
@@ -958,7 +1664,7 @@ private struct ConversationView: View {
     var body: some View {
         VStack(spacing: 0) {
             ConversationHeader(store: store)
-            Divider().overlay(Theme.border)
+            Rectangle().fill(Theme.border).frame(height: 1)
             if let session = store.selectedSession {
                 if session.messages.isEmpty {
                     WelcomeView(store: store, session: session)
@@ -978,7 +1684,7 @@ private struct ConversationHeader: View {
     var body: some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(store.selectedSession?.title ?? "OS-1 Claudex")
+                Text("\((store.selectedSession?.lastProvider ?? "RCC").uppercased()) · \(store.selectedSession?.title ?? "OS-1 CLAUDEX")")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
@@ -993,6 +1699,12 @@ private struct ConversationHeader: View {
             Spacer()
 
             if let session = store.selectedSession {
+                Circle().fill(Theme.green).frame(width: 8, height: 8)
+                    .shadow(color: Theme.green.opacity(0.75), radius: 5)
+                Text("RCC governed")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.muted)
+
                 Menu {
                     Button("Auto routing") { store.chooseProvider(.auto) }
                     Divider()
@@ -1010,9 +1722,9 @@ private struct ConversationHeader: View {
                     Button("Force Codex next turn") { store.chooseProvider(.codex) }
                     Button("Force Claude next turn") { store.chooseProvider(.claude) }
                     Divider()
-                    Button("Inspect Codex backend") { store.openCodexSession() }
+                    Button("Inspect Codex backend") { store.inspectBackend(.codex) }
                         .disabled(session.codexSessionID == nil)
-                    Button("Inspect Claude backend") { store.openClaudeSession() }
+                    Button("Inspect Claude backend") { store.inspectBackend(.claude) }
                         .disabled(session.claudeSessionID == nil)
                 } label: {
                     Label(
@@ -1025,9 +1737,8 @@ private struct ConversationHeader: View {
                     .foregroundStyle(Theme.green)
                     .padding(.horizontal, 10)
                     .frame(height: 35)
-                    .background(Theme.green.opacity(0.08))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.green.opacity(0.3)))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .background(Color.black.opacity(0.3))
+                    .overlay(Rectangle().stroke(Theme.border))
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
@@ -1043,18 +1754,17 @@ private struct ConversationHeader: View {
                     .foregroundStyle(Theme.text)
                     .padding(.horizontal, 11)
                     .frame(height: 35)
-                    .background(Theme.panelRaised)
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .background(Color.black.opacity(0.3))
+                    .overlay(Rectangle().stroke(Theme.border))
                 }
                 .buttonStyle(.plain)
                 .disabled(store.isRunning)
                 .help(session.workspace)
             }
         }
-        .padding(.horizontal, 18)
-        .frame(height: 64)
-        .background(Theme.panel.opacity(0.8))
+        .padding(.horizontal, 24)
+        .frame(height: 66)
+        .background(Color.black.opacity(0.72))
     }
 }
 
@@ -1072,11 +1782,22 @@ private struct WelcomeView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 Spacer(minLength: 34)
-                Text("What are we building?")
-                    .font(.system(size: 34, weight: .semibold, design: .rounded))
+                HStack(spacing: 12) {
+                    Image(systemName: "diamond")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Theme.pink)
+                        .frame(width: 34, height: 34)
+                        .background(Theme.pinkDeep)
+                        .clipShape(Circle())
+                    Text("Routing, model execution, token control, and receipts stay on one governed path.")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.muted)
+                }
+                Text("Start a governed task.")
+                    .font(.system(size: 30, weight: .semibold, design: .rounded))
                     .foregroundStyle(Theme.text)
-                Text("Pick a project once. OS-1 treats Codex and Claude Code as managed backends, then selects the backend, model tier, and reasoning effort from task fit and weekly capacity.")
-                    .font(.system(size: 15))
+                Text("Choose the project once. RCC routes each turn to Codex or Claude Code with the model tier, reasoning effort, token budget, and workspace authority kept on the same governed path.")
+                    .font(.system(size: 14))
                     .foregroundStyle(Color.white.opacity(0.62))
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -1103,10 +1824,9 @@ private struct WelcomeView: View {
                                     .foregroundStyle(Theme.muted)
                             }
                             .padding(.horizontal, 14)
-                            .frame(height: 42)
-                            .background(Theme.panelRaised)
-                            .overlay(RoundedRectangle(cornerRadius: 9).stroke(Theme.border))
-                            .clipShape(RoundedRectangle(cornerRadius: 9))
+                            .frame(height: 46)
+                            .background(Color.black.opacity(0.3))
+                            .overlay(Rectangle().stroke(Theme.border))
                         }
                         .buttonStyle(.plain)
                     }
@@ -1140,9 +1860,8 @@ private struct WelcomeStep: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 108, alignment: .topLeading)
-        .background(Theme.panel)
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .background(Color.black.opacity(0.3))
+        .overlay(Rectangle().stroke(Theme.border))
     }
 }
 
@@ -1169,9 +1888,9 @@ private struct MessageTimeline: View {
                         .id("running")
                     }
                 }
-                .padding(.horizontal, 34)
-                .padding(.vertical, 28)
-                .frame(maxWidth: 900)
+                .padding(.horizontal, 40)
+                .padding(.vertical, 34)
+                .frame(maxWidth: 1_020)
                 .frame(maxWidth: .infinity)
             }
             .onAppear {
@@ -1195,13 +1914,13 @@ private struct MessageView: View {
             HStack {
                 Spacer(minLength: 100)
                 Text(message.text)
-                    .font(.system(size: 13))
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .textSelection(.enabled)
-                    .padding(.horizontal, 15)
-                    .padding(.vertical, 12)
-                    .background(Color.white.opacity(0.09))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 16)
+                    .background(Color.black.opacity(0.28))
+                    .overlay(Rectangle().stroke(Theme.borderStrong))
             }
         case .assistant:
             VStack(alignment: .leading, spacing: 9) {
@@ -1227,29 +1946,37 @@ private struct MessageView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         case .receipt:
-            HStack(spacing: 9) {
-                Image(systemName: "checkmark.shield.fill").foregroundStyle(Theme.green)
-                Text("RCC GOVERNANCE RECEIPT")
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
-                    .tracking(1.1)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("RCC GOVERNANCE RECEIPT")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(1.3)
+                        .foregroundStyle(Theme.pink)
+                    Spacer()
+                    Text("VERIFIED")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(1.1)
+                        .foregroundStyle(Theme.green)
+                }
                 Text(message.text)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(Theme.muted)
-                Spacer()
-                Text("VERIFIED")
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
-                    .foregroundStyle(Theme.green)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.horizontal, 12)
-            .frame(height: 39)
-            .background(Theme.panel)
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .padding(16)
+            .frame(maxWidth: .infinity, minHeight: 70, alignment: .leading)
+            .background(Color.black.opacity(0.36))
+            .overlay(Rectangle().stroke(Theme.borderStrong))
         case .system:
             HStack(spacing: 8) {
-                Image(systemName: "info.circle")
+                Image(systemName: "diamond")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(Theme.pink)
+                    .frame(width: 30, height: 30)
+                    .background(Theme.pinkDeep)
+                    .clipShape(Circle())
                 Text(message.text)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12, weight: .medium))
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
             }
@@ -1265,21 +1992,21 @@ private struct ComposerView: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 10) {
             HStack(alignment: .bottom, spacing: 12) {
                 TextEditor(text: $store.composer)
-                    .font(.system(size: 13))
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .scrollContentBackground(.hidden)
                     .focused($focused)
-                    .frame(minHeight: 54, maxHeight: 120)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
+                    .frame(minHeight: 70, maxHeight: 130)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
                     .disabled(store.isRunning)
                     .overlay(alignment: .topLeading) {
                         if store.composer.isEmpty {
-                            Text("Tell OS-1 what outcome you want…")
-                                .font(.system(size: 13))
+                            Text("Route a governed task through OS-1…")
+                                .font(.system(size: 14, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.3))
                                 .padding(.horizontal, 13)
                                 .padding(.vertical, 14)
@@ -1291,18 +2018,17 @@ private struct ComposerView: View {
                     Image(systemName: store.isRunning ? "hourglass" : "arrow.up")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(Color.black.opacity(0.86))
-                        .frame(width: 38, height: 38)
-                        .background(session.provider.tint)
+                        .frame(width: 44, height: 44)
+                        .background(Theme.pink)
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .disabled(store.isRunning || store.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .keyboardShortcut(.return, modifiers: [.command])
             }
-            .padding(10)
-            .background(Theme.panelRaised)
-            .overlay(RoundedRectangle(cornerRadius: 13).stroke(Theme.border))
-            .clipShape(RoundedRectangle(cornerRadius: 13))
+            .padding(12)
+            .background(Color.black.opacity(0.5))
+            .overlay(Rectangle().stroke(Theme.borderStrong))
 
             HStack {
                 Label(URL(fileURLWithPath: session.workspace).lastPathComponent, systemImage: "folder")
@@ -1317,12 +2043,12 @@ private struct ComposerView: View {
                 Spacer()
                 Text("⌘↩ send")
             }
-            .font(.system(size: 10, weight: .medium))
+            .font(.system(size: 9, weight: .medium, design: .rounded))
             .foregroundStyle(Theme.muted)
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 10)
-        .padding(.bottom, 16)
+        .padding(.horizontal, 38)
+        .padding(.top, 12)
+        .padding(.bottom, 18)
         .background(Theme.background)
     }
 }

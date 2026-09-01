@@ -3,6 +3,7 @@ import { loadPolicyBundle, type RevasPolicy } from "./bundle";
 import {
   select, type PermissionProfile, type Provider, type ProviderPreference,
   type CapacityPlan, type Step, type Action, chooseCapacityAware, selectAction,
+  resolveProviderPreference,
 } from "./policy";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -178,12 +179,14 @@ export default {
           typeof body.principal.subject !== "string" || body.principal.subject.length < 1 || typeof body.principal.device_id !== "string") throw new Error("denied");
         const bundle = await loadPolicyBundle(env);
         if (task.executor_contract_version !== bundle.executor_contract.version || task.executor_contract_sha256 !== bundle.executor_contract.sha256) throw new Error("denied");
-        const preference = task.provider_preference as ProviderPreference;
+        const requestedPreference = task.provider_preference as ProviderPreference;
+        const preference = resolveProviderPreference(task.content, requestedPreference);
         const base = select(bundle.routing, task.content, preference);
         const budget = env.ROUTING_BUDGETS.getByName(await subjectKey(body.principal.subject));
         const provider = preference === "auto" ? await budget.chooseAndRecord(base, plan) : preference;
         if (preference !== "auto") await budget.record(provider);
-        const selected: RoutedStep = { ...base, provider, fallback_provider: provider === "codex" ? "claude" : "codex",
+        const selected: RoutedStep = { ...base, provider,
+          fallback_provider: preference === "auto" ? (provider === "codex" ? "claude" : "codex") : provider,
           action: selectAction(base, provider, preference),
           fallback_action: preference === "auto" && base.budget_protected ? "agent_run_deep" : "agent_run" };
         if ((await state.begin({ ...selected, task: task.content, policy_version: bundle.policy_version,
