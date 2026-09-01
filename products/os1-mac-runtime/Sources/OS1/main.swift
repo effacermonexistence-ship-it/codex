@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 
@@ -70,19 +71,30 @@ struct RuntimeConfig: Codable {
         case executorContract = "executor_contract"
     }
 
+    private static func executableURL() -> URL {
+        var size: UInt32 = 0
+        _ = _NSGetExecutablePath(nil, &size)
+        var buffer = [CChar](repeating: 0, count: Int(size))
+        guard _NSGetExecutablePath(&buffer, &size) == 0 else {
+            return URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        }
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return URL(fileURLWithPath: String(decoding: bytes, as: UTF8.self)).resolvingSymlinksInPath()
+    }
+
     static func load() throws -> RuntimeConfig {
         let environment = ProcessInfo.processInfo.environment
-        let bundledConfig = URL(fileURLWithPath: CommandLine.arguments[0])
-            .standardizedFileURL
+        let bundledConfig = executableURL()
             .deletingLastPathComponent()
             .appendingPathComponent("config.json")
             .path
+        let userConfig = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/os1/config.json").path
         let paths = [
             environment["OS1_CONFIG"],
             bundledConfig,
+            userConfig,
             "/Library/Application Support/OS-1/config.json",
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".config/os1/config.json").path,
         ].compactMap { $0 }
         for path in paths where FileManager.default.fileExists(atPath: path) {
             let value = try JSONDecoder().decode(RuntimeConfig.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
@@ -1141,7 +1153,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.6.3")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.6.4")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":
