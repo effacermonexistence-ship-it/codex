@@ -105,6 +105,13 @@ else
   add_check fail "completion persistence" "global completion rule is missing"
 fi
 
+if [[ -f "$repo_root/codex/AGENTS.md" ]] &&
+   grep -Fq 'Do not infer that GitHub is disconnected' "$repo_root/codex/AGENTS.md"; then
+  add_check pass "connection discovery" "connector-first GitHub discovery rule is present"
+else
+  add_check fail "connection discovery" "connector-first GitHub discovery rule is missing"
+fi
+
 if [[ -f "$repo_root/CLAUDE.md" && -f "$claude_config_dir/CLAUDE.md" ]]; then
   if cmp -s "$repo_root/CLAUDE.md" "$claude_config_dir/CLAUDE.md"; then
     add_check pass "Claude guidance sync" "durable and installed CLAUDE.md match"
