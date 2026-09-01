@@ -21,7 +21,7 @@ function healthyBody() {
   }
 }
 
-test('accepts exact healthy v124 with an operational alert', () => {
+test('accepts exact healthy v128 with an operational alert', () => {
   const result = evaluateEndpoint(target, 200, healthyBody())
   assert.equal(result.ok, true)
   assert.equal(result.operational_alert_count, 1)
