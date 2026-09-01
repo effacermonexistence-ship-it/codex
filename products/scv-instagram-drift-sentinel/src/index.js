@@ -1,19 +1,19 @@
 const SENTINEL_SCHEMA = 'scv-instagram-drift-sentinel-2026-08-31-v1'
-const RELEASE_ID = 'scv-instagram-single-20260901-v134'
-const CONTENT_FINGERPRINT = '5ed144c2c4de76c97168a18eed45ae28421b287737d8de96006387d2ffece92d'
-const RELEASE_MANIFEST = '88efcb7dbe4124665f72c3451cf4504c024ea9a18a6a0ffb605ca16dbd4a0675'
+const RELEASE_ID = 'scv-instagram-single-20260901-v135'
+const CONTENT_FINGERPRINT = '1497a548217e657d958646546c3c0ab9ff5251dc41a3ee4ee9311110c4ef1697'
+const RELEASE_MANIFEST = '12461756cc699407a8c7a06d540fc85b15b7bf1bdd4274bce766a8e54fd0651b'
 const VISIBLE_MODEL = 'gpt-5.4-mini-2026-03-17'
-const SNAPSHOT_CONTROL_VERSION = '20260901T200703Z'
-const SNAPSHOT_COUNT = 21
+const SNAPSHOT_CONTROL_VERSION = '20260901T222100Z'
+const SNAPSHOT_COUNT = 23
 const GOLDEN_SNAPSHOT_ID = 'scv-instagram-20260420T152810-local-origin'
-const PRE_RESET_SNAPSHOT_ID = 'scv-instagram-20260901T195957Z-v134-pre-omar-reset'
-const CURRENT_SNAPSHOT_ID = 'scv-instagram-20260901T195959Z-v134-post-omar-reset-current'
-const SNAPSHOT_CATALOG_SHA256 = 'fc538d4934e6656f1032cc376ea0bc86dea862281afa1dadb0ae7009ba416e2c'
-const SNAPSHOT_SEAL_SHA256 = 'dfb580e30a3448495fa6a648907f64e896909c78aad8181527893b21eb45ef0d'
+const PRE_RESET_SNAPSHOT_ID = 'scv-instagram-20260901T221418Z-v135-pre-omar-reset'
+const CURRENT_SNAPSHOT_ID = 'scv-instagram-20260901T221420Z-v135-post-omar-reset-current'
+const SNAPSHOT_CATALOG_SHA256 = 'd8153ebf64da0aff2c6a2757b1d447ec327b1cce14b31e5d25f2f03fd9142b24'
+const SNAPSHOT_SEAL_SHA256 = '0c12dd66817344d48e01b23ced62a0d89f44733440cc8f9cf14dd52245526d5d'
 const SNAPSHOT_RESTORE_TOOL_SHA256 = '4044f96616a504c9049657fbe628b63246b56a626fa57cdb5f67dc1307d3f206'
-const RESET_RECEIPT_SHA256 = '1769ab22d00d37b050ddbdbf9653fb6d251739636e6474def86090b6951bc3cb'
-const PRE_RESTORE_RECEIPT_SHA256 = '890a997dcee590fbfee2efa513f18fd67f6fd057453a5f1df2c87e1f9d72895d'
-const POST_RESTORE_RECEIPT_SHA256 = '3b55847e41f43e2357536bbc50ebff0968ea3dc4fa3cf4619d82d54fc6739d01'
+const RESET_RECEIPT_SHA256 = '060c964e926d51b992e91274969d555d79ca349a8db68b10840f97706f714a9f'
+const PRE_RESTORE_RECEIPT_SHA256 = 'd643c44526cc4061a3c1dcb35096b1d1909ff8074e002b031177b1d60e18edfd'
+const POST_RESTORE_RECEIPT_SHA256 = '23e636edaf0370f851ba22fc21b384662cd2db9ac5a6ff2c30ce8a93bdffebcb'
 const MAX_CANARY_AGE_MS = 90 * 60 * 1000
 const MAX_DRIFT_AGE_MS = 3 * 60 * 1000
 const FETCH_TIMEOUT_MS = 20_000
@@ -175,15 +175,15 @@ async function checkSnapshotControl(archive, options = {}) {
     check(latest?.seal?.sha256 === SNAPSHOT_SEAL_SHA256, 'snapshot_seal_pointer_hash')
     check(latest?.restore_tool?.key === `${expectedPrefix}/scv-timestamped-restore.js`, 'snapshot_restore_tool_key')
     check(latest?.restore_tool?.sha256 === SNAPSHOT_RESTORE_TOOL_SHA256, 'snapshot_restore_tool_pointer_hash')
-    check(latest?.restore_receipts?.pre_v134_omar_reset?.key ===
-      `${expectedPrefix}/receipts/pre-v134-omar-reset-20260901T195957Z.json`,
+    check(latest?.restore_receipts?.pre_v135_omar_reset?.key ===
+      `${expectedPrefix}/receipts/pre-v135-omar-reset-20260901T221418Z.json`,
     'snapshot_pre_restore_receipt_key')
-    check(latest?.restore_receipts?.pre_v134_omar_reset?.sha256 === PRE_RESTORE_RECEIPT_SHA256,
+    check(latest?.restore_receipts?.pre_v135_omar_reset?.sha256 === PRE_RESTORE_RECEIPT_SHA256,
       'snapshot_pre_restore_receipt_hash')
-    check(latest?.restore_receipts?.current_post_v134_omar_reset?.key ===
-      `${expectedPrefix}/receipts/current-post-v134-omar-reset-20260901T195959Z.json`,
+    check(latest?.restore_receipts?.current_post_v135_omar_reset?.key ===
+      `${expectedPrefix}/receipts/current-post-v135-omar-reset-20260901T221420Z.json`,
     'snapshot_post_restore_receipt_key')
-    check(latest?.restore_receipts?.current_post_v134_omar_reset?.sha256 ===
+    check(latest?.restore_receipts?.current_post_v135_omar_reset?.sha256 ===
       POST_RESTORE_RECEIPT_SHA256, 'snapshot_post_restore_receipt_hash')
     check(latest?.restore_requires_exact_snapshot_id === true, 'snapshot_exact_id_required')
     check(latest?.production_cutover_automatic === false, 'snapshot_automatic_cutover')
@@ -207,7 +207,7 @@ async function checkSnapshotControl(archive, options = {}) {
           ? catalog.snapshots.find((snapshot) => snapshot?.snapshot_id === CURRENT_SNAPSHOT_ID)
           : null
         check(preReset?.release_id === RELEASE_ID, 'snapshot_pre_reset_release')
-        check(Number(preReset?.omar_system_audit_remaining_count) === 7,
+        check(Number(preReset?.omar_system_audit_remaining_count) === 4,
           'snapshot_pre_reset_audit_count')
         check(current?.release_id === RELEASE_ID, 'snapshot_current_release')
         check(current?.previous_snapshot_id === PRE_RESET_SNAPSHOT_ID,

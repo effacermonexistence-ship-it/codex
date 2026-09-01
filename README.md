@@ -180,8 +180,8 @@ repositories are not affected. A fork push is reported separately from the
 upstream merge that triggers the GitHub Actions upload to R2.
 
 Product-specific release and custody coordinates are deliberately kept out of
-the global Codex and Claude instructions. The active SCV Instagram v134 custody
-record is documented in `docs/scv-instagram-v134-custody.md`; older records are
+the global Codex and Claude instructions. The active SCV Instagram v135 custody
+record is documented in `docs/scv-instagram-v135-custody.md`; older records are
 retained as timestamped history.
 
 ## Restore on a new computer
