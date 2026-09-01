@@ -1,5 +1,31 @@
 # GitHub to Cloudflare R2 backup
 
+## Open OS-1 Codex
+
+On any Apple Silicon or Intel Mac running macOS 13 or newer, install the public
+OS-1 release with:
+
+```bash
+curl -fsSL https://os1-route-gateway.omar-git-r2-backup.workers.dev/install.sh | bash
+```
+
+The installer downloads a SHA-256-pinned universal package, installs the
+`Open OS-1 Codex.app` application and `os1` command, and installs the official
+Codex CLI, Claude Code, and GitHub CLI when absent. Each person completes the
+three providers' OAuth browser approvals on their own Mac; credentials are
+never copied between computers.
+
+After installation:
+
+```bash
+os1 doctor
+os1 run --workspace /path/to/project --prompt "Implement the requested change"
+```
+
+The proprietary route policy is deployed only in the private Cloudflare
+service. The Mac receives a short Ed25519-signed execution ticket and uploads a
+device-signed result artifact to private R2 storage.
+
 This project keeps every `effacermonexistence` GitHub repository mirrored as a
 verified Git bundle in the private Cloudflare R2 bucket
 `omar-private-archive`.

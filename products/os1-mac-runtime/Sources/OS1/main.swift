@@ -1,0 +1,634 @@
+import CryptoKit
+import Foundation
+import Security
+
+enum OS1Error: Error, CustomStringConvertible {
+    case message(String)
+
+    var description: String {
+        switch self { case .message(let value): return value }
+    }
+}
+
+struct RuntimeConfig: Codable {
+    let apiURL: String
+    let ticketVerifyingKeyRaw: String
+    let maximumSteps: Int
+    let executionTimeoutSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case apiURL = "api_url"
+        case ticketVerifyingKeyRaw = "ticket_verifying_key_raw"
+        case maximumSteps = "maximum_steps"
+        case executionTimeoutSeconds = "execution_timeout_seconds"
+    }
+
+    static func load() throws -> RuntimeConfig {
+        let environment = ProcessInfo.processInfo.environment
+        let paths = [
+            environment["OS1_CONFIG"],
+            "/Library/Application Support/OS-1/config.json",
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config/os1/config.json").path,
+        ].compactMap { $0 }
+        for path in paths where FileManager.default.fileExists(atPath: path) {
+            let value = try JSONDecoder().decode(RuntimeConfig.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            guard URL(string: value.apiURL)?.scheme == "https",
+                  value.maximumSteps >= 1, value.maximumSteps <= 4,
+                  value.executionTimeoutSeconds >= 60 else {
+                throw OS1Error.message("OS-1 configuration is invalid")
+            }
+            return value
+        }
+        throw OS1Error.message("OS-1 configuration is missing; reinstall OS-1")
+    }
+}
+
+struct JWK: Codable, Equatable {
+    let kty: String
+    let crv: String
+    let x: String
+    let y: String
+}
+
+struct Ticket: Codable {
+    let executionID: String
+    let sequence: Int
+    let provider: String
+    let action: String
+    let permissionProfile: String
+    let expiresAt: String
+    let nonce: String
+    let signature: String
+
+    enum CodingKeys: String, CodingKey {
+        case executionID = "execution_id"
+        case sequence, provider, action
+        case permissionProfile = "permission_profile"
+        case expiresAt = "expires_at"
+        case nonce, signature
+    }
+}
+
+struct RouteResponse: Decodable {
+    let status: String?
+    let ticket: Ticket?
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let ticket = try? container.decode(Ticket.self) {
+            self.ticket = ticket
+            self.status = nil
+        } else {
+            let value = try container.decode([String: String].self)
+            self.status = value["status"]
+            self.ticket = nil
+        }
+    }
+}
+
+struct DeviceRegistration: Codable {
+    let deviceID: String
+    let registeredAt: Int64
+    let nonce: String
+    let p256PublicJWK: JWK
+    let signature: String
+
+    enum CodingKeys: String, CodingKey {
+        case deviceID = "device_id"
+        case registeredAt = "registered_at"
+        case nonce
+        case p256PublicJWK = "p256_public_jwk"
+        case signature
+    }
+}
+
+struct ArtifactUpload: Codable {
+    let ticket: Ticket
+    let artifactBase64: String
+    let resultHash: String
+    let deviceSignature: String
+
+    enum CodingKeys: String, CodingKey {
+        case ticket
+        case artifactBase64 = "artifact_base64"
+        case resultHash = "result_hash"
+        case deviceSignature = "device_signature"
+    }
+}
+
+struct ResultSubmission: Codable {
+    let ticket: Ticket
+    let resultHash: String
+    let artifactRef: String
+    let deviceSignature: String
+
+    enum CodingKeys: String, CodingKey {
+        case ticket
+        case resultHash = "result_hash"
+        case artifactRef = "artifact_ref"
+        case deviceSignature = "device_signature"
+    }
+}
+
+struct Artifact: Codable {
+    let schema = 1
+    let provider: String
+    let exitCode: Int32
+    let output: String
+    let stderr: String
+    let durationMS: Int64
+    let workspaceDiffHash: String
+
+    enum CodingKeys: String, CodingKey {
+        case schema, provider, output, stderr
+        case exitCode = "exit_code"
+        case durationMS = "duration_ms"
+        case workspaceDiffHash = "workspace_diff_hash"
+    }
+}
+
+enum Base64URL {
+    static func encode(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    static func decode(_ value: String) throws -> Data {
+        var base64 = value.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+        guard let data = Data(base64Encoded: base64) else {
+            throw OS1Error.message("Invalid signed value")
+        }
+        return data
+    }
+}
+
+func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+func randomNonce() throws -> String {
+    var bytes = Data(count: 32)
+    let status = bytes.withUnsafeMutableBytes { buffer in
+        SecRandomCopyBytes(kSecRandomDefault, 32, buffer.baseAddress!)
+    }
+    guard status == errSecSuccess else { throw OS1Error.message("Secure random generation failed") }
+    return Base64URL.encode(bytes)
+}
+
+enum Keychain {
+    private static let service = "com.omaragi.os1.runtime.v1"
+
+    static func read(_ account: String) throws -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw OS1Error.message("OS-1 Keychain read failed (\(status))")
+        }
+        return data
+    }
+
+    static func write(_ data: Data, account: String) throws {
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let update: [String: Any] = [kSecValueData as String: data]
+        let updateStatus = SecItemUpdate(base as CFDictionary, update as CFDictionary)
+        if updateStatus == errSecItemNotFound {
+            var insert = base
+            insert[kSecValueData as String] = data
+            insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            let insertStatus = SecItemAdd(insert as CFDictionary, nil)
+            guard insertStatus == errSecSuccess else {
+                throw OS1Error.message("OS-1 Keychain write failed (\(insertStatus))")
+            }
+        } else if updateStatus != errSecSuccess {
+            throw OS1Error.message("OS-1 Keychain update failed (\(updateStatus))")
+        }
+    }
+}
+
+enum DeviceStorage {
+    private static var directory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/OS-1/device", isDirectory: true)
+    }
+
+    static func read(_ name: String) throws -> Data? {
+        let url = directory.appendingPathComponent(name, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try Data(contentsOf: url)
+    }
+
+    static func write(_ data: Data, name: String) throws {
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let url = directory.appendingPathComponent(name, isDirectory: false)
+        try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+}
+
+enum SigningKey {
+    case enclave(SecureEnclave.P256.Signing.PrivateKey)
+    case software(P256.Signing.PrivateKey)
+
+    static func loadOrCreate() throws -> SigningKey {
+        if let typeData = try DeviceStorage.read("key-type"),
+           let type = String(data: typeData, encoding: .utf8) {
+            if type == "secure-enclave" {
+                guard let material = try DeviceStorage.read("secure-enclave-key") else {
+                    throw OS1Error.message("OS-1 device key is incomplete")
+                }
+                return .enclave(try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material))
+            }
+            guard let material = try Keychain.read("software-device-key") else {
+                throw OS1Error.message("OS-1 software device key is missing")
+            }
+            return .software(try P256.Signing.PrivateKey(rawRepresentation: material))
+        }
+        if SecureEnclave.isAvailable {
+            let key = try SecureEnclave.P256.Signing.PrivateKey()
+            try DeviceStorage.write(Data("secure-enclave".utf8), name: "key-type")
+            try DeviceStorage.write(key.dataRepresentation, name: "secure-enclave-key")
+            return .enclave(key)
+        }
+        let key = P256.Signing.PrivateKey()
+        try Keychain.write(key.rawRepresentation, account: "software-device-key")
+        try DeviceStorage.write(Data("software".utf8), name: "key-type")
+        return .software(key)
+    }
+
+    var securityMode: String {
+        switch self { case .enclave: return "secure-enclave"; case .software: return "software-keychain" }
+    }
+
+    var publicKey: P256.Signing.PublicKey {
+        switch self { case .enclave(let key): return key.publicKey; case .software(let key): return key.publicKey }
+    }
+
+    func sign(_ data: Data) throws -> Data {
+        switch self {
+        case .enclave(let key): return try key.signature(for: data).rawRepresentation
+        case .software(let key): return try key.signature(for: data).rawRepresentation
+        }
+    }
+
+    func jwk() throws -> JWK {
+        let bytes = publicKey.x963Representation
+        guard bytes.count == 65, bytes.first == 4 else { throw OS1Error.message("Invalid device public key") }
+        return JWK(
+            kty: "EC",
+            crv: "P-256",
+            x: Base64URL.encode(bytes.subdata(in: 1..<33)),
+            y: Base64URL.encode(bytes.subdata(in: 33..<65))
+        )
+    }
+}
+
+func deviceID() throws -> String {
+    if let data = try DeviceStorage.read("device-id"), let value = String(data: data, encoding: .utf8) {
+        return value
+    }
+    let value = "device:" + UUID().uuidString.lowercased()
+    try DeviceStorage.write(Data(value.utf8), name: "device-id")
+    return value
+}
+
+func registrationBytes(deviceID: String, registeredAt: Int64, nonce: String, jwk: JWK) -> Data {
+    Data([
+        "os1-device-register-v1", deviceID, String(registeredAt), nonce,
+        jwk.kty, jwk.crv, jwk.x, jwk.y,
+    ].joined(separator: "\n").utf8)
+}
+
+func ticketBytes(_ ticket: Ticket) -> Data {
+    Data([
+        "os1-ticket-v1", ticket.executionID, String(ticket.sequence), ticket.provider,
+        ticket.action, ticket.permissionProfile, ticket.expiresAt, ticket.nonce,
+    ].joined(separator: "\n").utf8)
+}
+
+func resultBytes(_ result: ResultSubmission) -> Data {
+    Data([
+        "os1-result-v1", result.ticket.executionID, String(result.ticket.sequence),
+        result.ticket.nonce, result.resultHash, result.artifactRef,
+    ].joined(separator: "\n").utf8)
+}
+
+func verifyTicket(_ ticket: Ticket, config: RuntimeConfig) throws {
+    guard ticket.action == "agent_run",
+          ["codex", "claude"].contains(ticket.provider),
+          ["read_only", "workspace_write", "full_access"].contains(ticket.permissionProfile) else {
+        throw OS1Error.message("Server ticket contract rejected")
+    }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    guard let expiry = formatter.date(from: ticket.expiresAt), expiry > Date() else {
+        throw OS1Error.message("Server ticket expired")
+    }
+    let key = try Curve25519.Signing.PublicKey(rawRepresentation: Base64URL.decode(config.ticketVerifyingKeyRaw))
+    guard key.isValidSignature(try Base64URL.decode(ticket.signature), for: ticketBytes(ticket)) else {
+        throw OS1Error.message("Server ticket signature rejected")
+    }
+}
+
+func commandOutput(
+    _ executable: String,
+    _ arguments: [String],
+    input: Data? = nil,
+    timeout: Int = 30,
+    currentDirectory: String? = nil
+) throws -> (Int32, Data, Data) {
+    let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("os1-process-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let stdoutURL = temporary.appendingPathComponent("stdout")
+    let stderrURL = temporary.appendingPathComponent("stderr")
+    FileManager.default.createFile(atPath: stdoutURL.path, contents: nil)
+    FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+    let stdout = try FileHandle(forWritingTo: stdoutURL)
+    let stderr = try FileHandle(forWritingTo: stderrURL)
+    defer { try? stdout.close(); try? stderr.close() }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    if let currentDirectory {
+        process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory, isDirectory: true)
+    }
+    process.standardOutput = stdout
+    process.standardError = stderr
+    if let input {
+        let pipe = Pipe()
+        process.standardInput = pipe
+        try process.run()
+        try pipe.fileHandleForWriting.write(contentsOf: input)
+        try pipe.fileHandleForWriting.close()
+    } else {
+        try process.run()
+    }
+    let deadline = Date().addingTimeInterval(TimeInterval(timeout))
+    while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.2) }
+    if process.isRunning {
+        process.terminate()
+        Thread.sleep(forTimeInterval: 1)
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        throw OS1Error.message("Local provider execution timed out")
+    }
+    return (process.terminationStatus, try Data(contentsOf: stdoutURL), try Data(contentsOf: stderrURL))
+}
+
+func findExecutable(_ name: String) throws -> String {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let candidates = [
+        "\(home)/.local/bin/\(name)",
+        "/opt/homebrew/bin/\(name)",
+        "/usr/local/bin/\(name)",
+        name == "codex" ? "/Applications/ChatGPT.app/Contents/Resources/codex" : "",
+    ]
+    for candidate in candidates where !candidate.isEmpty {
+        if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+    }
+    if let path = ProcessInfo.processInfo.environment["PATH"] {
+        for directory in path.split(separator: ":") {
+            let candidate = String(directory) + "/" + name
+            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+        }
+    }
+    throw OS1Error.message("Required command is missing: \(name)")
+}
+
+func githubToken() throws -> String {
+    let gh = try findExecutable("gh")
+    let result = try commandOutput(gh, ["auth", "token", "--hostname", "github.com"], timeout: 20)
+    guard result.0 == 0, let token = String(data: result.1, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), token.count >= 20 else {
+        throw OS1Error.message("GitHub login required: gh auth login --hostname github.com --git-protocol https --web")
+    }
+    return token
+}
+
+struct APIClient {
+    let config: RuntimeConfig
+    let token: String
+    let deviceID: String
+
+    func post<Request: Encodable, Response: Decodable>(_ path: String, body: Request, as: Response.Type) async throws -> Response {
+        guard let base = URL(string: config.apiURL), let url = URL(string: path, relativeTo: base) else {
+            throw OS1Error.message("Invalid OS-1 API URL")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(body)
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        request.setValue(deviceID, forHTTPHeaderField: "x-os1-device-id")
+        request.timeoutInterval = 30
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw OS1Error.message("OS-1 server rejected the request")
+        }
+        return try JSONDecoder().decode(Response.self, from: data)
+    }
+}
+
+func register(client: APIClient, key: SigningKey) async throws {
+    let jwk = try key.jwk()
+    let now = Int64(Date().timeIntervalSince1970 * 1_000)
+    let nonce = try randomNonce()
+    let signature = try key.sign(registrationBytes(deviceID: client.deviceID, registeredAt: now, nonce: nonce, jwk: jwk))
+    let request = DeviceRegistration(
+        deviceID: client.deviceID,
+        registeredAt: now,
+        nonce: nonce,
+        p256PublicJWK: jwk,
+        signature: Base64URL.encode(signature)
+    )
+    let response: [String: String] = try await client.post("/v1/devices/register", body: request, as: [String: String].self)
+    guard response["status"] == "registered" else { throw OS1Error.message("Device registration failed") }
+}
+
+func boundedString(_ data: Data, maximum: Int) -> String {
+    let prefix = data.prefix(maximum)
+    return String(decoding: prefix, as: UTF8.self)
+}
+
+func workspaceHash(_ workspace: String) -> String {
+    guard let git = try? findExecutable("git"),
+          let result = try? commandOutput(git, ["-C", workspace, "status", "--porcelain=v1", "-z"], timeout: 20) else {
+        return sha256Hex(Data())
+    }
+    return sha256Hex(result.1)
+}
+
+func execute(ticket: Ticket, prompt: String, workspace: String, timeout: Int) throws -> Artifact {
+    let started = Date()
+    let result: (Int32, Data, Data)
+    if ticket.provider == "codex" {
+        let codex = try findExecutable("codex")
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("os1-codex-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+        var arguments = ["exec", "--color", "never", "-C", workspace, "-o", outputURL.path]
+        switch ticket.permissionProfile {
+        case "read_only": arguments += ["-s", "read-only"]
+        case "full_access": arguments += ["--dangerously-bypass-approvals-and-sandbox"]
+        default: arguments += ["--approve-for-me"]
+        }
+        arguments.append("-")
+        let raw = try commandOutput(codex, arguments, input: Data(prompt.utf8), timeout: timeout)
+        let final = (try? Data(contentsOf: outputURL)).flatMap { $0.isEmpty ? nil : $0 } ?? raw.1
+        result = (raw.0, final, raw.2)
+    } else {
+        let claude = try findExecutable("claude")
+        var arguments = ["-p", "--output-format", "json", "--no-session-persistence"]
+        switch ticket.permissionProfile {
+        case "read_only": arguments += ["--permission-mode", "plan"]
+        case "full_access": arguments += ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"]
+        default: arguments += ["--permission-mode", "acceptEdits"]
+        }
+        arguments.append(prompt)
+        let raw = try commandOutput(
+            claude,
+            arguments,
+            timeout: timeout,
+            currentDirectory: workspace
+        )
+        var output = raw.1
+        if let object = try? JSONSerialization.jsonObject(with: raw.1) as? [String: Any],
+           let value = object["result"] as? String {
+            output = Data(value.utf8)
+        }
+        result = (raw.0, output, raw.2)
+    }
+    return Artifact(
+        provider: ticket.provider,
+        exitCode: result.0,
+        output: boundedString(result.1, maximum: 800_000),
+        stderr: boundedString(result.2, maximum: 180_000),
+        durationMS: Int64(Date().timeIntervalSince(started) * 1_000),
+        workspaceDiffHash: workspaceHash(workspace)
+    )
+}
+
+func runTask(prompt: String, workspace: String) async throws {
+    let config = try RuntimeConfig.load()
+    let canonicalWorkspace = URL(fileURLWithPath: workspace).standardizedFileURL.path
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: canonicalWorkspace, isDirectory: &isDirectory), isDirectory.boolValue else {
+        throw OS1Error.message("Workspace directory does not exist")
+    }
+    let key = try SigningKey.loadOrCreate()
+    let id = try deviceID()
+    let client = APIClient(config: config, token: try githubToken(), deviceID: id)
+    try await register(client: client, key: key)
+    var route: RouteResponse = try await client.post("/v1/executions", body: ["task": prompt], as: RouteResponse.self)
+
+    for step in 1...config.maximumSteps {
+        if route.status == "complete" { print("OS-1 completed"); return }
+        guard let ticket = route.ticket else { throw OS1Error.message("Invalid OS-1 route response") }
+        try verifyTicket(ticket, config: config)
+        print("OS-1 step \(step): \(ticket.provider) / \(ticket.permissionProfile)")
+        let artifact = try execute(ticket: ticket, prompt: prompt, workspace: canonicalWorkspace, timeout: config.executionTimeoutSeconds)
+        let artifactData = try JSONEncoder().encode(artifact)
+        let resultHash = sha256Hex(artifactData)
+        let artifactRef = "r2://os1-private-results/\(ticket.executionID)/\(ticket.sequence)/\(resultHash).json"
+        var submission = ResultSubmission(ticket: ticket, resultHash: resultHash, artifactRef: artifactRef, deviceSignature: "")
+        submission = ResultSubmission(
+            ticket: ticket,
+            resultHash: resultHash,
+            artifactRef: artifactRef,
+            deviceSignature: Base64URL.encode(try key.sign(resultBytes(submission)))
+        )
+        let upload = ArtifactUpload(
+            ticket: ticket,
+            artifactBase64: Base64URL.encode(artifactData),
+            resultHash: resultHash,
+            deviceSignature: submission.deviceSignature
+        )
+        let uploaded: [String: String] = try await client.post("/v1/artifacts", body: upload, as: [String: String].self)
+        guard uploaded["artifact_ref"] == artifactRef else { throw OS1Error.message("Artifact upload binding failed") }
+        route = try await client.post("/v1/results", body: submission, as: RouteResponse.self)
+    }
+    guard route.status == "complete" else { throw OS1Error.message("OS-1 maximum step limit reached") }
+    print("OS-1 completed")
+}
+
+func doctor() throws {
+    let config = try RuntimeConfig.load()
+    let key = try SigningKey.loadOrCreate()
+    _ = try deviceID()
+    for command in ["gh", "codex", "claude"] { _ = try findExecutable(command) }
+    _ = try githubToken()
+    print("OS-1 configuration: OK (\(config.apiURL))")
+    print("OS-1 device key: \(key.securityMode)")
+    print("GitHub, Codex, Claude: available")
+}
+
+func usage() {
+    print("""
+    OS-1 local runtime
+
+      os1 doctor
+      os1 register
+      os1 run --workspace /path/to/project --prompt "task"
+      os1 version
+    """)
+}
+
+@main
+struct OS1Main {
+    static func main() async {
+        do {
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            guard let command = arguments.first else { usage(); return }
+            switch command {
+            case "version", "--version", "-V": print("OS-1 Runtime 0.1.0")
+            case "doctor": try doctor()
+            case "register":
+                let config = try RuntimeConfig.load()
+                let client = APIClient(config: config, token: try githubToken(), deviceID: try deviceID())
+                let key = try SigningKey.loadOrCreate()
+                try await register(client: client, key: key)
+                print("OS-1 device registered (\(key.securityMode))")
+            case "run":
+                var workspace: String?
+                var prompt: String?
+                var index = 1
+                while index < arguments.count {
+                    switch arguments[index] {
+                    case "--workspace" where index + 1 < arguments.count:
+                        workspace = arguments[index + 1]; index += 2
+                    case "--prompt" where index + 1 < arguments.count:
+                        prompt = arguments[index + 1]; index += 2
+                    default: throw OS1Error.message("Unknown OS-1 argument")
+                    }
+                }
+                guard let workspace, let prompt, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw OS1Error.message("Both --workspace and --prompt are required")
+                }
+                try await runTask(prompt: prompt, workspace: workspace)
+            default: usage()
+            }
+        } catch {
+            fputs("OS-1 error: \(error)\n", stderr)
+            exit(1)
+        }
+    }
+}

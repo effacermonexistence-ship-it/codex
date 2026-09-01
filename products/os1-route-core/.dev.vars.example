@@ -1,0 +1,5 @@
+# Local placeholders used only so `wrangler types` can include secret binding names.
+# Copy to .dev.vars and replace locally. Never commit real key material or canaries.
+TICKET_SIGNING_KEY_PKCS8="LOCAL_ONLY_REPLACE_WITH_ED25519_PKCS8_PEM"
+TICKET_VERIFYING_KEY_SPKI="LOCAL_ONLY_REPLACE_WITH_ED25519_SPKI_PEM"
+DELIVERY_DENYLIST_JSON="[]"
