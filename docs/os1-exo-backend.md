@@ -47,6 +47,30 @@ exactly `provider: "exo"`, `action: "exo_inference"`, and
 `permission_profile: "read_only"`. Any different provider/action pairing is
 rejected by the gateway and by the Mac Runtime.
 
+## Claude Code automatic two-Mac context
+
+Claude Code's hosted Claude model cannot itself be split across personal Macs.
+OS-1 instead uses a Claude Code `UserPromptSubmit` hook: before Claude Code
+processes a prompt, the local runtime creates a read-only EXO draft through the
+two-node cluster and attaches it as untrusted context. Claude Code retains
+control of all file changes, shell commands, deployments, and permissions.
+
+The hook is intentionally fail-open. If the local EXO service is not ready with
+two nodes, Claude Code receives no local draft and proceeds normally; it never
+waits for a single-node fallback or loses the user's prompt.
+
+Enable it on a Mac after installing the runtime:
+
+```bash
+os1 configure-claude-exo
+```
+
+This adds a user-scoped Claude Code hook, preserves a timestamped copy of any
+existing `~/.claude/settings.json`, and uses the installed `os1` binary as the
+hook command. The OS-1 installer enables it for future Macs as well. No
+ZeroTier address, EXO peer ID, model credential, or Cloudflare credential is
+stored in Claude's settings.
+
 Example private policy fragment (store it as the Worker secret, never in a UI
 bundle):
 

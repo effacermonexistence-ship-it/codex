@@ -65,6 +65,7 @@ curl -fL --retry 3 --proto '=https' --tlsv1.2 \
 [[ "$(stat -f '%z' "$os1_tmp/OS-1.pkg")" == "$os1_size" ]]
 printf '%s  %s\n' "$os1_sha256" "$os1_tmp/OS-1.pkg" | shasum -a 256 -c -
 sudo installer -pkg "$os1_tmp/OS-1.pkg" -target /
+/usr/local/bin/os1 configure-claude-exo
 
 if [[ "${OS1_SKIP_LOGIN:-0}" != "1" && -t 0 ]]; then
   gh auth status --hostname github.com >/dev/null 2>&1 || \
