@@ -391,13 +391,13 @@ private final class SessionStore: ObservableObject {
         chooseProvider(provider)
         switch provider {
         case .codex where session.codexSessionID != nil:
-            openCodexSession()
+            statusText = "Codex connected · next task resumes the synchronized session"
         case .claude where session.claudeSessionID != nil:
-            openClaudeSession()
+            statusText = "Claude Code connected · next task resumes the synchronized session"
         case .codex:
-            statusText = "Codex selected · send a task to create the synchronized native session"
+            statusText = "Codex connected · next task creates the synchronized session"
         case .claude:
-            statusText = "Claude Code selected · send a task to create the synchronized native session"
+            statusText = "Claude Code connected · next task creates the synchronized session"
         case .auto:
             break
         }
@@ -826,7 +826,7 @@ private struct BackendStatus: View {
         }
         .buttonStyle(.plain)
         .disabled(disabled)
-        .help(linked ? "Synchronize and open \(provider.title)" : "Select \(provider.title) and connect on the next task")
+        .help(linked ? "Connect Claudex to the synchronized \(provider.title) session" : "Connect Claudex to \(provider.title) on the next task")
         .accessibilityLabel(provider == .claude ? "Claude Code backend" : "Codex backend")
     }
 }
