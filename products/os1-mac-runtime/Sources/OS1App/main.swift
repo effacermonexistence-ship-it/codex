@@ -379,6 +379,30 @@ private final class SessionStore: ObservableObject {
         save()
     }
 
+    func showClaudexHome() {
+        guard !isRunning else { return }
+        chooseProvider(.auto)
+        statusText = "Claudex home · RCC auto routing"
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func synchronizeBackend(_ provider: ProviderChoice) {
+        guard !isRunning, provider != .auto, let session = selectedSession else { return }
+        chooseProvider(provider)
+        switch provider {
+        case .codex where session.codexSessionID != nil:
+            openCodexSession()
+        case .claude where session.claudeSessionID != nil:
+            openClaudeSession()
+        case .codex:
+            statusText = "Codex selected · send a task to create the synchronized native session"
+        case .claude:
+            statusText = "Claude Code selected · send a task to create the synchronized native session"
+        case .auto:
+            break
+        }
+    }
+
     func setCapacity(_ provider: ProviderChoice, value: Int) {
         guard let index = selectedIndex, [0, 10, 25, 50, 75, 100].contains(value) else { return }
         if provider == .codex { sessions[index].codexCapacity = value }
@@ -717,23 +741,34 @@ private struct ProviderRail: View {
 
     var body: some View {
         VStack(spacing: 18) {
-            ZStack {
-                Circle()
-                    .fill(AngularGradient(
-                        colors: [.pink, .purple, .orange, .pink],
-                        center: .center
-                    ))
-                Circle().fill(Theme.background).padding(7)
-                Circle().fill(Color.white.opacity(0.9)).frame(width: 7, height: 7)
+            Button { store.showClaudexHome() } label: {
+                ZStack {
+                    Circle()
+                        .fill(AngularGradient(
+                            colors: [.pink, .purple, .orange, .pink],
+                            center: .center
+                        ))
+                    Circle().fill(Theme.background).padding(7)
+                    Circle().fill(Color.white.opacity(0.9)).frame(width: 7, height: 7)
+                }
+                .frame(width: 38, height: 38)
             }
-            .frame(width: 38, height: 38)
+            .buttonStyle(.plain)
+            .disabled(store.isRunning)
+            .help("Claudex home")
+            .accessibilityLabel("Claudex home")
             .padding(.bottom, 5)
 
             ForEach([ProviderChoice.codex, ProviderChoice.claude]) { provider in
                 BackendStatus(
                     provider: provider,
-                    active: store.selectedSession?.lastProvider == provider.rawValue
-                )
+                    selected: store.selectedSession?.provider == provider,
+                    active: store.selectedSession?.lastProvider == provider.rawValue,
+                    linked: provider == .codex
+                        ? store.selectedSession?.codexSessionID != nil
+                        : store.selectedSession?.claudeSessionID != nil,
+                    disabled: store.isRunning
+                ) { store.synchronizeBackend(provider) }
             }
 
             Spacer()
@@ -760,19 +795,39 @@ private struct ProviderRail: View {
 
 private struct BackendStatus: View {
     let provider: ProviderChoice
+    let selected: Bool
     let active: Bool
+    let linked: Bool
+    let disabled: Bool
+    let action: () -> Void
 
     var body: some View {
-        VStack(spacing: 7) {
-            Image(systemName: provider.symbol).font(.system(size: 17, weight: .semibold))
-            Text("BACKEND").font(.system(size: 7, weight: .bold, design: .rounded))
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: provider.symbol).font(.system(size: 17, weight: .semibold))
+                Text(provider == .claude ? "CLAUDE CODE" : "CODEX")
+                    .font(.system(size: 7, weight: .bold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+                HStack(spacing: 3) {
+                    Circle().fill(linked ? Theme.green : Theme.muted).frame(width: 4, height: 4)
+                    Text(linked ? "SYNCED" : "CONNECT")
+                        .font(.system(size: 6, weight: .bold, design: .rounded))
+                }
+            }
+            .foregroundStyle(selected || active ? provider.tint : Theme.muted)
+            .frame(width: 62, height: 66)
+            .background(selected ? provider.tint.opacity(0.16) : (active ? provider.tint.opacity(0.09) : Color.clear))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(selected ? provider.tint : Theme.border, lineWidth: selected ? 1.6 : 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 10))
         }
-        .foregroundStyle(active ? provider.tint : Theme.muted)
-        .frame(width: 58, height: 58)
-        .background(active ? provider.tint.opacity(0.12) : Color.clear)
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(active ? provider.tint : Theme.border))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .help("Managed (provider.title) backend")
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .help(linked ? "Synchronize and open \(provider.title)" : "Select \(provider.title) and connect on the next task")
+        .accessibilityLabel(provider == .claude ? "Claude Code backend" : "Codex backend")
     }
 }
 
