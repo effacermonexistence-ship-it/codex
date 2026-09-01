@@ -18,11 +18,16 @@ function includesAny(text: string, patterns: string[]): boolean {
 
 export function evaluateArtifact(task: string, artifact: Artifact, policy: RevasPolicy): Evaluation {
   const output = artifact.output.trim();
+  const foldedOutput = artifact.output.toLocaleLowerCase("und");
   const combined = `${artifact.output}\n${artifact.stderr}`.toLocaleLowerCase("und");
   const transient = includesAny(combined, policy.transient_patterns);
-  const fatal = includesAny(combined, policy.failure_patterns);
-  const incomplete = includesAny(combined, policy.incomplete_patterns);
   if (artifact.exit_code !== 0) return { outcome: transient ? "retry" : "fail", score: 0, flags: [transient ? "transient_exit" : "failed_exit"] };
+  // Provider CLIs may emit non-fatal connector startup warnings on stderr while
+  // still returning exit 0 and a valid final answer. Once execution succeeded,
+  // grade fatal/incomplete language in the answer itself; stderr remains useful
+  // for classifying non-zero exits above.
+  const fatal = includesAny(foldedOutput, policy.failure_patterns);
+  const incomplete = includesAny(foldedOutput, policy.incomplete_patterns);
   if (fatal) return { outcome: "fail", score: 0, flags: ["fatal_pattern"] };
   if (incomplete) return { outcome: "retry", score: policy.retry_score, flags: ["incomplete_pattern"] };
   if (output.length === 0) return { outcome: "retry", score: policy.retry_score, flags: ["empty_output"] };
@@ -30,12 +35,12 @@ export function evaluateArtifact(task: string, artifact: Artifact, policy: Revas
   const exactReply = includesAny(foldedTask, policy.exact_reply_terms);
   const mutation = !exactReply && includesAny(foldedTask, policy.mutation_terms);
   const hasDiff = artifact.workspace_diff_hash !== EMPTY_DIFF;
-  const hasEvidence = includesAny(combined, policy.evidence_terms);
+  const hasEvidence = includesAny(foldedOutput, policy.evidence_terms);
   if (mutation && !hasDiff && !hasEvidence) return { outcome: "retry", score: policy.retry_score, flags: ["missing_change_evidence"] };
   const stop = new Set(policy.stop_words.map((word) => word.toLocaleLowerCase("und")));
   const tokens = foldedTask.match(/[\p{L}\p{N}_-]{4,}/gu) ?? [];
   const material = [...new Set(tokens.filter((token) => !stop.has(token)))].slice(0, 32);
-  const aligned = exactReply || material.length === 0 || material.some((token) => combined.includes(token));
+  const aligned = exactReply || material.length === 0 || material.some((token) => foldedOutput.includes(token));
   let score = 35 + 15 + 15 + 10;
   if (exactReply || output.length >= policy.minimum_output_chars) score += 15;
   if (aligned) score += 15;

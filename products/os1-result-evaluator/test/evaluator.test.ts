@@ -17,6 +17,11 @@ describe("REVAS evaluator", () => {
   it("passes aligned substantive output and exact replies", () => {
     expect(evaluateArtifact("analyze the repository", base, policy).outcome).toBe("pass");
     expect(evaluateArtifact("reply exactly OK", { ...base, output: "OK" }, policy).outcome).toBe("pass");
+    expect(evaluateArtifact("reply exactly OK", {
+      ...base,
+      output: "OK",
+      stderr: "optional connector startup error: authentication required",
+    }, policy).outcome).toBe("pass");
   });
   it("retries transient failures and incomplete work", () => {
     expect(evaluateArtifact("analyze", { ...base, exit_code: 1, stderr: "rate limit" }, policy).outcome).toBe("retry");
