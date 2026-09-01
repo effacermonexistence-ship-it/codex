@@ -1,0 +1,31 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "os1-route-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "services": [
+    { "binding": "AUTH_SERVICE", "service": "os1-auth-service" },
+    { "binding": "DEVICE_REGISTRY", "service": "os1-device-registry" },
+    { "binding": "PRIVATE_ROUTE_CORE", "service": "os1-private-route-core" },
+    { "binding": "RESULT_EVALUATOR", "service": "os1-result-evaluator" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "EXECUTIONS", "class_name": "ExecutionState" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ExecutionState"] }
+  ],
+  "vars": {
+    "MAX_REQUEST_BYTES": "65536",
+    "SERVICE_RESPONSE_BYTES": "32768",
+    "TICKET_TTL_SECONDS": "90"
+  },
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.1 }
+  }
+}

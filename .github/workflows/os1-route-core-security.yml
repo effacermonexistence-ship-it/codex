@@ -1,0 +1,59 @@
+name: OS-1 route-core security gates
+
+on:
+  push:
+    paths:
+      - ".github/workflows/os1-route-core-security.yml"
+      - "products/os1-route-core/**"
+      - "docs/os1-route-core-security-handoff.md"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+  pull_request:
+    paths:
+      - ".github/workflows/os1-route-core-security.yml"
+      - "products/os1-route-core/**"
+      - "docs/os1-route-core-security-handoff.md"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Type, test, and bundle security boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.20.0"
+
+      - name: Enable pinned pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.19.0 --activate
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Cloudflare binding types
+        run: pnpm --dir products/os1-route-core types
+
+      - name: Type-check Worker boundary
+        run: pnpm --dir products/os1-route-core check
+
+      - name: Run adversarial contract tests
+        run: pnpm --dir products/os1-route-core test
+
+      - name: Build Cloudflare dry-run bundle
+        run: pnpm --dir products/os1-route-core deploy:dry-run

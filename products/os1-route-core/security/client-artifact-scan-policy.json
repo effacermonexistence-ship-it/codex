@@ -1,0 +1,22 @@
+{
+  "forbiddenPathFragments": [
+    ".dev.vars",
+    "dataset",
+    "debug",
+    "prompt",
+    "staging",
+    "testset"
+  ],
+  "forbiddenContentFragments": [
+    "RCC/REVAS",
+    "internal evaluation rubric",
+    "private routing prompt",
+    "provider selection weights",
+    "routing threshold"
+  ],
+  "entropy": {
+    "minimumLength": 48,
+    "minimumBitsPerCharacter": 4.7,
+    "allowedTokenSha256": []
+  }
+}
