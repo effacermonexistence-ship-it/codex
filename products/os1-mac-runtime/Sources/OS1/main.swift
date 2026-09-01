@@ -792,15 +792,299 @@ func normalizedSessionID(_ value: String?) throws -> String? {
     return uuid.uuidString.lowercased()
 }
 
-func codexThreadID(from events: Data) -> String? {
-    for line in events.split(separator: 0x0A) {
-        guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-              object["type"] as? String == "thread.started",
-              let value = object["thread_id"] as? String,
-              let uuid = UUID(uuidString: value) else { continue }
-        return uuid.uuidString.lowercased()
+final class CodexAppServerClient: @unchecked Sendable {
+    private let process = Process()
+    private let input = Pipe()
+    private let output = Pipe()
+    private let stderrURL: URL
+    private let stderrHandle: FileHandle
+    private let lock = NSLock()
+    private let messageAvailable = DispatchSemaphore(value: 0)
+    private var buffer = Data()
+    private var messages: [[String: Any]] = []
+    private var deferredNotifications: [[String: Any]] = []
+    private var nextRequestID = 1
+
+    init(executable: String, workspace: String) throws {
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("os1-codex-app-server-\(UUID().uuidString).stderr")
+        FileManager.default.createFile(atPath: temporary.path, contents: nil)
+        stderrURL = temporary
+        stderrHandle = try FileHandle(forWritingTo: temporary)
+
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["app-server"]
+        process.currentDirectoryURL = URL(fileURLWithPath: workspace, isDirectory: true)
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = stderrHandle
+
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard let self else { return }
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                self.messageAvailable.signal()
+                return
+            }
+            self.ingest(data)
+        }
+        try process.run()
     }
-    return nil
+
+    deinit {
+        close()
+    }
+
+    func initialize(deadline: Date) throws {
+        _ = try request(
+            "initialize",
+            params: [
+                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.6.6"],
+                "capabilities": ["experimentalApi": true],
+            ],
+            deadline: deadline
+        )
+        try send(["jsonrpc": "2.0", "method": "initialized", "params": [:] as [String: Any]])
+    }
+
+    func startOrResumeThread(
+        existingSessionID: String?,
+        workspace: String,
+        model: String?,
+        instructions: String,
+        permissionProfile: String,
+        title: String,
+        deadline: Date
+    ) throws -> String {
+        let sandbox: String
+        switch permissionProfile {
+        case "read_only": sandbox = "read-only"
+        case "workspace_write": sandbox = "workspace-write"
+        case "full_access": sandbox = "danger-full-access"
+        default: throw OS1Error.message("Server ticket permission profile rejected")
+        }
+
+        var params: [String: Any] = [
+            "cwd": workspace,
+            "developerInstructions": instructions,
+            "approvalPolicy": "never",
+            "approvalsReviewer": "auto_review",
+            "sandbox": sandbox,
+            "runtimeWorkspaceRoots": [workspace],
+        ]
+        if let model { params["model"] = model }
+
+        let result: [String: Any]
+        if let existingSessionID {
+            params["threadId"] = existingSessionID
+            params["excludeTurns"] = true
+            result = try request("thread/resume", params: params, deadline: deadline)
+        } else {
+            params["ephemeral"] = false
+            params["historyMode"] = "paginated"
+            params["threadSource"] = "os1"
+            params["serviceName"] = "OS-1"
+            result = try request("thread/start", params: params, deadline: deadline)
+        }
+
+        guard let thread = result["thread"] as? [String: Any],
+              let rawID = thread["id"] as? String,
+              let threadID = try normalizedSessionID(rawID) else {
+            throw OS1Error.message("Codex did not return a persistent desktop thread ID")
+        }
+        if let existingSessionID, existingSessionID != threadID {
+            throw OS1Error.message("Codex resumed the wrong desktop thread")
+        }
+
+        if existingSessionID == nil {
+            _ = try request(
+                "thread/name/set",
+                params: ["threadId": threadID, "name": title],
+                deadline: deadline
+            )
+        }
+        try makeVisible(threadID: threadID, deadline: deadline)
+        return threadID
+    }
+
+    func runTurn(
+        threadID: String,
+        prompt: String,
+        workspace: String,
+        model: String?,
+        effort: String,
+        deadline: Date
+    ) throws -> Data {
+        var params: [String: Any] = [
+            "threadId": threadID,
+            "input": [["type": "text", "text": prompt]],
+            "cwd": workspace,
+            "effort": effort,
+            "approvalPolicy": "never",
+            "approvalsReviewer": "auto_review",
+            "turnTrigger": "os1",
+        ]
+        if let model { params["model"] = model }
+        let result = try request("turn/start", params: params, deadline: deadline)
+        guard let turn = result["turn"] as? [String: Any], let turnID = turn["id"] as? String else {
+            throw OS1Error.message("Codex did not start a persistent desktop turn")
+        }
+        return try waitForTurn(threadID: threadID, turnID: turnID, deadline: deadline)
+    }
+
+    func close() {
+        output.fileHandleForReading.readabilityHandler = nil
+        try? input.fileHandleForWriting.close()
+        if process.isRunning {
+            process.terminate()
+            let deadline = Date().addingTimeInterval(1)
+            while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
+        try? stderrHandle.close()
+        try? FileManager.default.removeItem(at: stderrURL)
+    }
+
+    func stderr() -> Data {
+        try? stderrHandle.synchronize()
+        return (try? Data(contentsOf: stderrURL)) ?? Data()
+    }
+
+    private func makeVisible(threadID: String, deadline: Date) throws {
+        let sectionName = "OS-1 Backend"
+        let listed = try request("threadSection/list", params: ["limit": 100], deadline: deadline)
+        var sectionID = (listed["data"] as? [[String: Any]])?
+            .first(where: { $0["name"] as? String == sectionName })?["id"] as? String
+        if sectionID == nil {
+            let created = try request("threadSection/create", params: ["name": sectionName], deadline: deadline)
+            sectionID = (created["section"] as? [String: Any])?["id"] as? String
+        }
+        guard let sectionID else {
+            throw OS1Error.message("Codex desktop session section could not be prepared")
+        }
+        _ = try request(
+            "thread/section/move",
+            params: ["threadId": threadID, "sectionId": sectionID, "beforeThreadId": NSNull()],
+            deadline: deadline
+        )
+    }
+
+    private func waitForTurn(threadID: String, turnID: String, deadline: Date) throws -> Data {
+        while true {
+            let message: [String: Any]
+            if !deferredNotifications.isEmpty {
+                message = deferredNotifications.removeFirst()
+            } else {
+                message = try nextMessage(deadline: deadline)
+            }
+            if let method = message["method"] as? String, message["id"] != nil {
+                try rejectServerRequest(message, method: method)
+                continue
+            }
+            guard message["method"] as? String == "turn/completed",
+                  let params = message["params"] as? [String: Any],
+                  params["threadId"] as? String == threadID,
+                  let turn = params["turn"] as? [String: Any],
+                  turn["id"] as? String == turnID else { continue }
+            guard turn["status"] as? String == "completed" else {
+                throw OS1Error.message("Codex desktop turn failed. OS-1 did not verify this step.")
+            }
+            let items = turn["items"] as? [[String: Any]] ?? []
+            let agentMessages = items.filter { $0["type"] as? String == "agentMessage" }
+            let final = agentMessages.last(where: { $0["phase"] as? String == "final_answer" })
+                ?? agentMessages.last
+            guard let text = final?["text"] as? String else {
+                throw OS1Error.message("Codex desktop turn returned no final answer")
+            }
+            return Data(text.utf8)
+        }
+    }
+
+    private func request(_ method: String, params: [String: Any], deadline: Date) throws -> [String: Any] {
+        let requestID = nextRequestID
+        nextRequestID += 1
+        try send(["jsonrpc": "2.0", "id": requestID, "method": method, "params": params])
+        while true {
+            let message = try nextMessage(deadline: deadline)
+            if let incomingMethod = message["method"] as? String, message["id"] != nil {
+                try rejectServerRequest(message, method: incomingMethod)
+                continue
+            }
+            guard (message["id"] as? NSNumber)?.intValue == requestID else {
+                if message["method"] != nil { deferredNotifications.append(message) }
+                continue
+            }
+            if message["error"] != nil {
+                throw OS1Error.message("Codex desktop protocol rejected \(method)")
+            }
+            return message["result"] as? [String: Any] ?? [:]
+        }
+    }
+
+    private func rejectServerRequest(_ message: [String: Any], method: String) throws {
+        guard let id = message["id"] else { return }
+        try send([
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": [
+                "code": -32000,
+                "message": "OS-1 non-interactive permission policy denied \(method)",
+            ],
+        ])
+    }
+
+    private func send(_ object: [String: Any]) throws {
+        var data = try JSONSerialization.data(withJSONObject: object)
+        data.append(0x0A)
+        try input.fileHandleForWriting.write(contentsOf: data)
+    }
+
+    private func ingest(_ data: Data) {
+        lock.lock()
+        buffer.append(data)
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            let line = Data(buffer[..<newline])
+            buffer.removeSubrange(...newline)
+            if let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] {
+                messages.append(object)
+                messageAvailable.signal()
+            }
+        }
+        lock.unlock()
+    }
+
+    private func nextMessage(deadline: Date) throws -> [String: Any] {
+        while true {
+            lock.lock()
+            if !messages.isEmpty {
+                let message = messages.removeFirst()
+                lock.unlock()
+                return message
+            }
+            lock.unlock()
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else {
+                throw OS1Error.message("Local provider execution timed out")
+            }
+            if messageAvailable.wait(timeout: .now() + remaining) == .timedOut {
+                throw OS1Error.message("Local provider execution timed out")
+            }
+            if !process.isRunning {
+                lock.lock()
+                let hasMessages = !messages.isEmpty
+                lock.unlock()
+                if !hasMessages {
+                    throw OS1Error.message("Codex desktop backend exited unexpectedly")
+                }
+            }
+        }
+    }
+}
+
+func codexSessionTitle(from prompt: String) -> String {
+    let compact = prompt.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    let summary = compact.isEmpty ? "Governed task" : String(compact.prefix(72))
+    return "OS-1 Codex · \(summary)"
 }
 
 func execute(
@@ -819,63 +1103,32 @@ func execute(
     let instructions = executorInstructions(contract: executorContract, ticket: ticket)
     if ticket.provider == "codex" {
         let codex = try findExecutable("codex")
-        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("os1-codex-\(UUID().uuidString).txt")
-        defer { try? FileManager.default.removeItem(at: outputURL) }
-        var arguments: [String]
-        if let providerSessionID = try normalizedSessionID(providerSessionID) {
-            switch ticket.permissionProfile {
-            case "read_only": arguments = ["-s", "read-only"]
-            case "full_access": arguments = ["--dangerously-bypass-approvals-and-sandbox"]
-            default: arguments = ["--approve-for-me"]
-            }
-            arguments += [
-                "exec", "resume",
-            ]
-            if let model { arguments += ["--model", model] }
-            arguments += ["--config", "model_reasoning_effort=\"\(effort)\""]
-            arguments += ["--config", "developer_instructions=\(try tomlStringLiteral(instructions))"]
-            arguments += [
-                "--json",
-                "--skip-git-repo-check",
-                "-o", outputURL.path,
-            ]
-            arguments += [providerSessionID, "-"]
-        } else {
-            arguments = [
-                "exec",
-            ]
-            if let model { arguments += ["--model", model] }
-            arguments += ["--config", "model_reasoning_effort=\"\(effort)\""]
-            arguments += ["--config", "developer_instructions=\(try tomlStringLiteral(instructions))"]
-            arguments += [
-                "--json",
-                "--color", "never",
-                "--skip-git-repo-check",
-                "-C", workspace,
-                "-o", outputURL.path,
-            ]
-            switch ticket.permissionProfile {
-            case "read_only": arguments += ["-s", "read-only"]
-            case "full_access": arguments += ["--dangerously-bypass-approvals-and-sandbox"]
-            default: arguments += ["--approve-for-me"]
-            }
-            arguments.append("-")
-        }
-        let raw = try commandOutput(
-            codex,
-            arguments,
-            input: Data(prompt.utf8),
-            timeout: timeout,
-            currentDirectory: workspace
+        let deadline = Date().addingTimeInterval(TimeInterval(timeout))
+        let appServer = try CodexAppServerClient(executable: codex, workspace: workspace)
+        defer { appServer.close() }
+        try appServer.initialize(deadline: deadline)
+        let expectedSessionID = try normalizedSessionID(providerSessionID)
+        let actualSessionID = try appServer.startOrResumeThread(
+            existingSessionID: expectedSessionID,
+            workspace: workspace,
+            model: model,
+            instructions: instructions,
+            permissionProfile: ticket.permissionProfile,
+            title: codexSessionTitle(from: prompt),
+            deadline: deadline
         )
-        let final = (try? Data(contentsOf: outputURL)).flatMap { $0.isEmpty ? nil : $0 } ?? raw.1
-        result = (raw.0, final, raw.2)
-        guard let actualSessionID = codexThreadID(from: raw.1) else {
-            throw OS1Error.message("Codex did not return a persistent thread ID")
-        }
-        if let expected = try normalizedSessionID(providerSessionID), expected != actualSessionID {
+        if let expectedSessionID, expectedSessionID != actualSessionID {
             throw OS1Error.message("Codex resumed the wrong thread")
         }
+        let final = try appServer.runTurn(
+            threadID: actualSessionID,
+            prompt: prompt,
+            workspace: workspace,
+            model: model,
+            effort: effort,
+            deadline: deadline
+        )
+        result = (0, final, appServer.stderr())
         sessionID = actualSessionID
     } else {
         let claude = try findExecutable("claude")
@@ -1059,13 +1312,9 @@ func selfTest() throws {
           (try? normalizedSessionID("most-recent")) == nil else {
         throw OS1Error.message("Native provider session validation failed")
     }
-    let events = Data("""
-    {"type":"item.completed","item":{"type":"agent_message","text":"hello"}}
-    {"type":"thread.started","thread_id":"01A05B4D-F206-7C71-BD11-128B24E755E0"}
-    """.utf8)
-    guard codexThreadID(from: events) == "01a05b4d-f206-7c71-bd11-128b24e755e0",
-          codexThreadID(from: Data("not json\n{}\n".utf8)) == nil else {
-        throw OS1Error.message("Codex native thread event validation failed")
+    guard codexSessionTitle(from: "  1 + 1   테스트  ") == "OS-1 Codex · 1 + 1 테스트",
+          codexSessionTitle(from: "").hasPrefix("OS-1 Codex · ") else {
+        throw OS1Error.message("Codex desktop session title validation failed")
     }
     let claudeSessionID = "01a05b4d-f206-7c71-bd11-128b24e755e0"
     let allowedClaudeResult = Data("""
@@ -1154,7 +1403,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.6.5")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.6.6")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":

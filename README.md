@@ -31,11 +31,13 @@ The desktop app follows the same three-pane workflow as Codex:
 
 Each OS-1 session pair links one real persistent Codex task and one real
 persistent Claude Code session. Repeated Codex turns resume the same Codex
-thread; repeated Claude turns resume the same Claude session. After the first
-turn in each engine, **Open Codex** and **Open Claude** appear in the header so
-the native provider session can be opened directly. Changing the project folder
-resets both links to prevent a provider session from resuming in the wrong
-workspace.
+thread; repeated Claude turns resume the same Claude session. Codex work is
+created through the local Codex desktop protocol and registered in the desktop
+task list, so the prompt, final answer, workspace, and continued turns remain
+visible when the Codex backend is inspected. After the first turn in either
+engine, the matching backend inspector is enabled in the header. Changing the
+project folder resets both links to prevent a provider session from resuming in
+the wrong workspace.
 
 When the selected engine changes, OS-1 sends a bounded, visible completed-turn
 handoff as untrusted context to the other engine. It does not claim to mirror
