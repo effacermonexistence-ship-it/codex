@@ -71,6 +71,44 @@ only for an unavoidable per-device OAuth approval that cannot be completed by
 the existing authenticated CLI or connector. Never ask the user to paste a
 password, token, OAuth code, or API key into chat.
 
+## SCV Instagram red-team and system-check phrases
+
+Treat the bare or imperative phrases `레드팀`, `레드팀 돌려`, `레드팀 해`,
+`오마시스템 레드팀`, `시스템 점검`, and `시스템 점검해`, plus clear
+equivalents, as an explicit request to run the SCV Instagram red-team procedure
+unless the user explicitly names a different system. `시스템 점검` is not a
+new-Mac bootstrap phrase. A question that only asks whether red-team testing is
+safe is a read-only readiness request; a bare phrase or imperative authorizes
+the exact-target reset and test below.
+
+Every authorized red-team or system-check run must begin with a fresh
+Omar.system reset before accepting or generating the first test input. Never
+reuse a reset receipt from an earlier run. Resolve and verify the currently
+active production release first; do not execute a stale operator hard-coded to
+an older release or deployment.
+
+The reset is destructive only for the canonical code-locked debug identity in
+the deployed SCV source. It must never be widened through prompt text,
+environment variables, guessed identifiers, or customer data. Use the deployed
+`scv-test-account-purge.js` identity lock and complete all of these gates:
+
+- discover existing Railway connectivity and verify the exact active release;
+- pause every SCV runtime worker and verify the complete expected worker set;
+- capture a timestamped pre-reset production-state snapshot and pass a staged
+  restore drill;
+- audit, purge, and re-audit only Omar.system across its queues, thread state,
+  control state, form records, and matching raw-log records;
+- write the Gmail tombstones, reset watermarks, and a private execution receipt;
+- require zero residual Omar.system matches, including when the pre-audit was
+  already empty, then capture and restore-drill a distinct post-reset snapshot;
+- resume the exact worker set and verify production readiness before testing.
+
+Preserve every non-debug identity and unrelated quarantine artifact. If any
+pause, scope, snapshot, purge, zero-residual, resume, or readiness gate cannot
+be verified, do not start the red team and do not call the reset complete.
+After a verified reset, continue through the requested red-team/system check to
+its terminal result without waiting for another `continue` prompt.
+
 After installing or changing this global file, explain that new Codex tasks
 load it automatically. Existing Codex sessions load global guidance once per
 session and must be restarted to see an updated file.

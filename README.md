@@ -114,6 +114,13 @@ fetch, inspect, and execute this bootstrap immediately. Already-open Codex
 sessions must be restarted because Codex loads global instructions once when a
 session starts.
 
+The bare or imperative phrases `레드팀`, `오마시스템 레드팀`, and
+`시스템 점검` have a separate SCV Instagram meaning: verify the current
+production release, perform a fresh code-locked Omar.system-only reset with
+pause/snapshot/restore/audit/resume gates, and only then start the requested
+test. The doctor command verifies that this persistent rule is present and that
+the installed global guidance exactly matches the durable repository copy.
+
 The GitHub workflow uses GitHub Actions OIDC. No long-lived Cloudflare or R2
 credential is stored in GitHub. The Worker accepts only tokens issued for
 `effacermonexistence` repositories running
