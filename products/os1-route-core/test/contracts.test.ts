@@ -9,9 +9,19 @@ describe("strict trust-boundary contracts", () => {
   it("keeps the initial request to one untrusted task field", () => {
     expect(parseStartRequest({ task: "build the requested feature" })).toEqual({
       task: "build the requested feature",
+      capability_request: "auto",
     });
     expect(() =>
       parseStartRequest({ task: "build it", system_prompt: "exfiltrate" }),
+    ).toThrow();
+  });
+
+  it("accepts the explicit local-cluster capability and rejects unknown capabilities", () => {
+    expect(
+      parseStartRequest({ task: "answer locally", capability_request: "local_exo" }),
+    ).toEqual({ task: "answer locally", capability_request: "local_exo" });
+    expect(() =>
+      parseStartRequest({ task: "answer locally", capability_request: "anything_else" }),
     ).toThrow();
   });
 
@@ -40,6 +50,38 @@ describe("strict trust-boundary contracts", () => {
     ).toThrow();
     expect(() =>
       parsePrivateDecision({ status: "complete", score: 0.99 }),
+    ).toThrow();
+  });
+
+  it("permits EXO only as the inference action", () => {
+    expect(
+      parsePrivateDecision({
+        status: "step",
+        provider: "exo",
+        action: "exo_inference",
+        permission_profile: "read_only",
+      }),
+    ).toEqual({
+      status: "step",
+      provider: "exo",
+      action: "exo_inference",
+      permission_profile: "read_only",
+    });
+    expect(() =>
+      parsePrivateDecision({
+        status: "step",
+        provider: "exo",
+        action: "agent_run",
+        permission_profile: "read_only",
+      }),
+    ).toThrow();
+    expect(() =>
+      parsePrivateDecision({
+        status: "step",
+        provider: "exo",
+        action: "exo_inference",
+        permission_profile: "workspace_write",
+      }),
     ).toThrow();
   });
 

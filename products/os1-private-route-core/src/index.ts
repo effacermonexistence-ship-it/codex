@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
-type Provider = "codex" | "claude";
+type Provider = "codex" | "claude" | "exo";
+type Action = "agent_run" | "exo_inference";
 type PermissionProfile = "read_only" | "workspace_write" | "full_access";
 type Step = {
   provider: Provider;
@@ -14,11 +15,12 @@ type Policy = {
   default_provider: Provider;
   default_permission_profile: PermissionProfile;
   max_steps: number;
+  local_exo_enabled: boolean;
   rules: Rule[];
 };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const providers = new Set<Provider>(["codex", "claude"]);
+const providers = new Set<Provider>(["codex", "claude", "exo"]);
 const permissions = new Set<PermissionProfile>([
   "read_only",
   "workspace_write",
@@ -33,17 +35,29 @@ function isPermission(value: unknown): value is PermissionProfile {
   return typeof value === "string" && permissions.has(value as PermissionProfile);
 }
 
+function actionFor(provider: Provider): Action {
+  return provider === "exo" ? "exo_inference" : "agent_run";
+}
+
+function validStep(provider: Provider, permissionProfile: PermissionProfile): boolean {
+  // EXO is an inference-only provider. It must never receive a ticket that
+  // implies workspace mutation or unrestricted local execution.
+  return provider !== "exo" || permissionProfile === "read_only";
+}
+
 function parsePolicy(serialized: string): Policy {
   const value = JSON.parse(serialized) as Record<string, unknown>;
   if (
     value.version !== 1 ||
     !isProvider(value.default_provider) ||
     !isPermission(value.default_permission_profile) ||
+    !validStep(value.default_provider, value.default_permission_profile) ||
     !Number.isSafeInteger(value.max_steps) ||
     (value.max_steps as number) < 1 ||
     (value.max_steps as number) > 4 ||
     !Array.isArray(value.rules) ||
-    value.rules.length > 64
+    value.rules.length > 64 ||
+    (value.local_exo_enabled !== undefined && typeof value.local_exo_enabled !== "boolean")
   ) {
     throw new Error("invalid policy");
   }
@@ -56,6 +70,8 @@ function parsePolicy(serialized: string): Policy {
       !isProvider(rule.provider) ||
       !isProvider(rule.fallback_provider) ||
       !isPermission(rule.permission_profile) ||
+      !validStep(rule.provider, rule.permission_profile) ||
+      !validStep(rule.fallback_provider, rule.permission_profile) ||
       !Number.isSafeInteger(rule.max_steps) ||
       (rule.max_steps as number) < 1 ||
       (rule.max_steps as number) > 4 ||
@@ -79,11 +95,20 @@ function parsePolicy(serialized: string): Policy {
     default_provider: value.default_provider,
     default_permission_profile: value.default_permission_profile,
     max_steps: value.max_steps as number,
+    local_exo_enabled: value.local_exo_enabled === true,
     rules,
   };
 }
 
-function select(policy: Policy, task: string): Step {
+function select(policy: Policy, task: string, capabilityRequest: "auto" | "local_exo"): Step {
+  if (capabilityRequest === "local_exo" && policy.local_exo_enabled) {
+    return {
+      provider: "exo",
+      fallback_provider: "codex",
+      permission_profile: "read_only",
+      max_steps: 1,
+    };
+  }
   const folded = task.toLocaleLowerCase("und");
   const rule = policy.rules.find((candidate) =>
     candidate.terms.some((term) => folded.includes(term.toLocaleLowerCase("und"))),
@@ -168,7 +193,7 @@ function stepResponse(step: Pick<Step, "provider" | "permission_profile">): Resp
   return Response.json({
     status: "step",
     provider: step.provider,
-    action: "agent_run",
+    action: actionFor(step.provider),
     permission_profile: step.permission_profile,
   });
 }
@@ -187,10 +212,19 @@ export default {
 
       if (typeof value.task === "object" && value.task !== null && !Array.isArray(value.task)) {
         const task = value.task as Record<string, unknown>;
-        if (task.trust !== "untrusted_user_data" || typeof task.content !== "string" || task.content.length > 48_000) {
+        if (
+          task.trust !== "untrusted_user_data" ||
+          typeof task.content !== "string" ||
+          task.content.length > 48_000 ||
+          !["auto", "local_exo"].includes(String(value.capability_request ?? "auto"))
+        ) {
           throw new Error("denied");
         }
-        const selected = select(parsePolicy(env.PRIVATE_ROUTE_POLICY_JSON), task.content);
+        const selected = select(
+          parsePolicy(env.PRIVATE_ROUTE_POLICY_JSON),
+          task.content,
+          (value.capability_request ?? "auto") as "auto" | "local_exo",
+        );
         if ((await state.begin(selected)) !== "created") throw new Error("denied");
         return stepResponse(selected);
       }

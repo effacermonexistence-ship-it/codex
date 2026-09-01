@@ -1,7 +1,7 @@
 import { reject } from "./errors";
 
-export const PROVIDERS = ["codex", "claude"] as const;
-export const ACTIONS = ["agent_run"] as const;
+export const PROVIDERS = ["codex", "claude", "exo"] as const;
+export const ACTIONS = ["agent_run", "exo_inference"] as const;
 export const PERMISSION_PROFILES = [
   "read_only",
   "workspace_write",
@@ -11,6 +11,7 @@ export const PERMISSION_PROFILES = [
 export type Provider = (typeof PROVIDERS)[number];
 export type Action = (typeof ACTIONS)[number];
 export type PermissionProfile = (typeof PERMISSION_PROFILES)[number];
+export type CapabilityRequest = "auto" | "local_exo";
 
 export type TicketUnsigned = {
   execution_id: string;
@@ -119,6 +120,17 @@ function oneOf<T extends string>(
   return typeof value === "string" && values.includes(value as T);
 }
 
+function validProviderAction(provider: unknown, action: unknown): boolean {
+  return (
+    (provider === "exo" && action === "exo_inference") ||
+    ((provider === "codex" || provider === "claude") && action === "agent_run")
+  );
+}
+
+function validProviderPermission(provider: unknown, permissionProfile: unknown): boolean {
+  return provider !== "exo" || permissionProfile === "read_only";
+}
+
 function boundedString(
   value: unknown,
   min: number,
@@ -133,15 +145,28 @@ function boundedString(
   );
 }
 
-export function parseStartRequest(value: unknown): { task: string } {
+export function parseStartRequest(value: unknown): {
+  task: string;
+  capability_request: CapabilityRequest;
+} {
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ["task"]) ||
+    !(hasExactKeys(value, ["task"]) || hasExactKeys(value, ["task", "capability_request"])) ||
     !boundedString(value.task, 1, 48_000)
   ) {
     reject();
   }
-  return { task: value.task };
+  if (
+    value.capability_request !== undefined &&
+    value.capability_request !== "auto" &&
+    value.capability_request !== "local_exo"
+  ) {
+    reject();
+  }
+  return {
+    task: value.task,
+    capability_request: value.capability_request === "local_exo" ? "local_exo" : "auto",
+  };
 }
 
 export function parseTicket(value: unknown): Ticket {
@@ -163,7 +188,9 @@ export function parseTicket(value: unknown): Ticket {
     (value.sequence as number) < 1 ||
     !oneOf(value.provider, PROVIDERS) ||
     !oneOf(value.action, ACTIONS) ||
+    !validProviderAction(value.provider, value.action) ||
     !oneOf(value.permission_profile, PERMISSION_PROFILES) ||
+    !validProviderPermission(value.provider, value.permission_profile) ||
     !boundedString(value.expires_at, 20, 32) ||
     !Number.isFinite(Date.parse(value.expires_at)) ||
     !boundedString(value.nonce, 32, 128, BASE64URL) ||
@@ -316,7 +343,9 @@ export function parsePrivateDecision(value: unknown): PrivateDecision {
     ]) ||
     !oneOf(value.provider, PROVIDERS) ||
     !oneOf(value.action, ACTIONS) ||
+    !validProviderAction(value.provider, value.action) ||
     !oneOf(value.permission_profile, PERMISSION_PROFILES)
+    || !validProviderPermission(value.provider, value.permission_profile)
   ) {
     reject();
   }

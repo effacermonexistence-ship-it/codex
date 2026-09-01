@@ -115,7 +115,7 @@ async function issueTicket(
 
 export async function startExecution(request: Request, env: Env): Promise<Response> {
   const identity = await authenticate(request, env);
-  const { task } = parseStartRequest(
+  const { task, capability_request } = parseStartRequest(
     await readBoundedJson(request, positiveInteger(env.MAX_REQUEST_BYTES)),
   );
   const executionId = crypto.randomUUID();
@@ -123,6 +123,7 @@ export async function startExecution(request: Request, env: Env): Promise<Respon
     version: 1,
     execution_id: executionId,
     principal: { subject: identity.subject, device_id: identity.device_id },
+    capability_request,
     task: { trust: "untrusted_user_data", content: task },
   });
   if (decision.status === "complete") return publicJson({ status: "complete" });

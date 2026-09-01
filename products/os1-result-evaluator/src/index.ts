@@ -30,7 +30,7 @@ function transientPatterns(serialized: string): string[] {
 }
 
 function parseArtifact(value: unknown): {
-  provider: "codex" | "claude";
+  provider: "codex" | "claude" | "exo";
   exit_code: number;
   output: string;
   stderr: string;
@@ -39,7 +39,7 @@ function parseArtifact(value: unknown): {
   const body = value as Record<string, unknown>;
   if (
     body.schema !== 1 ||
-    !["codex", "claude"].includes(String(body.provider)) ||
+    !["codex", "claude", "exo"].includes(String(body.provider)) ||
     !Number.isSafeInteger(body.exit_code) ||
     typeof body.output !== "string" ||
     body.output.length > 800_000 ||
@@ -52,7 +52,7 @@ function parseArtifact(value: unknown): {
     throw new Error("invalid");
   }
   return {
-    provider: body.provider as "codex" | "claude",
+    provider: body.provider as "codex" | "claude" | "exo",
     exit_code: body.exit_code as number,
     output: body.output,
     stderr: body.stderr,

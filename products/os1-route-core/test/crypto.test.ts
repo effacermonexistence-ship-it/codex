@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ResultRequest, TicketUnsigned } from "../src/contracts";
+import { parseResultRequest, type ResultRequest, type TicketUnsigned } from "../src/contracts";
 import {
   canonicalResult,
   signTicket,
@@ -42,6 +42,26 @@ describe("asymmetric ticket signatures", () => {
     await expect(
       verifyTicket({ ...ticket, permission_profile: "full_access" }, publicPem),
     ).resolves.toBe(false);
+  });
+
+  it("binds the EXO provider to its inference-only action", () => {
+    expect(() =>
+      parseResultRequest({
+        ticket: {
+          execution_id: "3f7c2a82-3b21-4f39-9e3a-8dd9af83c79c",
+          sequence: 1,
+          provider: "exo",
+          action: "agent_run",
+          permission_profile: "read_only",
+          expires_at: "2026-09-01T00:00:00.000Z",
+          nonce: "Q2hhbmdlTWVOb3RBbmRUaGVuQ2hhbmdlTWVBZ2Fpbg",
+          signature: "A".repeat(86),
+        },
+        result_hash: "0".repeat(64),
+        artifact_ref: "r2://os1-private-results/3f7c2a82-3b21-4f39-9e3a-8dd9af83c79c/1/0000000000000000000000000000000000000000000000000000000000000000.json",
+        device_signature: "A".repeat(86),
+      }),
+    ).toThrow();
   });
 
   it("binds a device signature to the ticket, result hash, and artifact", async () => {

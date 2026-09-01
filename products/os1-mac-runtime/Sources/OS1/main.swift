@@ -15,12 +15,22 @@ struct RuntimeConfig: Codable {
     let ticketVerifyingKeyRaw: String
     let maximumSteps: Int
     let executionTimeoutSeconds: Int
+    let exoAPIURL: String?
+    let exoModelID: String?
+    let exoMinimumNodes: Int?
+    let exoStartupTimeoutSeconds: Int?
+    let exoMaximumOutputTokens: Int?
 
     enum CodingKeys: String, CodingKey {
         case apiURL = "api_url"
         case ticketVerifyingKeyRaw = "ticket_verifying_key_raw"
         case maximumSteps = "maximum_steps"
         case executionTimeoutSeconds = "execution_timeout_seconds"
+        case exoAPIURL = "exo_api_url"
+        case exoModelID = "exo_model_id"
+        case exoMinimumNodes = "exo_minimum_nodes"
+        case exoStartupTimeoutSeconds = "exo_startup_timeout_seconds"
+        case exoMaximumOutputTokens = "exo_maximum_output_tokens"
     }
 
     static func load() throws -> RuntimeConfig {
@@ -38,6 +48,7 @@ struct RuntimeConfig: Codable {
                   value.executionTimeoutSeconds >= 60 else {
                 throw OS1Error.message("OS-1 configuration is invalid")
             }
+            _ = try EXOConfiguration(runtimeConfig: value)
             return value
         }
         throw OS1Error.message("OS-1 configuration is missing; reinstall OS-1")
@@ -334,10 +345,15 @@ func resultBytes(_ result: ResultSubmission) -> Data {
 }
 
 func verifyTicket(_ ticket: Ticket, config: RuntimeConfig) throws {
-    guard ticket.action == "agent_run",
-          ["codex", "claude"].contains(ticket.provider),
+    let validProviderAction =
+        (ticket.provider == "exo" && ticket.action == "exo_inference") ||
+        (["codex", "claude"].contains(ticket.provider) && ticket.action == "agent_run")
+    guard validProviderAction,
           ["read_only", "workspace_write", "full_access"].contains(ticket.permissionProfile) else {
         throw OS1Error.message("Server ticket contract rejected")
+    }
+    if ticket.provider == "exo" && ticket.permissionProfile != "read_only" {
+        throw OS1Error.message("EXO tickets must be inference-only")
     }
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -478,10 +494,13 @@ func workspaceHash(_ workspace: String) -> String {
     return sha256Hex(result.1)
 }
 
-func execute(ticket: Ticket, prompt: String, workspace: String, timeout: Int) throws -> Artifact {
+func execute(ticket: Ticket, prompt: String, workspace: String, timeout: Int, config: RuntimeConfig) async throws -> Artifact {
     let started = Date()
     let result: (Int32, Data, Data)
-    if ticket.provider == "codex" {
+    if ticket.provider == "exo" {
+        let inference = try await executeEXO(prompt: prompt, config: config)
+        result = (0, Data(inference.output.utf8), Data())
+    } else if ticket.provider == "codex" {
         let codex = try findExecutable("codex")
         let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("os1-codex-\(UUID().uuidString).txt")
         defer { try? FileManager.default.removeItem(at: outputURL) }
@@ -545,7 +564,7 @@ func runTask(prompt: String, workspace: String) async throws {
         guard let ticket = route.ticket else { throw OS1Error.message("Invalid OS-1 route response") }
         try verifyTicket(ticket, config: config)
         print("OS-1 step \(step): \(ticket.provider) / \(ticket.permissionProfile)")
-        let artifact = try execute(ticket: ticket, prompt: prompt, workspace: canonicalWorkspace, timeout: config.executionTimeoutSeconds)
+        let artifact = try await execute(ticket: ticket, prompt: prompt, workspace: canonicalWorkspace, timeout: config.executionTimeoutSeconds, config: config)
         let artifactData = try JSONEncoder().encode(artifact)
         let resultHash = sha256Hex(artifactData)
         let artifactRef = "r2://os1-private-results/\(ticket.executionID)/\(ticket.sequence)/\(resultHash).json"
@@ -586,13 +605,13 @@ func usage() {
     OS-1 local runtime
 
       os1 doctor
+      os1 exo-doctor
       os1 register
       os1 run --workspace /path/to/project --prompt "task"
       os1 version
     """)
 }
 
-@main
 struct OS1Main {
     static func main() async {
         do {
@@ -601,6 +620,7 @@ struct OS1Main {
             switch command {
             case "version", "--version", "-V": print("OS-1 Runtime 0.1.0")
             case "doctor": try doctor()
+            case "exo-doctor": try await exoDoctor(config: RuntimeConfig.load())
             case "register":
                 let config = try RuntimeConfig.load()
                 let client = APIClient(config: config, token: try githubToken(), deviceID: try deviceID())
@@ -632,3 +652,8 @@ struct OS1Main {
         }
     }
 }
+
+Task {
+    await OS1Main.main()
+}
+dispatchMain()
