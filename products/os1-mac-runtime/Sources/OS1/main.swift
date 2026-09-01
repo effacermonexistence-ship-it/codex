@@ -345,6 +345,7 @@ func executorInstructions(contract: ExecutorContract, ticket: Ticket) -> String 
     - action: \(ticket.action)
     - permission profile: \(ticket.permissionProfile)
     - OS-1 owns permission orchestration. Do not ask the user to approve provider-native tools.
+    - Do not invoke, shell out to, or delegate work to the other provider's CLI. OS-1 alone dispatches Codex and Claude backends.
     - Execute only actions allowed by the assigned permission profile. If an action is denied, stop and report the blocker truthfully.
     """
 }
@@ -1153,7 +1154,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.6.4")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.6.5")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":

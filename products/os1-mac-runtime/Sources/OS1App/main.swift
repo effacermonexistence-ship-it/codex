@@ -39,6 +39,73 @@ private enum ProviderChoice: String, CaseIterable, Codable, Identifiable, Sendab
     }
 }
 
+private func explicitlyRequestedProvider(in request: String) -> ProviderChoice? {
+    let value = request
+        .lowercased()
+        .replacingOccurrences(of: "[\\p{P}\\p{S}]+", with: " ", options: .regularExpression)
+        .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+
+    // Voice dictation frequently turns 코덱스 into 코덱세/코덱센트/코덱선트.
+    // This recognizes only directed backend requests; merely discussing a
+    // provider keeps the private RCC auto route in control.
+    let codexPatterns = [
+        #"코덱(?:스|세|센트|선트)?\s*(?:(?:한테|에게|로|으로)(?:\s|\S){0,24}(?:시켜|시키|맡겨|보내|돌려|실행|해|하게|말|부탁)|(?:가|이)?\s*(?:뭐\s*)?(?:시켜|시키|맡겨|보내|돌려|실행|해|하게|말|부탁))"#,
+        #"(?:시켜|시키|맡겨|보내|돌려|실행|부탁)(?:\s|\S){0,18}코덱(?:스|세|센트|선트)?"#,
+        #"(?:use|ask|route|send|run|delegate)(?:\s+\w+){0,3}\s+codex\b"#,
+        #"\bcodex\b(?:\s+\w+){0,3}\s+(?:do|run|handle|execute)\b"#,
+    ]
+    let claudePatterns = [
+        #"클(?:로드|로더)\s*(?:코드)?\s*(?:(?:한테|에게|로|으로)(?:\s|\S){0,24}(?:시켜|시키|맡겨|보내|돌려|실행|해|하게|말|부탁)|(?:가|이)?\s*(?:뭐\s*)?(?:시켜|시키|맡겨|보내|돌려|실행|해|하게|말|부탁))"#,
+        #"(?:시켜|시키|맡겨|보내|돌려|실행|부탁)(?:\s|\S){0,18}클(?:로드|로더)(?:\s*코드)?"#,
+        #"(?:use|ask|route|send|run|delegate)(?:\s+\w+){0,3}\s+claude(?:\s+code)?\b"#,
+        #"\bclaude(?:\s+code)?\b(?:\s+\w+){0,3}\s+(?:do|run|handle|execute)\b"#,
+    ]
+    func lastMatch(in patterns: [String]) -> String.Index? {
+        patterns.compactMap { pattern in
+            value.range(of: pattern, options: .regularExpression)?.lowerBound
+        }.max()
+    }
+    let codex = lastMatch(in: codexPatterns)
+    let claude = lastMatch(in: claudePatterns)
+    switch (codex, claude) {
+    case (.some(let codexIndex), .some(let claudeIndex)):
+        return codexIndex > claudeIndex ? .codex : .claude
+    case (.some, .none): return .codex
+    case (.none, .some): return .claude
+    case (.none, .none): return nil
+    }
+}
+
+private func providerIntentSelfTest() throws {
+    let codexRequests = [
+        "코덱스한테 말시켜봐",
+        "코덱세한테 뭐 시켜봐",
+        "1 더하기 1 코덱선트 시켜라니까",
+        "코덱센트 시켜서 확인해",
+        "ask Codex to run the tests",
+        "use Codex for this task",
+    ]
+    let claudeRequests = [
+        "클로드한테 레드팀 시켜",
+        "이거 클로더 코드로 해",
+        "ask Claude Code to review this",
+        "use Claude for this task",
+    ]
+    let autoRequests = [
+        "코덱스 사용량과 클로드 사용량을 비교해줘",
+        "Codex and Claude are both backends",
+        "이 버그를 고치고 테스트해",
+    ]
+    let failures = codexRequests.filter { explicitlyRequestedProvider(in: $0) != .codex }
+        + claudeRequests.filter { explicitlyRequestedProvider(in: $0) != .claude }
+        + autoRequests.filter { explicitlyRequestedProvider(in: $0) != nil }
+        + (explicitlyRequestedProvider(in: "코덱스한테 시키지 말고 클로드한테 시켜") == .claude
+            ? [] : ["last directed provider"])
+    guard failures.isEmpty else {
+        throw RunnerError.message("OS-1 provider intent self-test failed: \(failures.joined(separator: " | "))")
+    }
+}
+
 private struct NativeSessionSummary: Identifiable, Sendable {
     let id: String
     let provider: ProviderChoice
@@ -664,6 +731,7 @@ private final class SessionStore: ObservableObject {
     @Published var nativeMessages: [NativeSessionMessage] = []
     @Published var isLoadingNativeSessions = false
     @Published var isRunning = false
+    @Published var pendingProvider: ProviderChoice?
     @Published var statusText = "Ready"
     @Published var alertMessage: String?
 
@@ -893,7 +961,10 @@ private final class SessionStore: ObservableObject {
         }
 
         let sessionID = sessions[index].id
-        let provider = sessions[index].provider
+        let configuredProvider = sessions[index].provider
+        let provider = configuredProvider == .auto
+            ? (explicitlyRequestedProvider(in: request) ?? .auto)
+            : configuredProvider
         let codexSessionID = sessions[index].codexSessionID
         let claudeSessionID = sessions[index].claudeSessionID
         let context = handoffContext(for: sessions[index], nextProvider: provider)
@@ -904,6 +975,7 @@ private final class SessionStore: ObservableObject {
         sessions[index].updatedAt = Date()
         composer = ""
         isRunning = true
+        pendingProvider = provider == .auto ? nil : provider
         statusText = provider == .auto
             ? "RCC is choosing the best engine…"
             : "\(provider.title) is working…"
@@ -922,6 +994,19 @@ private final class SessionStore: ObservableObject {
                     claudeCapacity: sessions[index].effectiveClaudeCapacity
                 )
                 guard let target = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+                if summary.status != "complete" {
+                    throw RunnerError.message("OS-1 did not return a completed governed run.")
+                }
+                if provider != .auto, summary.steps.isEmpty {
+                    throw RunnerError.message("OS-1 did not create or resume the requested \(provider.title) backend session.")
+                }
+                if provider != .auto,
+                   summary.steps.contains(where: { $0.provider != provider.rawValue }) {
+                    throw RunnerError.message("OS-1 rejected a backend mismatch. The request targeted \(provider.title), but a different backend answered.")
+                }
+                if summary.steps.contains(where: { UUID(uuidString: $0.sessionID) == nil }) {
+                    throw RunnerError.message("OS-1 rejected an invalid native backend session link.")
+                }
                 if summary.steps.isEmpty {
                     sessions[target].messages.append(ChatMessage(
                         role: .assistant,
@@ -965,6 +1050,7 @@ private final class SessionStore: ObservableObject {
                 statusText = "Needs attention"
             }
             isRunning = false
+            pendingProvider = nil
             save()
         }
     }
@@ -1055,7 +1141,21 @@ private enum Theme {
 
 @main
 private struct OS1DesktopApp: App {
-    @StateObject private var store = SessionStore()
+    @StateObject private var store: SessionStore
+
+    init() {
+        if CommandLine.arguments.contains("--self-test") {
+            do {
+                try providerIntentSelfTest()
+                print("OS-1 app provider intent and native dispatch self-test: OK")
+                exit(EXIT_SUCCESS)
+            } catch {
+                fputs("\(error.localizedDescription)\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+        }
+        _store = StateObject(wrappedValue: SessionStore())
+    }
 
     var body: some Scene {
         WindowGroup("OS-1 Claudex") {
@@ -1684,7 +1784,7 @@ private struct ConversationHeader: View {
     var body: some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("\((store.selectedSession?.lastProvider ?? "RCC").uppercased()) · \(store.selectedSession?.title ?? "OS-1 CLAUDEX")")
+                Text("\((store.pendingProvider?.rawValue ?? store.selectedSession?.lastProvider ?? "RCC").uppercased()) · \(store.selectedSession?.title ?? "OS-1 CLAUDEX")")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
