@@ -655,5 +655,6 @@ struct OS1Main {
 
 Task {
     await OS1Main.main()
+    exit(0)
 }
 dispatchMain()
