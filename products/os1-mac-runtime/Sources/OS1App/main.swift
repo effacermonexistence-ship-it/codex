@@ -386,18 +386,13 @@ private final class SessionStore: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func synchronizeBackend(_ provider: ProviderChoice) {
-        guard !isRunning, provider != .auto, let session = selectedSession else { return }
-        chooseProvider(provider)
+    func inspectBackend(_ provider: ProviderChoice) {
+        guard !isRunning, provider != .auto else { return }
         switch provider {
-        case .codex where session.codexSessionID != nil:
-            statusText = "Codex connected · next task resumes the synchronized session"
-        case .claude where session.claudeSessionID != nil:
-            statusText = "Claude Code connected · next task resumes the synchronized session"
         case .codex:
-            statusText = "Codex connected · next task creates the synchronized session"
+            openCodexSession()
         case .claude:
-            statusText = "Claude Code connected · next task creates the synchronized session"
+            openClaudeSession()
         case .auto:
             break
         }
@@ -762,13 +757,12 @@ private struct ProviderRail: View {
             ForEach([ProviderChoice.codex, ProviderChoice.claude]) { provider in
                 BackendStatus(
                     provider: provider,
-                    selected: store.selectedSession?.provider == provider,
                     active: store.selectedSession?.lastProvider == provider.rawValue,
                     linked: provider == .codex
                         ? store.selectedSession?.codexSessionID != nil
                         : store.selectedSession?.claudeSessionID != nil,
                     disabled: store.isRunning
-                ) { store.synchronizeBackend(provider) }
+                ) { store.inspectBackend(provider) }
             }
 
             Spacer()
@@ -795,7 +789,6 @@ private struct ProviderRail: View {
 
 private struct BackendStatus: View {
     let provider: ProviderChoice
-    let selected: Bool
     let active: Bool
     let linked: Bool
     let disabled: Bool
@@ -815,18 +808,18 @@ private struct BackendStatus: View {
                         .font(.system(size: 6, weight: .bold, design: .rounded))
                 }
             }
-            .foregroundStyle(selected || active ? provider.tint : Theme.muted)
+            .foregroundStyle(linked ? provider.tint : Theme.muted)
             .frame(width: 62, height: 66)
-            .background(selected ? provider.tint.opacity(0.16) : (active ? provider.tint.opacity(0.09) : Color.clear))
+            .background(linked ? provider.tint.opacity(active ? 0.14 : 0.07) : Color.clear)
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
-                    .stroke(selected ? provider.tint : Theme.border, lineWidth: selected ? 1.6 : 1)
+                    .stroke(linked ? provider.tint.opacity(active ? 1 : 0.45) : Theme.border, lineWidth: active ? 1.6 : 1)
             )
             .clipShape(RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
         .disabled(disabled)
-        .help(linked ? "Connect Claudex to the synchronized \(provider.title) session" : "Connect Claudex to \(provider.title) on the next task")
+        .help(linked ? "Open the synchronized \(provider.title) backend window" : "No synchronized \(provider.title) session yet")
         .accessibilityLabel(provider == .claude ? "Claude Code backend" : "Codex backend")
     }
 }
