@@ -33,8 +33,8 @@ private enum ProviderChoice: String, CaseIterable, Codable, Identifiable, Sendab
     var tint: Color {
         switch self {
         case .auto: return Color(red: 0.38, green: 0.86, blue: 0.58)
-        case .codex: return Color(red: 0.82, green: 0.51, blue: 0.94)
-        case .claude: return Color(red: 0.93, green: 0.49, blue: 0.34)
+        case .codex: return Color(red: 0.95, green: 0.64, blue: 0.80)
+        case .claude: return Color(red: 0.98, green: 0.53, blue: 0.68)
         }
     }
 }
@@ -1019,13 +1019,16 @@ private final class SessionStore: ObservableObject {
 }
 
 private enum Theme {
-    static let background = Color(red: 0.035, green: 0.035, blue: 0.045)
-    static let panel = Color(red: 0.055, green: 0.055, blue: 0.068)
-    static let panelRaised = Color(red: 0.075, green: 0.075, blue: 0.092)
-    static let border = Color.white.opacity(0.09)
-    static let muted = Color.white.opacity(0.48)
-    static let text = Color.white.opacity(0.93)
-    static let green = Color(red: 0.35, green: 0.92, blue: 0.55)
+    static let background = Color(red: 0.008, green: 0.008, blue: 0.011)
+    static let panel = Color(red: 0.015, green: 0.014, blue: 0.017)
+    static let panelRaised = Color(red: 0.035, green: 0.029, blue: 0.034)
+    static let border = Color.white.opacity(0.14)
+    static let borderStrong = Color.white.opacity(0.22)
+    static let muted = Color.white.opacity(0.47)
+    static let text = Color.white.opacity(0.95)
+    static let pink = Color(red: 0.93, green: 0.70, blue: 0.80)
+    static let pinkDeep = Color(red: 0.22, green: 0.10, blue: 0.16)
+    static let green = Color(red: 0.28, green: 0.93, blue: 0.55)
 }
 
 @main
@@ -1038,7 +1041,7 @@ private struct OS1DesktopApp: App {
                 .preferredColorScheme(.dark)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1240, height: 780)
+        .defaultSize(width: 1360, height: 760)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New session pair") { store.createSession() }
@@ -1052,18 +1055,24 @@ private struct RootView: View {
     @ObservedObject var store: SessionStore
 
     var body: some View {
-        HStack(spacing: 0) {
-            ProviderRail(store: store)
-            Divider().overlay(Theme.border)
-            if store.surface == .auto {
-                SessionSidebar(store: store)
-                Divider().overlay(Theme.border)
-                ConversationView(store: store)
-            } else {
-                NativeSessionBrowser(store: store, provider: store.surface)
+        ZStack {
+            CosmicBackdrop()
+            HStack(spacing: 0) {
+                ProviderRail(store: store)
+                Rectangle().fill(Theme.border).frame(width: 1)
+                if store.surface == .auto {
+                    SessionSidebar(store: store)
+                    Rectangle().fill(Theme.border).frame(width: 1)
+                    ConversationView(store: store)
+                } else {
+                    NativeSessionBrowser(store: store, provider: store.surface)
+                }
             }
+            .background(Theme.background.opacity(0.97))
+            .overlay(Rectangle().stroke(Theme.borderStrong, lineWidth: 1))
+            .padding(12)
         }
-        .frame(minWidth: 1_040, minHeight: 680)
+        .frame(minWidth: 1_100, minHeight: 680)
         .background(Theme.background)
         .alert("OS-1 Claudex", isPresented: Binding(
             get: { store.alertMessage != nil },
@@ -1076,28 +1085,63 @@ private struct RootView: View {
     }
 }
 
+private struct CosmicBackdrop: View {
+    var body: some View {
+        Canvas { context, size in
+            let width = max(size.width, 1)
+            let height = max(size.height, 1)
+            for index in 0..<82 {
+                let x = CGFloat((index * 83 + 17) % 997) / 997 * width
+                let y = CGFloat((index * 47 + 31) % 991) / 991 * height
+                let diameter = CGFloat(index % 4 == 0 ? 1.4 : 0.8)
+                let tint = index % 5 == 0 ? Theme.pink : Color.white
+                context.fill(
+                    Path(ellipseIn: CGRect(x: x, y: y, width: diameter, height: diameter)),
+                    with: .color(tint.opacity(index % 5 == 0 ? 0.16 : 0.10))
+                )
+            }
+            for index in stride(from: 0, to: 28, by: 4) {
+                var path = Path()
+                let start = CGPoint(
+                    x: CGFloat((index * 97 + 23) % 997) / 997 * width,
+                    y: CGFloat((index * 61 + 19) % 991) / 991 * height
+                )
+                let end = CGPoint(
+                    x: min(width, start.x + CGFloat(90 + index * 7)),
+                    y: min(height, start.y + CGFloat(42 + index * 3))
+                )
+                path.move(to: start)
+                path.addLine(to: end)
+                context.stroke(path, with: .color(Theme.pink.opacity(0.035)), lineWidth: 0.6)
+            }
+        }
+        .background(Color.black)
+        .allowsHitTesting(false)
+    }
+}
+
 private struct ProviderRail: View {
     @ObservedObject var store: SessionStore
 
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 22) {
             Button { store.showClaudexHome() } label: {
                 ZStack {
                     Circle()
                         .fill(AngularGradient(
-                            colors: [.pink, .purple, .orange, .pink],
+                            colors: [Theme.pink, .pink, .red, Theme.pink],
                             center: .center
                         ))
-                    Circle().fill(Theme.background).padding(7)
-                    Circle().fill(Color.white.opacity(0.9)).frame(width: 7, height: 7)
+                    Circle().fill(Theme.background).padding(8)
+                    Circle().fill(Color.white.opacity(0.94)).frame(width: 6, height: 6)
                 }
-                .frame(width: 38, height: 38)
+                .frame(width: 43, height: 43)
             }
             .buttonStyle(.plain)
             .disabled(store.isRunning)
             .help("Claudex home")
             .accessibilityLabel("Claudex home")
-            .padding(.bottom, 5)
+            .padding(.bottom, 8)
 
             ForEach([ProviderChoice.codex, ProviderChoice.claude]) { provider in
                 BackendStatus(
@@ -1113,23 +1157,19 @@ private struct ProviderRail: View {
 
             Spacer()
 
-            RailButton(
-                provider: .auto,
-                selected: store.selectedSession?.provider == .auto,
-                disabled: store.isRunning
-            ) { store.chooseProvider(.auto) }
-
-            VStack(spacing: 5) {
-                Circle().fill(Theme.green).frame(width: 7, height: 7)
-                    .shadow(color: Theme.green.opacity(0.7), radius: 5)
-                Text("RCC")
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
+            VStack(spacing: 6) {
+                Circle().fill(Theme.green).frame(width: 9, height: 9)
+                    .shadow(color: Theme.green.opacity(0.85), radius: 6)
+                Text("RCC\nGOVERNED")
+                    .font(.system(size: 7, weight: .bold, design: .rounded))
+                    .tracking(0.7)
+                    .multilineTextAlignment(.center)
                     .foregroundStyle(Theme.muted)
             }
         }
-        .padding(.vertical, 18)
-        .frame(width: 82)
-        .background(Color.black.opacity(0.2))
+        .padding(.vertical, 24)
+        .frame(width: 78)
+        .background(Color.black.opacity(0.74))
     }
 }
 
@@ -1143,26 +1183,31 @@ private struct BackendStatus: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 5) {
-                Image(systemName: provider.symbol).font(.system(size: 17, weight: .semibold))
-                Text(provider == .claude ? "CLAUDE CODE" : "CODEX")
+            VStack(spacing: 9) {
+                Image(systemName: provider.symbol)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(selected ? Color.black.opacity(0.82) : provider.tint)
+                    .frame(width: 27, height: 27)
+                    .background(selected ? provider.tint : provider.tint.opacity(0.16))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                Text(provider == .claude ? "CLAUDE" : "CODEX")
                     .font(.system(size: 7, weight: .bold, design: .rounded))
+                    .tracking(1.1)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.72)
+                    .minimumScaleFactor(0.8)
                 HStack(spacing: 3) {
                     Circle().fill(linked ? Theme.green : Theme.muted).frame(width: 4, height: 4)
                     Text(linked ? "SYNCED" : "CONNECT")
-                        .font(.system(size: 6, weight: .bold, design: .rounded))
+                        .font(.system(size: 5.5, weight: .bold, design: .rounded))
                 }
             }
-            .foregroundStyle(linked ? provider.tint : Theme.muted)
-            .frame(width: 62, height: 66)
-            .background(linked ? provider.tint.opacity(selected ? 0.18 : (active ? 0.14 : 0.07)) : Color.clear)
+            .foregroundStyle(linked ? (selected ? Theme.text : provider.tint) : Theme.muted)
+            .frame(width: 58, height: 80)
+            .background(linked ? provider.tint.opacity(selected ? 0.13 : (active ? 0.08 : 0.025)) : Color.black.opacity(0.25))
             .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(linked ? provider.tint.opacity(selected || active ? 1 : 0.45) : Theme.border, lineWidth: selected ? 1.8 : (active ? 1.6 : 1))
+                Rectangle()
+                    .stroke(linked ? provider.tint.opacity(selected || active ? 0.75 : 0.25) : Theme.border, lineWidth: selected ? 1.3 : 1)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
         .disabled(disabled)
@@ -1178,19 +1223,29 @@ private struct NativeSessionBrowser: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(provider == .claude ? "CLAUDE CODE" : "CODEX")
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                HStack(spacing: 8) {
+                    Text("OS-1").foregroundStyle(Theme.pink)
+                    Text("CLAUDEX").foregroundStyle(Theme.text)
+                }
+                .font(.system(size: 16, weight: .bold, design: .rounded))
+                .tracking(2.1)
+                .padding(.horizontal, 24)
+                .padding(.top, 34)
+                .padding(.bottom, 24)
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(provider == .claude ? "CLAUDE CODE SESSIONS" : "CODEX SESSIONS")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(1.2)
                         .foregroundStyle(provider.tint)
                     HStack(spacing: 6) {
                         Circle().fill(Theme.green).frame(width: 6, height: 6)
-                        Text("LOCAL BACKEND · \(store.nativeSessions.count) SESSIONS")
+                        Text("SYNCED · \(store.nativeSessions.count)")
                             .font(.system(size: 9, weight: .bold, design: .rounded))
                             .foregroundStyle(Theme.muted)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 23)
+                .padding(.horizontal, 24)
                 .padding(.bottom, 16)
 
                 HStack(spacing: 8) {
@@ -1204,13 +1259,12 @@ private struct NativeSessionBrowser: View {
                     .help("Refresh local sessions")
                     .accessibilityLabel("Refresh backend sessions")
                 }
-                .padding(.horizontal, 11)
-                .frame(height: 38)
-                .background(Color.black.opacity(0.16))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .padding(.horizontal, 12)
-                .padding(.bottom, 12)
+                .padding(.horizontal, 16)
+                .frame(height: 48)
+                .background(Color.black.opacity(0.24))
+                .overlay(Rectangle().stroke(Theme.borderStrong))
+                .padding(.horizontal, 20)
+                .padding(.bottom, 16)
 
                 if store.isLoadingNativeSessions && store.nativeSessions.isEmpty {
                     Spacer()
@@ -1237,15 +1291,15 @@ private struct NativeSessionBrowser: View {
                                 ) { store.selectNativeSession(session.id) }
                             }
                         }
-                        .padding(.horizontal, 9)
+                        .padding(.horizontal, 20)
                         .padding(.bottom, 12)
                     }
                 }
             }
-            .frame(width: 310)
-            .background(Theme.panel)
+            .frame(width: 315)
+            .background(Color.black.opacity(0.72))
 
-            Divider().overlay(Theme.border)
+            Rectangle().fill(Theme.border).frame(width: 1)
 
             NativeTranscriptView(store: store, provider: provider)
         }
@@ -1285,15 +1339,15 @@ private struct NativeSessionRow: View {
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(Theme.muted)
             }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 13)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(selected ? tint.opacity(0.15) : Color.clear)
+            .background(selected ? Theme.panelRaised : Color.clear)
             .overlay(
-                RoundedRectangle(cornerRadius: 9)
-                    .stroke(selected ? tint.opacity(0.8) : Theme.border, lineWidth: selected ? 1.4 : 1)
+                RoundedRectangle(cornerRadius: 11)
+                    .stroke(selected ? tint.opacity(0.42) : Color.clear, lineWidth: 1)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 9))
+            .clipShape(RoundedRectangle(cornerRadius: 11))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(session.displayTitle)
@@ -1306,39 +1360,29 @@ private struct NativeTranscriptView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(store.selectedNativeSession?.displayTitle ?? "Select a session")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundStyle(Theme.text)
-                        .lineLimit(1)
-                    HStack(spacing: 6) {
-                        Circle().fill(Theme.green).frame(width: 6, height: 6)
-                        Text(store.selectedNativeSession?.linkedTitle == nil
-                             ? "Native local session"
-                             : "Synchronized with OS-1 Claudex")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(Theme.muted)
-                    }
-                }
+            HStack(spacing: 12) {
+                Text("\(provider == .claude ? "CLAUDE CODE" : "CODEX") · \(store.selectedNativeSession?.displayTitle ?? "SELECT A SESSION")")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
                 Spacer()
                 if let session = store.selectedNativeSession, !session.workspace.isEmpty {
-                    Label(session.displayWorkspace, systemImage: "folder")
-                        .font(.system(size: 10, weight: .semibold))
+                    Text(session.displayWorkspace)
+                        .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(Theme.muted)
                         .lineLimit(1)
-                        .padding(.horizontal, 10)
-                        .frame(height: 34)
-                        .background(Theme.panelRaised)
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
+                Circle().fill(Theme.green).frame(width: 8, height: 8)
+                    .shadow(color: Theme.green.opacity(0.75), radius: 5)
+                Text("RCC governed")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.muted)
             }
-            .padding(.horizontal, 16)
-            .frame(height: 70)
-            .background(Theme.panel)
+            .padding(.horizontal, 24)
+            .frame(height: 66)
+            .background(Color.black.opacity(0.72))
 
-            Divider().overlay(Theme.border)
+            Rectangle().fill(Theme.border).frame(height: 1)
 
             if store.selectedNativeSession == nil {
                 Spacer()
@@ -1367,17 +1411,20 @@ private struct NativeTranscriptView: View {
                                     .padding(.top, 60)
                             }
                         }
-                        .padding(22)
+                        .padding(.horizontal, 40)
+                        .padding(.vertical, 30)
+                        .frame(maxWidth: 1_020)
+                        .frame(maxWidth: .infinity)
                     }
                     .onAppear { scrollToBottom(proxy) }
                     .onChange(of: store.nativeMessages.count) { _ in scrollToBottom(proxy) }
                 }
             }
 
-            Divider().overlay(Theme.border)
+            Rectangle().fill(Theme.border).frame(height: 1)
             HStack(spacing: 8) {
                 Image(systemName: "arrow.triangle.2.circlepath")
-                Text("Read-only synchronized backend view · use Claudex Home to route the next task")
+                Text("READ-ONLY SYNCHRONIZED BACKEND · USE CLAUDEX HOME TO ROUTE THE NEXT TASK")
                 Spacer()
                 Text(provider == .claude ? "CLAUDE CODE" : "CODEX")
                     .foregroundStyle(provider.tint)
@@ -1385,8 +1432,8 @@ private struct NativeTranscriptView: View {
             .font(.system(size: 9, weight: .semibold, design: .rounded))
             .foregroundStyle(Theme.muted)
             .padding(.horizontal, 14)
-            .frame(height: 34)
-            .background(Theme.panel)
+            .frame(height: 38)
+            .background(Color.black.opacity(0.72))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.background)
@@ -1422,13 +1469,12 @@ private struct NativeMessageCard: View {
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(14)
-            .background(message.role == .user ? Theme.panelRaised : provider.tint.opacity(0.06))
+            .padding(16)
+            .background(message.role == .user ? Color.black.opacity(0.5) : provider.tint.opacity(0.025))
             .overlay(
-                RoundedRectangle(cornerRadius: 11)
-                    .stroke(message.role == .user ? Theme.border : provider.tint.opacity(0.25))
+                Rectangle()
+                    .stroke(message.role == .user ? Theme.borderStrong : provider.tint.opacity(0.18))
             )
-            .clipShape(RoundedRectangle(cornerRadius: 11))
             if message.role != .user { Spacer(minLength: 60) }
         }
     }
@@ -1468,48 +1514,44 @@ private struct SessionSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
                 Text("OS-1")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .tracking(2.4)
-                    .foregroundStyle(Theme.muted)
+                    .foregroundStyle(Theme.pink)
                 Text("CLAUDEX")
-                    .font(.system(size: 19, weight: .bold, design: .rounded))
-                    .tracking(1.6)
                     .foregroundStyle(Theme.text)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 23)
-            .padding(.bottom, 18)
+            .font(.system(size: 16, weight: .bold, design: .rounded))
+            .tracking(2.1)
+            .padding(.horizontal, 24)
+            .padding(.top, 34)
+            .padding(.bottom, 24)
 
             Button { store.createSession() } label: {
-                Label("New session pair", systemImage: "square.and.pencil")
-                    .font(.system(size: 13, weight: .semibold))
+                Label("New governed task", systemImage: "pencil")
+                    .font(.system(size: 14, weight: .semibold))
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .frame(height: 44)
-                    .background(Theme.panelRaised)
-                    .overlay(RoundedRectangle(cornerRadius: 9).stroke(Theme.border))
-                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                    .padding(.horizontal, 16)
+                    .frame(height: 54)
+                    .background(Color.black.opacity(0.24))
+                    .overlay(Rectangle().stroke(Theme.borderStrong))
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 20)
 
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(Theme.muted)
                 TextField("Search sessions", text: $store.search)
                     .textFieldStyle(.plain)
             }
-            .padding(.horizontal, 12)
-            .frame(height: 38)
-            .background(Color.black.opacity(0.16))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .padding(.horizontal, 14)
-            .padding(.top, 10)
+            .padding(.horizontal, 16)
+            .frame(height: 48)
+            .background(Color.black.opacity(0.24))
+            .overlay(Rectangle().stroke(Theme.borderStrong))
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
 
             HStack {
-                Text("SESSION PAIRS")
+                Text("SYNCED SESSIONS")
                     .font(.system(size: 10, weight: .bold, design: .rounded))
                     .tracking(1.2)
                     .foregroundStyle(Theme.muted)
@@ -1518,9 +1560,9 @@ private struct SessionSidebar: View {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(Theme.muted)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 20)
-            .padding(.bottom, 8)
+            .padding(.horizontal, 25)
+            .padding(.top, 24)
+            .padding(.bottom, 12)
 
             ScrollView {
                 LazyVStack(spacing: 4) {
@@ -1531,26 +1573,13 @@ private struct SessionSidebar: View {
                         ) { store.select(session.id) }
                     }
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 20)
             }
 
             Spacer(minLength: 0)
-
-            HStack(spacing: 8) {
-                Circle().fill(Theme.green).frame(width: 7, height: 7)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Governance active")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Theme.text)
-                    Text("Real native sessions")
-                        .font(.system(size: 10))
-                        .foregroundStyle(Theme.muted)
-                }
-            }
-            .padding(16)
         }
-        .frame(width: 270)
-        .background(Theme.panel)
+        .frame(width: 315)
+        .background(Color.black.opacity(0.72))
     }
 }
 
@@ -1561,34 +1590,31 @@ private struct SessionRow: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 7) {
-                    Circle().fill(session.provider.tint).frame(width: 6, height: 6)
                     Text(session.title)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(Theme.text)
                         .lineLimit(1)
                     Spacer(minLength: 0)
                 }
                 HStack(spacing: 6) {
                     Text(URL(fileURLWithPath: session.workspace).lastPathComponent)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: 11))
                         .foregroundStyle(Theme.muted)
                         .lineLimit(1)
                     Spacer(minLength: 0)
-                    NativeBadge(label: "C", linked: session.codexSessionID != nil, tint: ProviderChoice.codex.tint)
-                    NativeBadge(label: "A", linked: session.claudeSessionID != nil, tint: ProviderChoice.claude.tint)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 11)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 13)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(selected ? Color.white.opacity(0.07) : Color.clear)
+            .background(selected ? Theme.panelRaised : Color.clear)
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(selected ? Theme.border : Color.clear)
+                RoundedRectangle(cornerRadius: 11)
+                    .stroke(selected ? Theme.border.opacity(0.45) : Color.clear)
             )
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .clipShape(RoundedRectangle(cornerRadius: 11))
         }
         .buttonStyle(.plain)
     }
@@ -1616,7 +1642,7 @@ private struct ConversationView: View {
     var body: some View {
         VStack(spacing: 0) {
             ConversationHeader(store: store)
-            Divider().overlay(Theme.border)
+            Rectangle().fill(Theme.border).frame(height: 1)
             if let session = store.selectedSession {
                 if session.messages.isEmpty {
                     WelcomeView(store: store, session: session)
@@ -1636,7 +1662,7 @@ private struct ConversationHeader: View {
     var body: some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(store.selectedSession?.title ?? "OS-1 Claudex")
+                Text("\((store.selectedSession?.lastProvider ?? "RCC").uppercased()) · \(store.selectedSession?.title ?? "OS-1 CLAUDEX")")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
@@ -1651,6 +1677,12 @@ private struct ConversationHeader: View {
             Spacer()
 
             if let session = store.selectedSession {
+                Circle().fill(Theme.green).frame(width: 8, height: 8)
+                    .shadow(color: Theme.green.opacity(0.75), radius: 5)
+                Text("RCC governed")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.muted)
+
                 Menu {
                     Button("Auto routing") { store.chooseProvider(.auto) }
                     Divider()
@@ -1683,9 +1715,8 @@ private struct ConversationHeader: View {
                     .foregroundStyle(Theme.green)
                     .padding(.horizontal, 10)
                     .frame(height: 35)
-                    .background(Theme.green.opacity(0.08))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.green.opacity(0.3)))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .background(Color.black.opacity(0.3))
+                    .overlay(Rectangle().stroke(Theme.border))
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
@@ -1701,18 +1732,17 @@ private struct ConversationHeader: View {
                     .foregroundStyle(Theme.text)
                     .padding(.horizontal, 11)
                     .frame(height: 35)
-                    .background(Theme.panelRaised)
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .background(Color.black.opacity(0.3))
+                    .overlay(Rectangle().stroke(Theme.border))
                 }
                 .buttonStyle(.plain)
                 .disabled(store.isRunning)
                 .help(session.workspace)
             }
         }
-        .padding(.horizontal, 18)
-        .frame(height: 64)
-        .background(Theme.panel.opacity(0.8))
+        .padding(.horizontal, 24)
+        .frame(height: 66)
+        .background(Color.black.opacity(0.72))
     }
 }
 
@@ -1730,11 +1760,22 @@ private struct WelcomeView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 Spacer(minLength: 34)
-                Text("What are we building?")
-                    .font(.system(size: 34, weight: .semibold, design: .rounded))
+                HStack(spacing: 12) {
+                    Image(systemName: "diamond")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Theme.pink)
+                        .frame(width: 34, height: 34)
+                        .background(Theme.pinkDeep)
+                        .clipShape(Circle())
+                    Text("Routing, model execution, token control, and receipts stay on one governed path.")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.muted)
+                }
+                Text("Start a governed task.")
+                    .font(.system(size: 30, weight: .semibold, design: .rounded))
                     .foregroundStyle(Theme.text)
-                Text("Pick a project once. OS-1 treats Codex and Claude Code as managed backends, then selects the backend, model tier, and reasoning effort from task fit and weekly capacity.")
-                    .font(.system(size: 15))
+                Text("Choose the project once. RCC routes each turn to Codex or Claude Code with the model tier, reasoning effort, token budget, and workspace authority kept on the same governed path.")
+                    .font(.system(size: 14))
                     .foregroundStyle(Color.white.opacity(0.62))
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -1761,10 +1802,9 @@ private struct WelcomeView: View {
                                     .foregroundStyle(Theme.muted)
                             }
                             .padding(.horizontal, 14)
-                            .frame(height: 42)
-                            .background(Theme.panelRaised)
-                            .overlay(RoundedRectangle(cornerRadius: 9).stroke(Theme.border))
-                            .clipShape(RoundedRectangle(cornerRadius: 9))
+                            .frame(height: 46)
+                            .background(Color.black.opacity(0.3))
+                            .overlay(Rectangle().stroke(Theme.border))
                         }
                         .buttonStyle(.plain)
                     }
@@ -1798,9 +1838,8 @@ private struct WelcomeStep: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 108, alignment: .topLeading)
-        .background(Theme.panel)
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.border))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .background(Color.black.opacity(0.3))
+        .overlay(Rectangle().stroke(Theme.border))
     }
 }
 
@@ -1827,9 +1866,9 @@ private struct MessageTimeline: View {
                         .id("running")
                     }
                 }
-                .padding(.horizontal, 34)
-                .padding(.vertical, 28)
-                .frame(maxWidth: 900)
+                .padding(.horizontal, 40)
+                .padding(.vertical, 34)
+                .frame(maxWidth: 1_020)
                 .frame(maxWidth: .infinity)
             }
             .onAppear {
@@ -1853,13 +1892,13 @@ private struct MessageView: View {
             HStack {
                 Spacer(minLength: 100)
                 Text(message.text)
-                    .font(.system(size: 13))
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .textSelection(.enabled)
-                    .padding(.horizontal, 15)
-                    .padding(.vertical, 12)
-                    .background(Color.white.opacity(0.09))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 16)
+                    .background(Color.black.opacity(0.28))
+                    .overlay(Rectangle().stroke(Theme.borderStrong))
             }
         case .assistant:
             VStack(alignment: .leading, spacing: 9) {
@@ -1885,29 +1924,37 @@ private struct MessageView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         case .receipt:
-            HStack(spacing: 9) {
-                Image(systemName: "checkmark.shield.fill").foregroundStyle(Theme.green)
-                Text("RCC GOVERNANCE RECEIPT")
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
-                    .tracking(1.1)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("RCC GOVERNANCE RECEIPT")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(1.3)
+                        .foregroundStyle(Theme.pink)
+                    Spacer()
+                    Text("VERIFIED")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .tracking(1.1)
+                        .foregroundStyle(Theme.green)
+                }
                 Text(message.text)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(Theme.muted)
-                Spacer()
-                Text("VERIFIED")
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
-                    .foregroundStyle(Theme.green)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.horizontal, 12)
-            .frame(height: 39)
-            .background(Theme.panel)
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.border))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .padding(16)
+            .frame(maxWidth: .infinity, minHeight: 70, alignment: .leading)
+            .background(Color.black.opacity(0.36))
+            .overlay(Rectangle().stroke(Theme.borderStrong))
         case .system:
             HStack(spacing: 8) {
-                Image(systemName: "info.circle")
+                Image(systemName: "diamond")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(Theme.pink)
+                    .frame(width: 30, height: 30)
+                    .background(Theme.pinkDeep)
+                    .clipShape(Circle())
                 Text(message.text)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12, weight: .medium))
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
             }
@@ -1923,21 +1970,21 @@ private struct ComposerView: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 10) {
             HStack(alignment: .bottom, spacing: 12) {
                 TextEditor(text: $store.composer)
-                    .font(.system(size: 13))
+                    .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .scrollContentBackground(.hidden)
                     .focused($focused)
-                    .frame(minHeight: 54, maxHeight: 120)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
+                    .frame(minHeight: 70, maxHeight: 130)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
                     .disabled(store.isRunning)
                     .overlay(alignment: .topLeading) {
                         if store.composer.isEmpty {
-                            Text("Tell OS-1 what outcome you want…")
-                                .font(.system(size: 13))
+                            Text("Route a governed task through OS-1…")
+                                .font(.system(size: 14, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.3))
                                 .padding(.horizontal, 13)
                                 .padding(.vertical, 14)
@@ -1949,18 +1996,17 @@ private struct ComposerView: View {
                     Image(systemName: store.isRunning ? "hourglass" : "arrow.up")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(Color.black.opacity(0.86))
-                        .frame(width: 38, height: 38)
-                        .background(session.provider.tint)
+                        .frame(width: 44, height: 44)
+                        .background(Theme.pink)
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .disabled(store.isRunning || store.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .keyboardShortcut(.return, modifiers: [.command])
             }
-            .padding(10)
-            .background(Theme.panelRaised)
-            .overlay(RoundedRectangle(cornerRadius: 13).stroke(Theme.border))
-            .clipShape(RoundedRectangle(cornerRadius: 13))
+            .padding(12)
+            .background(Color.black.opacity(0.5))
+            .overlay(Rectangle().stroke(Theme.borderStrong))
 
             HStack {
                 Label(URL(fileURLWithPath: session.workspace).lastPathComponent, systemImage: "folder")
@@ -1975,12 +2021,12 @@ private struct ComposerView: View {
                 Spacer()
                 Text("⌘↩ send")
             }
-            .font(.system(size: 10, weight: .medium))
+            .font(.system(size: 9, weight: .medium, design: .rounded))
             .foregroundStyle(Theme.muted)
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 10)
-        .padding(.bottom, 16)
+        .padding(.horizontal, 38)
+        .padding(.top, 12)
+        .padding(.bottom, 18)
         .background(Theme.background)
     }
 }
