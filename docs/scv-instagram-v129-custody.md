@@ -53,32 +53,47 @@ quarantine is preserved durable evidence and is not a critical release drift.
 
 - Private catalog pointer:
   `scv-instagram-automation/timestamped-snapshots/LATEST.json`
-- Catalog control version: `20260901T041232Z`
-- Snapshot count: `14`
+- Catalog control version: `20260901T061502Z`
+- Snapshot count: `16`
 - April golden snapshot:
   `scv-instagram-20260420T152810-local-origin`
 - Previous current v128 snapshot, retained as history:
   `scv-instagram-20260901T031348Z-v128-post-date-change-fix-current`
-- Current v129 snapshot:
+- v129 snapshot before the explicit Omar.system reset, retained as history:
   `scv-instagram-20260901T040911Z-v129-human-word-choice-current`
+- Paused v129 state immediately before the Omar.system reset:
+  `scv-instagram-20260901T061104Z-v129-pre-omar-reset`
+- Current paused v129 state immediately after the Omar.system reset:
+  `scv-instagram-20260901T061107Z-v129-post-omar-reset-current`
 - Catalog SHA-256:
-  `b8c1a42e03c7fb1f21bb6aa41bd90facdbdb21092a4a2329a2ac678438dfe504`
+  `8c868399b47ace1744083e2004104d0ed51e3b19c39324d4644d700fe850d890`
 - Catalog seal SHA-256:
-  `48f20b24802201400a5108ee9e9d278f6e567511079d47504b6afdfb411e7201`
-- Current production-state archive SHA-256:
-  `8f05309cdf0e6aef52bfc4f9a6876dd848af80aeb91e3d407fd186a50936f207`
+  `e7f3ceced05a8595bec384f01f0b6177cbfdce78f21a2e2ccbe954ce9e182e2a`
+- Pre-reset production-state archive SHA-256:
+  `16e4cbc338c6c2f3b4cea1a663526df98ef5cb795eb19b480258df4add9ee0db`
+- Current post-reset production-state archive SHA-256:
+  `cbecefbdfc5838edb41935aafe7c0c337aea129b521ed0be4604e682f5a80fa1`
+- Exact-scope reset receipt SHA-256:
+  `eebb15794de2e73645a825eb52ddcebd96dd89e8af875ed47ce115e34eaa706a`
 
-The golden pointer was not moved or overlaid. The v129 runtime and production
-state were restored into a newly created staging directory, hash-checked, and
-retested. The receipt records `production_mutated: false`. The catalog requires
-an exact snapshot ID and does not implement automatic production cutover. All
-new control objects were downloaded from R2 and verified before `LATEST.json`
-was published last.
+The golden pointer was not moved or overlaid. The reset suspended all ten v129
+runtime workers and verified their stopped state before capturing the full
+production namespace. The code-locked target was the canonical debug identity
+pair only. Its audit changed from 21 matching files to zero; customer scope was
+not allowed. All ten workers were then resumed.
+
+The pre-reset and post-reset v129 runtime/state pairs were each selected by
+their exact snapshot ID, downloaded from R2, restored into different new
+staging directories, and hash-checked. The pre-reset restore reproduced 21
+debug-account matches and the post-reset restore reproduced zero. Both restore
+receipts record `production_mutated: false`. The catalog does not implement
+automatic production cutover. All new control objects were downloaded from R2
+and verified before `LATEST.json` was published last.
 
 ## Independent drift sentinel
 
 - Worker: `scv-instagram-drift-sentinel`
-- Worker version: `1e1f82a8-c2eb-45da-a738-d1866ffa20bc`
+- Worker version: `23303742-086c-4d79-a182-32351775efd2`
 - Schedule: every five minutes
 - Safe health endpoint:
   `https://scv-instagram-drift-sentinel.omar-git-r2-backup.workers.dev/health`
