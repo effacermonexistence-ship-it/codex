@@ -24,7 +24,13 @@ export type TicketUnsigned = {
 
 export type Ticket = TicketUnsigned & { signature: string };
 export type CompleteResponse = { status: "complete" };
-export type PublicResponse = Ticket | CompleteResponse;
+export type RegisteredResponse = { status: "registered" };
+export type ArtifactResponse = { artifact_ref: string };
+export type PublicResponse =
+  | Ticket
+  | CompleteResponse
+  | RegisteredResponse
+  | ArtifactResponse;
 
 export type AuthIdentity = {
   subject: string;
@@ -58,6 +64,21 @@ export type ResultRequest = {
   device_signature: string;
 };
 
+export type DeviceRegistration = {
+  device_id: string;
+  registered_at: number;
+  nonce: string;
+  p256_public_jwk: JsonWebKey;
+  signature: string;
+};
+
+export type ArtifactUploadRequest = {
+  ticket: Ticket;
+  artifact_base64: string;
+  result_hash: string;
+  device_signature: string;
+};
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -72,6 +93,11 @@ function isArtifactRef(value: unknown): value is string {
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function parseDeviceId(value: unknown): string {
+  if (!boundedString(value, 8, 128, DEVICE_ID)) reject();
+  return value;
 }
 
 function hasExactKeys(
@@ -206,6 +232,56 @@ function parseP256Jwk(value: unknown): JsonWebKey {
   return { kty: "EC", crv: "P-256", x: value.x, y: value.y };
 }
 
+export function parseDeviceRegistration(value: unknown): DeviceRegistration {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "device_id",
+      "registered_at",
+      "nonce",
+      "p256_public_jwk",
+      "signature",
+    ]) ||
+    !Number.isSafeInteger(value.registered_at) ||
+    !boundedString(value.nonce, 32, 128, BASE64URL) ||
+    !boundedString(value.signature, 64, 256, BASE64URL)
+  ) {
+    reject();
+  }
+  return {
+    device_id: parseDeviceId(value.device_id),
+    registered_at: value.registered_at as number,
+    nonce: value.nonce,
+    p256_public_jwk: parseP256Jwk(value.p256_public_jwk),
+    signature: value.signature,
+  };
+}
+
+export function parseArtifactUploadRequest(
+  value: unknown,
+): ArtifactUploadRequest {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "ticket",
+      "artifact_base64",
+      "result_hash",
+      "device_signature",
+    ]) ||
+    !boundedString(value.artifact_base64, 4, 1_500_000, BASE64URL) ||
+    !boundedString(value.result_hash, 64, 64, SHA256) ||
+    !boundedString(value.device_signature, 64, 256, BASE64URL)
+  ) {
+    reject();
+  }
+  return {
+    ticket: parseTicket(value.ticket),
+    artifact_base64: value.artifact_base64,
+    result_hash: value.result_hash,
+    device_signature: value.device_signature,
+  };
+}
+
 export function parseDeviceRecord(value: unknown): DeviceRecord {
   if (
     !isRecord(value) ||
@@ -272,5 +348,26 @@ export function parsePublicResponse(value: unknown): PublicResponse {
     if (!hasExactKeys(value, ["status"])) reject();
     return { status: "complete" };
   }
+  if (isRecord(value) && value.status === "registered") {
+    if (!hasExactKeys(value, ["status"])) reject();
+    return { status: "registered" };
+  }
+  if (
+    isRecord(value) &&
+    hasExactKeys(value, ["artifact_ref"]) &&
+    isArtifactRef(value.artifact_ref)
+  ) {
+    return { artifact_ref: value.artifact_ref };
+  }
   return parseTicket(value);
+}
+
+export function resultArtifactRef(ticket: Ticket, resultHash: string): string {
+  if (!SHA256.test(resultHash)) reject();
+  return `r2://os1-private-results/${ticket.execution_id}/${ticket.sequence}/${resultHash}.json`;
+}
+
+export function resultArtifactKey(artifactRef: string): string {
+  if (!isArtifactRef(artifactRef)) reject();
+  return artifactRef.slice("r2://os1-private-results/".length);
 }

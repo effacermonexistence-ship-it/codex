@@ -10,6 +10,10 @@
     { "binding": "PRIVATE_ROUTE_CORE", "service": "os1-private-route-core" },
     { "binding": "RESULT_EVALUATOR", "service": "os1-result-evaluator" }
   ],
+  "r2_buckets": [
+    { "binding": "RESULTS", "bucket_name": "os1-private-results" },
+    { "binding": "RELEASES", "bucket_name": "os1-public-releases" }
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "EXECUTIONS", "class_name": "ExecutionState" }
@@ -20,8 +24,10 @@
   ],
   "vars": {
     "MAX_REQUEST_BYTES": "65536",
+    "MAX_ARTIFACT_REQUEST_BYTES": "1500000",
+    "MAX_ARTIFACT_BYTES": "1048576",
     "SERVICE_RESPONSE_BYTES": "32768",
-    "TICKET_TTL_SECONDS": "90"
+    "TICKET_TTL_SECONDS": "3600"
   },
   "observability": {
     "enabled": true,

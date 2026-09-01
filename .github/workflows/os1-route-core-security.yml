@@ -5,6 +5,11 @@ on:
     paths:
       - ".github/workflows/os1-route-core-security.yml"
       - "products/os1-route-core/**"
+      - "products/os1-auth-service/**"
+      - "products/os1-device-registry/**"
+      - "products/os1-private-route-core/**"
+      - "products/os1-result-evaluator/**"
+      - "products/os1-mac-runtime/**"
       - "docs/os1-route-core-security-handoff.md"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -12,6 +17,11 @@ on:
     paths:
       - ".github/workflows/os1-route-core-security.yml"
       - "products/os1-route-core/**"
+      - "products/os1-auth-service/**"
+      - "products/os1-device-registry/**"
+      - "products/os1-private-route-core/**"
+      - "products/os1-result-evaluator/**"
+      - "products/os1-mac-runtime/**"
       - "docs/os1-route-core-security-handoff.md"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
@@ -22,9 +32,18 @@ permissions:
 
 jobs:
   validate:
-    name: Type, test, and bundle security boundary
+    name: Validate ${{ matrix.worker }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        worker:
+          - os1-route-core
+          - os1-auth-service
+          - os1-device-registry
+          - os1-private-route-core
+          - os1-result-evaluator
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,13 +66,47 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Generate Cloudflare binding types
-        run: pnpm --dir products/os1-route-core types
+        run: pnpm --dir "products/${{ matrix.worker }}" types
 
       - name: Type-check Worker boundary
-        run: pnpm --dir products/os1-route-core check
+        run: pnpm --dir "products/${{ matrix.worker }}" check
 
       - name: Run adversarial contract tests
+        if: matrix.worker == 'os1-route-core'
         run: pnpm --dir products/os1-route-core test
 
       - name: Build Cloudflare dry-run bundle
-        run: pnpm --dir products/os1-route-core deploy:dry-run
+        run: pnpm --dir "products/${{ matrix.worker }}" deploy:dry-run
+
+  mac-runtime:
+    name: Build and scan universal Mac release
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.20.0"
+
+      - name: Enable pinned pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.19.0 --activate
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate release shell entrypoints
+        run: |
+          bash -n products/os1-mac-runtime/scripts/build-release.sh
+          bash -n products/os1-mac-runtime/scripts/install-os1.sh
+
+      - name: Build, sign, package, and scan universal release
+        run: products/os1-mac-runtime/scripts/build-release.sh

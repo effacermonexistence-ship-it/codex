@@ -22,10 +22,13 @@ services are rejected rather than silently removed.
 | `PRIVATE_ROUTE_CORE` | `{ status: "complete" }` or the minimal step decision |
 | `RESULT_EVALUATOR` | `{ outcome, verified_artifact_hash }` |
 
-The private route and result evaluator Workers are intentionally absent from
-this public package. The evaluator must fetch the artifact from private storage
-and independently verify its hash and outcome. A client-provided success/fail
-claim is never accepted as a routing input.
+The private route core, device registry, authentication service, and result
+evaluator are separate internal Workers. The protected policy is stored only in
+a Cloudflare secret; it is not present in the public repository, gateway
+bundle, Mac application, package, or result artifact. The evaluator fetches the
+artifact from private R2 storage and independently verifies its hash and
+outcome. A client-provided success/fail claim is never accepted as a routing
+input.
 
 ## Local verification
 
@@ -41,7 +44,9 @@ Real keys and protected canary fragments belong in Cloudflare secrets. Copy
 `.dev.vars.example` to an ignored `.dev.vars` only for local development; never
 commit it.
 
-The current release posture is **UNVERIFIED** because there is no Mac Runtime
-release candidate or deployed private route/evaluator implementation to run the
-T1/T4/T5/T7 acceptance tests against. See
+The deployed functional release candidate includes a universal Mac Runtime,
+Secure Enclave device signing, private services, R2 artifact storage, a public
+SHA-256-pinned package, and deployed red-team smoke tests. Developer ID package
+signing and Apple notarization remain release-distribution work; the shell
+installer is currently the supported installation path. See
 [`docs/os1-route-core-security-handoff.md`](../../docs/os1-route-core-security-handoff.md).

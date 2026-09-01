@@ -43,6 +43,70 @@ function printableStrings(bytes) {
   return output;
 }
 
+function fixedString(bytes, offset, length) {
+  const end = bytes.indexOf(0, offset);
+  return bytes.subarray(offset, end === -1 || end > offset + length ? offset + length : end).toString("ascii");
+}
+
+function thinMachOCStrings(bytes) {
+  if (bytes.length < 32 || bytes.readUInt32LE(0) !== 0xfeedfacf) return null;
+  const commandCount = bytes.readUInt32LE(16);
+  let cursor = 32;
+  const regions = [];
+  for (let index = 0; index < commandCount; index += 1) {
+    if (cursor + 8 > bytes.length) throw new Error("invalid Mach-O load commands");
+    const command = bytes.readUInt32LE(cursor);
+    const commandSize = bytes.readUInt32LE(cursor + 4);
+    if (commandSize < 8 || cursor + commandSize > bytes.length) {
+      throw new Error("invalid Mach-O load command size");
+    }
+    if (command === 0x19) {
+      if (commandSize < 72) throw new Error("invalid Mach-O segment");
+      const sectionCount = bytes.readUInt32LE(cursor + 64);
+      let sectionCursor = cursor + 72;
+      for (let sectionIndex = 0; sectionIndex < sectionCount; sectionIndex += 1) {
+        if (sectionCursor + 80 > cursor + commandSize) throw new Error("invalid Mach-O section");
+        if (fixedString(bytes, sectionCursor, 16) === "__cstring") {
+          const size = Number(bytes.readBigUInt64LE(sectionCursor + 40));
+          const offset = bytes.readUInt32LE(sectionCursor + 48);
+          if (!Number.isSafeInteger(size) || offset + size > bytes.length) {
+            throw new Error("invalid Mach-O cstring range");
+          }
+          regions.push(bytes.subarray(offset, offset + size));
+        }
+        sectionCursor += 80;
+      }
+    }
+    cursor += commandSize;
+  }
+  return regions;
+}
+
+function entropyRegions(bytes) {
+  const thin = thinMachOCStrings(bytes);
+  if (thin !== null) return thin;
+  if (bytes.length >= 8 && [0xcafebabe, 0xcafebabf].includes(bytes.readUInt32BE(0))) {
+    const is64 = bytes.readUInt32BE(0) === 0xcafebabf;
+    const count = bytes.readUInt32BE(4);
+    const entrySize = is64 ? 32 : 20;
+    const regions = [];
+    for (let index = 0; index < count; index += 1) {
+      const cursor = 8 + index * entrySize;
+      if (cursor + entrySize > bytes.length) throw new Error("invalid fat Mach-O table");
+      const offset = is64 ? Number(bytes.readBigUInt64BE(cursor + 8)) : bytes.readUInt32BE(cursor + 8);
+      const size = is64 ? Number(bytes.readBigUInt64BE(cursor + 16)) : bytes.readUInt32BE(cursor + 12);
+      if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset + size > bytes.length) {
+        throw new Error("invalid fat Mach-O range");
+      }
+      const nested = thinMachOCStrings(bytes.subarray(offset, offset + size));
+      if (nested === null) throw new Error("invalid fat Mach-O architecture");
+      regions.push(...nested);
+    }
+    return regions;
+  }
+  return [bytes];
+}
+
 async function collectFiles(target, root = target) {
   const metadata = await lstat(target);
   if (metadata.isSymbolicLink()) {
@@ -110,6 +174,12 @@ export async function scanClientArtifacts(targets, policy) {
           });
         }
       }
+    }
+    const scanEntropy = !lowerPath.endsWith("_codesignature/coderesources");
+    const entropyItems = scanEntropy
+      ? entropyRegions(bytes).flatMap((region) => printableStrings(region))
+      : [];
+    for (const item of entropyItems) {
       const candidates = item.value.match(/[A-Za-z0-9_+/=-]{48,}/gu) ?? [];
       for (const candidate of candidates) {
         const fingerprint = sha256(candidate);

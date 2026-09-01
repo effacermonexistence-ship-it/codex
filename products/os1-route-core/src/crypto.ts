@@ -1,4 +1,9 @@
-import type { ResultRequest, Ticket, TicketUnsigned } from "./contracts";
+import type {
+  DeviceRegistration,
+  ResultRequest,
+  Ticket,
+  TicketUnsigned,
+} from "./contracts";
 
 const encoder = new TextEncoder();
 
@@ -11,10 +16,27 @@ function base64UrlEncode(bytes: Uint8Array): string {
     .replace(/=+$/u, "");
 }
 
-function base64UrlDecode(value: string): Uint8Array {
+export function base64UrlDecode(value: string): Uint8Array {
   const padded = value.replaceAll("-", "+").replaceAll("_", "/") + "===".slice((value.length + 3) % 4);
   const binary = atob(padded);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+export function canonicalRegistration(
+  registration: Omit<DeviceRegistration, "signature">,
+): Uint8Array {
+  return encoder.encode(
+    [
+      "os1-device-register-v1",
+      registration.device_id,
+      String(registration.registered_at),
+      registration.nonce,
+      registration.p256_public_jwk.kty ?? "",
+      registration.p256_public_jwk.crv ?? "",
+      registration.p256_public_jwk.x ?? "",
+      registration.p256_public_jwk.y ?? "",
+    ].join("\n"),
+  );
 }
 
 function pemBytes(pem: string, label: string): Uint8Array {
@@ -112,6 +134,25 @@ export async function verifyDeviceResult(
   );
 }
 
+export async function verifyDeviceRegistration(
+  registration: DeviceRegistration,
+): Promise<boolean> {
+  const { signature, ...unsigned } = registration;
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    registration.p256_public_jwk,
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["verify"],
+  );
+  return crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    base64UrlDecode(signature),
+    canonicalRegistration(unsigned),
+  );
+}
+
 export function randomNonce(): string {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
@@ -120,6 +161,13 @@ export function randomNonce(): string {
 
 export async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", encoder.encode(value));
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export async function sha256HexBytes(value: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", value);
   return [...new Uint8Array(digest)]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");

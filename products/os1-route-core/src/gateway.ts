@@ -1,11 +1,16 @@
 import {
   parseAuthIdentity,
+  parseArtifactUploadRequest,
+  parseDeviceId,
+  parseDeviceRegistration,
   parseDeviceRecord,
   parseEvaluatedResult,
   parsePrivateDecision,
   parsePublicResponse,
   parseResultRequest,
   parseStartRequest,
+  resultArtifactKey,
+  resultArtifactRef,
   type AuthIdentity,
   type PrivateDecision,
   type PublicResponse,
@@ -14,10 +19,13 @@ import {
 } from "./contracts";
 import {
   randomNonce,
+  base64UrlDecode,
   sha256Hex,
+  sha256HexBytes,
   signTicket,
   timingSafeHexEqual,
   verifyDeviceResult,
+  verifyDeviceRegistration,
   verifyTicket,
 } from "./crypto";
 import { assertTicketDeliveryHygiene, publicJson } from "./egress";
@@ -35,14 +43,24 @@ async function authenticate(request: Request, env: Env): Promise<AuthIdentity> {
   if (!authorization?.startsWith("Bearer ") || authorization.length > 8_192) {
     reject();
   }
+  const deviceId = parseDeviceId(request.headers.get("x-os1-device-id"));
   const value = await bindingJson(
     env.AUTH_SERVICE,
     "/verify",
-    {},
+    { device_id: deviceId },
     positiveInteger(env.SERVICE_RESPONSE_BYTES),
     authorization,
   );
   return parseAuthIdentity(value);
+}
+
+async function verifyTicketFresh(ticket: Ticket, env: Env): Promise<void> {
+  if (
+    Date.parse(ticket.expires_at) < Date.now() ||
+    !(await verifyTicket(ticket, env.TICKET_VERIFYING_KEY_SPKI))
+  ) {
+    reject();
+  }
 }
 
 async function privateDecision(
@@ -124,6 +142,34 @@ export async function startExecution(request: Request, env: Env): Promise<Respon
   return publicJson(ticket);
 }
 
+export async function registerDevice(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const identity = await authenticate(request, env);
+  const registration = parseDeviceRegistration(
+    await readBoundedJson(request, positiveInteger(env.MAX_REQUEST_BYTES)),
+  );
+  if (
+    registration.device_id !== identity.device_id ||
+    Math.abs(Date.now() - registration.registered_at) > 300_000 ||
+    !(await verifyDeviceRegistration(registration))
+  ) {
+    reject();
+  }
+  const value = await bindingJson(
+    env.DEVICE_REGISTRY,
+    "/register",
+    {
+      subject: identity.subject,
+      device_id: identity.device_id,
+      p256_public_jwk: registration.p256_public_jwk,
+    },
+    positiveInteger(env.SERVICE_RESPONSE_BYTES),
+  );
+  return publicJson(parsePublicResponse(value));
+}
+
 async function verifiedDeviceKey(
   env: Env,
   identity: AuthIdentity,
@@ -150,12 +196,7 @@ export async function submitResult(request: Request, env: Env): Promise<Response
   const result = parseResultRequest(
     await readBoundedJson(request, positiveInteger(env.MAX_REQUEST_BYTES)),
   );
-  if (
-    Date.parse(result.ticket.expires_at) < Date.now() ||
-    !(await verifyTicket(result.ticket, env.TICKET_VERIFYING_KEY_SPKI))
-  ) {
-    reject();
-  }
+  await verifyTicketFresh(result.ticket, env);
   const deviceKey = await verifiedDeviceKey(env, identity);
   if (!(await verifyDeviceResult(result, deviceKey))) reject();
 
@@ -228,4 +269,47 @@ export async function submitResult(request: Request, env: Env): Promise<Response
   });
   if (finalized.kind === "rejected") reject();
   return publicJson(parsePublicResponse(JSON.parse(finalized.response_json)));
+}
+
+export async function uploadArtifact(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const identity = await authenticate(request, env);
+  const upload = parseArtifactUploadRequest(
+    await readBoundedJson(request, positiveInteger(env.MAX_ARTIFACT_REQUEST_BYTES)),
+  );
+  await verifyTicketFresh(upload.ticket, env);
+  const artifactRef = resultArtifactRef(upload.ticket, upload.result_hash);
+  const result = {
+    ticket: upload.ticket,
+    result_hash: upload.result_hash,
+    artifact_ref: artifactRef,
+    device_signature: upload.device_signature,
+  };
+  const deviceKey = await verifiedDeviceKey(env, identity);
+  if (!(await verifyDeviceResult(result, deviceKey))) reject();
+
+  const bytes = base64UrlDecode(upload.artifact_base64);
+  if (
+    bytes.byteLength === 0 ||
+    bytes.byteLength > positiveInteger(env.MAX_ARTIFACT_BYTES) ||
+    !(await timingSafeHexEqual(
+      await sha256HexBytes(bytes),
+      upload.result_hash,
+    ))
+  ) {
+    reject();
+  }
+  await env.RESULTS.put(resultArtifactKey(artifactRef), bytes, {
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+    customMetadata: {
+      execution_id: upload.ticket.execution_id,
+      sequence: String(upload.ticket.sequence),
+      result_hash: upload.result_hash,
+      subject_hash: await sha256Hex(identity.subject),
+      device_id: identity.device_id,
+    },
+  });
+  return publicJson({ artifact_ref: artifactRef });
 }

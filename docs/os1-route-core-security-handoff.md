@@ -2,16 +2,17 @@
 
 ## Status
 
-**UNVERIFIED — public gateway controls implemented; end-to-end release approval blocked on missing Mac Runtime and private services.**
+**FUNCTIONAL RELEASE CANDIDATE — deployed end to end; Developer ID signing and Apple notarization remain pending.**
 
-This branch establishes the server boundary that can be verified without
-placing any proprietary routing material in the repository. It does not claim
+This branch implements and deploys the public gateway, four private services,
+private R2 result storage, universal Mac Runtime, GUI application, package
+builder, public release download, and one-command installer. It does not claim
 that OS-1 is unhackable or that black-box behavioral extraction is eliminated.
 
 ## Implemented architecture
 
 ```text
-Mac Runtime
+Universal Mac Runtime (Apple Silicon + Intel)
   │ authenticated task / signed result binding
   ▼
 OS-1 Route Gateway (this package)
@@ -21,6 +22,14 @@ OS-1 Route Gateway (this package)
   ├── RESULT_EVALUATOR          independent artifact verification
   └── EXECUTIONS Durable Object nonce/sequence/result state
 ```
+
+Production resources:
+
+- gateway: `os1-route-gateway`;
+- internal Workers: `os1-auth-service`, `os1-device-registry`,
+  `os1-private-route-core`, and `os1-result-evaluator`;
+- private artifacts: `os1-private-results`;
+- public signed-hash release objects: `os1-public-releases`.
 
 The gateway never receives internal reasoning from the private route service.
 Its strict parser accepts only `status` or the minimal
@@ -56,18 +65,18 @@ The response builder accepts only an eight-field ticket or a complete marker.
 
 | Requirement | Implemented evidence | Remaining release blocker |
 | --- | --- | --- |
-| P1-1 delivery hygiene / T1 | Gateway emits only the eight ticket fields; semantic fields are enum-bounded; protected canary denylist is a secret. | Capture the real Mac Runtime → Codex/Claude stdin/socket payload. No Mac Runtime exists in this repository. |
-| P1-2 injection isolation / T4 | User task is tagged `untrusted_user_data`; internal decision outputs reject every extra field; public egress is allowlisted. | The private RCC/REVAS service must implement role/data separation and pass an end-to-end injection suite. |
-| P1-3 opaque egress / T3 | One fixed-shape error response; bounded JSON; logs contain only event class and request ID; internal field names never pass the public parser. | Run malformed-input sweeps against deployed auth/private/evaluator services and verify network-level headers, size buckets, and timing. |
-| P1-4 result integrity / T5 | Ed25519 ticket verification, P-256 device signature, independent evaluator contract, timing-safe hash match, atomic nonce/sequence ledger, idempotent response persistence. | Secure Enclave client implementation, real device attestation/revocation, evaluator implementation, and active oracle measurements are absent. |
-| P1-5 build hygiene / T7 | Client artifact scanner rejects forbidden paths/content, high-entropy tokens, and symlinks without printing leaked content. A separately controlled production policy can supply real protected fingerprints. Scanner behavior is tested. | Run it on an actual signed `.app` and every updater package, then sign and retain each report. No client release artifact is present, so T7 cannot pass yet. |
-| P2-1 device binding | Registry and P-256 possession contracts exist. | Secure Enclave key generation, attestation validation, DPoP/mTLS, and per-device revocation service. |
-| P2-2 asymmetric tickets | Implemented with Ed25519 PKCS#8/SPKI keys. | Production key rotation and overlapping verification-key rollout procedure. |
-| P2-3 atomic result submission | SQLite Durable Object state enforces sequence, nonce, result hash, and one stored response. | Cloudflare integration/concurrency test against a deployed namespace. |
+| P1-1 delivery hygiene / T1 | Runtime delivers only the user's task to the selected local agent; the gateway emits only the eight ticket fields; the protected canary denylist is a secret. | Retain packet/process-capture evidence per production release. |
+| P1-2 injection isolation / T4 | User content is explicitly untrusted data; private decisions and public egress use exact schemas. A deployed hidden-prompt exfiltration probe returned only the ticket schema. | Continue the injection corpus as policies evolve. |
+| P1-3 opaque egress / T3 | One 197-byte fixed-shape error; bounded JSON; logs contain only event class/request ID. Nine deployed malformed/auth cases passed. | Success response size and latency normalization remain P2 work. |
+| P1-4 result integrity / T5 | Secure Enclave P-256 signing, Ed25519 tickets, private R2 artifacts, independent evaluator, timing-safe hashes, and atomic nonce/sequence state are deployed. | A rooted owner can still fabricate client-observed output; cryptographic possession is not proof of honest execution. This is a documented structural residual risk. |
+| P1-5 build hygiene / T7 | Universal app/CLI and package build passed exact-content and Mach-O cstring entropy scanning with zero findings. CI rebuilds both architectures and repeats the gate. | Developer ID signing/notarization awaits an Apple distribution identity. |
+| P2-1 device binding | Secure Enclave non-extractable P-256 key on supported Macs; Keychain fallback on older Intel hardware; immutable device registry. | Apple attestation validation, user-visible device revocation, and DPoP/mTLS. |
+| P2-2 asymmetric tickets | Deployed Ed25519 PKCS#8/SPKI split; only the raw public key is in the client config. | Rotation with overlapping public keys. |
+| P2-3 atomic result submission | Deployed SQLite Durable Objects enforce sequence, nonce, result hash, and one stored response; live E2E passed. | Add sustained concurrency/load evidence. |
 | P2-4 extraction resistance | None claimed. | Account/global budgets, distributed/Sybil detection, cost-bound identity and measured extraction-query threshold. |
 | P2-5 side-channel normalization | Fixed error status/body and no diagnostic headers. | Success payload bucketing and measured response-time/size normalization. |
 
-## Automated evidence in this branch
+## Automated and live evidence in this branch
 
 The test suite currently covers:
 
@@ -82,10 +91,21 @@ The test suite currently covers:
 - idempotent return of the stored next-step response after finalization; and
 - release artifact scanning without echoing protected fragments.
 
-CI also regenerates Wrangler bindings, type-checks the Worker, and performs a
-Cloudflare dry-run bundle. A successful dry run is not a production deployment.
+CI regenerates bindings and type-checks/dry-bundles all five Workers. A macOS
+job builds both architectures, creates the application and package, validates
+code signatures and payloads, and runs the artifact scanner.
 
-## Private service implementation contracts
+The live acceptance run completed this sequence on 2026-08-31:
+
+1. generated and registered a Secure Enclave P-256 device key;
+2. received and verified an Ed25519 server ticket;
+3. executed Codex in a temporary Git workspace;
+4. created and verified the requested file content;
+5. uploaded the signed artifact to private R2;
+6. completed server evaluation and atomic finalization; and
+7. downloaded the public package and matched its manifest SHA-256 exactly.
+
+## Private service contracts
 
 ### `PRIVATE_ROUTE_CORE`
 
@@ -136,8 +156,9 @@ commit that private policy to this repository.
 
 ## Release decision
 
-This branch is an implementation foundation, not a release approval. Promote
-from **UNVERIFIED** only after the five P1 rows above have real end-to-end
-evidence. Behavioral surrogate routing and decision-boundary approximation
-remain structural residual risks and must be measured and documented rather
-than marked resolved.
+The shell installation path is functional now. Finder double-click distribution
+must not be described as production-signed until a Developer ID Installer and
+Developer ID Application identity are used and the package is notarized and
+stapled. Behavioral surrogate routing, client-output fabrication on an
+owner-controlled Mac, and decision-boundary approximation remain structural
+residual risks and must be measured and documented rather than marked resolved.

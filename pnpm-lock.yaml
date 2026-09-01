@@ -25,6 +25,42 @@ importers:
         specifier: 4.127.1
         version: 4.127.1
 
+  products/os1-auth-service:
+    devDependencies:
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      wrangler:
+        specifier: 4.127.1
+        version: 4.127.1
+
+  products/os1-device-registry:
+    devDependencies:
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      wrangler:
+        specifier: 4.127.1
+        version: 4.127.1
+
+  products/os1-private-route-core:
+    devDependencies:
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      wrangler:
+        specifier: 4.127.1
+        version: 4.127.1
+
+  products/os1-result-evaluator:
+    devDependencies:
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+      wrangler:
+        specifier: 4.127.1
+        version: 4.127.1
+
   products/os1-route-core:
     devDependencies:
       '@types/node':

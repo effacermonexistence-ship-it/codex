@@ -1,21 +1,17 @@
 {
-  "name": "@omar/os1-route-core",
+  "name": "@omar/os1-result-evaluator",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
+    "deploy": "wrangler deploy",
     "deploy:dry-run": "wrangler deploy --dry-run --outdir dist",
-    "redteam:deployed": "node scripts/deployed-redteam-smoke.mjs",
-    "scan:client": "node scripts/client-artifact-scan.mjs",
-    "test": "vitest run",
     "types": "wrangler types --env-file .dev.vars.example",
     "types:check": "wrangler types --env-file .dev.vars.example --check"
   },
   "devDependencies": {
-    "@types/node": "26.4.0",
     "typescript": "5.9.3",
-    "vitest": "4.1.11",
     "wrangler": "4.127.1"
   }
 }
