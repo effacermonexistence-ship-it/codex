@@ -1074,7 +1074,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         _ = try request(
             "initialize",
             params: [
-                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.7.5"],
+                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.7.6"],
                 "capabilities": ["experimentalApi": true],
             ],
             deadline: deadline
@@ -2320,7 +2320,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.7.5")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.7.6")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":

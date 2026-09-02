@@ -141,6 +141,21 @@ private func composerText(base: String, dictated transcript: String) -> String {
     return base + " " + transcript
 }
 
+/// AVAudioEngine calls its tap on a realtime queue. Keeping the Speech request
+/// in an explicitly Sendable bridge prevents Swift 6 from inheriting the
+/// controller's MainActor isolation into that callback and trapping at runtime.
+private final class SpeechAudioBufferSink: @unchecked Sendable {
+    private let request: SFSpeechAudioBufferRecognitionRequest
+
+    init(request: SFSpeechAudioBufferRecognitionRequest) {
+        self.request = request
+    }
+
+    nonisolated func append(_ buffer: AVAudioPCMBuffer) {
+        request.append(buffer)
+    }
+}
+
 @MainActor
 private final class VoiceDictationController: ObservableObject {
     @Published private(set) var isRecording = false
@@ -150,13 +165,17 @@ private final class VoiceDictationController: ObservableObject {
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var audioBufferSink: SpeechAudioBufferSink?
     private var meterTimer: Timer?
     private var baseText = ""
     private var onTranscript: ((String) -> Void)?
     private var onFailure: ((String) -> Void)?
     private var tapInstalled = false
+    private var wantsRecording = false
+    private var recognitionGeneration = 0
+    private var latestText = ""
 
-    var isActive: Bool { isRecording || isAuthorizing }
+    var isActive: Bool { wantsRecording || isRecording || isAuthorizing }
 
     func toggle(
         initialText: String,
@@ -168,13 +187,24 @@ private final class VoiceDictationController: ObservableObject {
             return
         }
         baseText = initialText
+        latestText = initialText
         self.onTranscript = onTranscript
         self.onFailure = onFailure
+        wantsRecording = true
         isAuthorizing = true
         Task { await authorizeAndStart() }
     }
 
     func stop() {
+        wantsRecording = false
+        tearDownRecognition()
+        isRecording = false
+        isAuthorizing = false
+        level = 0
+    }
+
+    private func tearDownRecognition() {
+        recognitionGeneration += 1
         if audioEngine.isRunning { audioEngine.stop() }
         if tapInstalled {
             audioEngine.inputNode.removeTap(onBus: 0)
@@ -184,11 +214,9 @@ private final class VoiceDictationController: ObservableObject {
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest = nil
+        audioBufferSink = nil
         meterTimer?.invalidate()
         meterTimer = nil
-        isRecording = false
-        isAuthorizing = false
-        level = 0
     }
 
     private func authorizeAndStart() async {
@@ -203,7 +231,7 @@ private final class VoiceDictationController: ObservableObject {
         case let existing:
             speechStatus = existing
         }
-        guard isAuthorizing else { return }
+        guard isAuthorizing, wantsRecording else { return }
         guard speechStatus == .authorized else {
             fail("Speech recognition access is off. Allow Open OS-1 Codex in System Settings → Privacy & Security → Speech Recognition.")
             return
@@ -218,7 +246,7 @@ private final class VoiceDictationController: ObservableObject {
         default:
             microphoneGranted = false
         }
-        guard isAuthorizing else { return }
+        guard isAuthorizing, wantsRecording else { return }
         guard microphoneGranted else {
             fail("Microphone access is off. Allow Open OS-1 Codex in System Settings → Privacy & Security → Microphone.")
             return
@@ -246,15 +274,22 @@ private final class VoiceDictationController: ObservableObject {
             request.requiresOnDeviceRecognition = true
         }
         recognitionRequest = request
+        let bufferSink = SpeechAudioBufferSink(request: request)
+        audioBufferSink = bufferSink
 
         let inputNode = audioEngine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw RunnerError.message("No microphone audio format is available.")
         }
-        inputNode.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak request] buffer, _ in
-            request?.append(buffer)
-        }
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: 1_024,
+            format: format,
+            block: { @Sendable [bufferSink] buffer, _ in
+                bufferSink.append(buffer)
+            }
+        )
         tapInstalled = true
         audioEngine.prepare()
         try audioEngine.start()
@@ -262,21 +297,44 @@ private final class VoiceDictationController: ObservableObject {
         isRecording = true
         startLevelMeter(inputNode: inputNode)
 
-        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+        recognitionGeneration += 1
+        let generation = recognitionGeneration
+        recognitionTask = recognizer.recognitionTask(with: request) { @Sendable [weak self] result, error in
             let transcript = result?.bestTranscription.formattedString
             let isFinal = result?.isFinal ?? false
             let errorMessage = error?.localizedDescription
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                guard self.isActive else { return }
+                guard self.wantsRecording,
+                      self.recognitionGeneration == generation else { return }
                 if let transcript {
-                    self.onTranscript?(composerText(base: self.baseText, dictated: transcript))
+                    let merged = composerText(base: self.baseText, dictated: transcript)
+                    self.latestText = merged
+                    self.onTranscript?(merged)
                 }
                 if let errorMessage, !isFinal {
                     self.fail("Voice input stopped: \(errorMessage)")
                 } else if isFinal {
-                    self.stop()
+                    self.restartAfterFinalResult()
                 }
+            }
+        }
+    }
+
+    /// Speech may finalize a segment after a pause. Keep the microphone UI and
+    /// user intent active while transparently rolling into a fresh segment.
+    private func restartAfterFinalResult() {
+        guard wantsRecording else { return }
+        baseText = latestText
+        tearDownRecognition()
+        isRecording = true
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard let self, self.wantsRecording else { return }
+            do {
+                try self.startRecognition()
+            } catch {
+                self.fail("Voice input could not continue: \(error.localizedDescription)")
             }
         }
     }
