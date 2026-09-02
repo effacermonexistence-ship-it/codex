@@ -109,4 +109,7 @@ jobs:
           bash -n products/os1-mac-runtime/scripts/install-os1.sh
 
       - name: Build, sign, package, and scan universal release
+        env:
+          OS1_PRIVATE_CORE_SOURCE: ${{ github.workspace }}/products/os1-mac-runtime/Fixtures/ci-private-core
+          OS1_ALLOW_CI_PRIVATE_CORE_FIXTURE: "1"
         run: products/os1-mac-runtime/scripts/build-release.sh
