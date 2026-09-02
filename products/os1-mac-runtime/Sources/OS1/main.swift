@@ -839,7 +839,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         _ = try request(
             "initialize",
             params: [
-                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.6.6"],
+                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.6.7"],
                 "capabilities": ["experimentalApi": true],
             ],
             deadline: deadline
@@ -887,16 +887,39 @@ final class CodexAppServerClient: @unchecked Sendable {
             result = try request("thread/start", params: params, deadline: deadline)
         }
 
-        guard let thread = result["thread"] as? [String: Any],
+        guard var thread = result["thread"] as? [String: Any],
               let rawID = thread["id"] as? String,
-              let threadID = try normalizedSessionID(rawID) else {
+              var threadID = try normalizedSessionID(rawID) else {
             throw OS1Error.message("Codex did not return a persistent desktop thread ID")
         }
         if let existingSessionID, existingSessionID != threadID {
             throw OS1Error.message("Codex resumed the wrong desktop thread")
         }
 
-        if existingSessionID == nil {
+        // Threads created by the legacy `codex exec` bridge are persisted, but the
+        // Codex desktop app deliberately omits them from its session list. Forking
+        // through app-server preserves the full conversation while producing a
+        // first-class desktop thread that the user can inspect and continue.
+        if existingSessionID != nil, codexThreadNeedsDesktopMigration(source: thread["source"]) {
+            var forkParams = params
+            forkParams["threadId"] = threadID
+            forkParams["ephemeral"] = false
+            forkParams["excludeTurns"] = true
+            forkParams["threadSource"] = "os1"
+            let migrated = try request("thread/fork", params: forkParams, deadline: deadline)
+            guard let migratedThread = migrated["thread"] as? [String: Any],
+                  let migratedRawID = migratedThread["id"] as? String,
+                  let migratedID = try normalizedSessionID(migratedRawID),
+                  migratedID != threadID,
+                  !codexThreadNeedsDesktopMigration(source: migratedThread["source"]) else {
+                throw OS1Error.message("Codex legacy session could not be migrated into the desktop session list")
+            }
+            thread = migratedThread
+            threadID = migratedID
+        }
+
+        let existingName = (thread["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if existingName?.isEmpty != false {
             _ = try request(
                 "thread/name/set",
                 params: ["threadId": threadID, "name": title],
@@ -1087,6 +1110,10 @@ func codexSessionTitle(from prompt: String) -> String {
     return "OS-1 Codex · \(summary)"
 }
 
+func codexThreadNeedsDesktopMigration(source: Any?) -> Bool {
+    (source as? String)?.lowercased() == "exec"
+}
+
 func execute(
     ticket: Ticket,
     prompt: String,
@@ -1117,9 +1144,6 @@ func execute(
             title: codexSessionTitle(from: prompt),
             deadline: deadline
         )
-        if let expectedSessionID, expectedSessionID != actualSessionID {
-            throw OS1Error.message("Codex resumed the wrong thread")
-        }
         let final = try appServer.runTurn(
             threadID: actualSessionID,
             prompt: prompt,
@@ -1313,7 +1337,12 @@ func selfTest() throws {
         throw OS1Error.message("Native provider session validation failed")
     }
     guard codexSessionTitle(from: "  1 + 1   테스트  ") == "OS-1 Codex · 1 + 1 테스트",
-          codexSessionTitle(from: "").hasPrefix("OS-1 Codex · ") else {
+          codexSessionTitle(from: "").hasPrefix("OS-1 Codex · "),
+          codexThreadNeedsDesktopMigration(source: "exec"),
+          codexThreadNeedsDesktopMigration(source: "EXEC"),
+          !codexThreadNeedsDesktopMigration(source: "vscode"),
+          !codexThreadNeedsDesktopMigration(source: "appServer"),
+          !codexThreadNeedsDesktopMigration(source: nil) else {
         throw OS1Error.message("Codex desktop session title validation failed")
     }
     let claudeSessionID = "01a05b4d-f206-7c71-bd11-128b24e755e0"
@@ -1403,7 +1432,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.6.6")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.6.7")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":
