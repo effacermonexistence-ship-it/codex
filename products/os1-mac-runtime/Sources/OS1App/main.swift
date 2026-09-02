@@ -461,6 +461,9 @@ private struct ChatMessage: Codable, Identifiable, Sendable {
     let provider: String?
     let permissionProfile: String?
     let timestamp: Date
+    /// Receipt-only: whether the native backend record was read back after the
+    /// step. Absent on receipts written before OS-1 verified persistence.
+    let nativeRecordVerified: Bool?
 
     init(
         id: UUID = UUID(),
@@ -468,7 +471,8 @@ private struct ChatMessage: Codable, Identifiable, Sendable {
         text: String,
         provider: String? = nil,
         permissionProfile: String? = nil,
-        timestamp: Date = Date()
+        timestamp: Date = Date(),
+        nativeRecordVerified: Bool? = nil
     ) {
         self.id = id
         self.role = role
@@ -476,6 +480,7 @@ private struct ChatMessage: Codable, Identifiable, Sendable {
         self.provider = provider
         self.permissionProfile = permissionProfile
         self.timestamp = timestamp
+        self.nativeRecordVerified = nativeRecordVerified
     }
 }
 
@@ -527,6 +532,22 @@ private struct SessionEnvelope: Codable {
     let sessions: [ConversationSession]
 }
 
+private struct AppNativeRecord: Decodable, Sendable {
+    let turnID: String?
+    let recordPath: String?
+    let persistence: String
+    let desktopVisibility: String
+
+    enum CodingKeys: String, CodingKey {
+        case turnID = "turn_id"
+        case recordPath = "record_path"
+        case persistence
+        case desktopVisibility = "desktop_visibility"
+    }
+
+    var isVerified: Bool { persistence == "verified" }
+}
+
 private struct AppRunStep: Decodable, Sendable {
     let sequence: Int
     let provider: String
@@ -538,6 +559,7 @@ private struct AppRunStep: Decodable, Sendable {
     let output: String
     let stderr: String
     let durationMS: Int64
+    let nativeRecord: AppNativeRecord?
 
     enum CodingKeys: String, CodingKey {
         case sequence, provider, action, effort, output, stderr
@@ -545,7 +567,29 @@ private struct AppRunStep: Decodable, Sendable {
         case permissionProfile = "permission_profile"
         case exitCode = "exit_code"
         case durationMS = "duration_ms"
+        case nativeRecord = "native_record"
     }
+}
+
+/// Receipt wording is derived from evidence the runtime actually gathered, so
+/// the receipt never says more than what was read back from the backend.
+private func nativeRecordReceipt(_ step: AppRunStep) -> String {
+    guard let record = step.nativeRecord else { return "native session linked (unverified)" }
+    var parts: [String] = []
+    if record.isVerified {
+        let file = record.recordPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "record"
+        parts.append("native record verified · \(file)")
+    } else {
+        parts.append("native record \(record.persistence)")
+    }
+    switch record.desktopVisibility {
+    case "revealed": parts.append("Codex Desktop: synced and opened")
+    case "not_revealed": parts.append("Codex Desktop: not opened")
+    case "desktop_not_running": parts.append("Codex Desktop: lists on launch")
+    case let value where value.hasPrefix("reveal_failed"): parts.append("Codex Desktop: open failed")
+    default: break
+    }
+    return parts.joined(separator: " · ")
 }
 
 private struct AppRunSummary: Decodable, Sendable {
@@ -669,6 +713,7 @@ private enum OS1Runner {
         arguments += [
             "--codex-capacity", String(codexCapacity),
             "--claude-capacity", String(claudeCapacity),
+            "--desktop-reveal", "always",
         ]
 
         let process = Process()
@@ -875,6 +920,25 @@ private final class SessionStore: ObservableObject {
         inspectBackend(surface)
     }
 
+    /// The first-party `codex://threads/<id>` deep link makes Codex Desktop
+    /// read the thread through its own app-server and open it, which is the
+    /// only way a running Desktop lists a thread OS-1 persisted separately.
+    /// If Desktop keeps the writer lock, the next OS-1 turn automatically
+    /// forks the complete history and continues in a new visible thread.
+    func openInCodexDesktop() {
+        guard !isRunning, let index = selectedIndex,
+              let id = sessions[index].codexSessionID,
+              let url = URL(string: "codex://threads/\(id)") else { return }
+        NSWorkspace.shared.open(url)
+        sessions[index].messages.append(ChatMessage(
+            role: .system,
+            text: "Opened Codex session \(id) in Codex Desktop. If Desktop owns this thread, the next OS-1 turn will preserve its history in a new linked Codex session automatically."
+        ))
+        sessions[index].updatedAt = Date()
+        statusText = "Opened in Codex Desktop"
+        save()
+    }
+
     func selectNativeSession(_ id: String) {
         selectedNativeSessionID = id
         loadSelectedNativeTranscript()
@@ -1033,13 +1097,17 @@ private final class SessionStore: ObservableObject {
                     ))
                     sessions[target].messages.append(ChatMessage(
                         role: .receipt,
-                        text: "\(backendTierLabel(action: step.action, provider: step.provider)) · \(step.effort) reasoning · native session linked · step \(step.sequence) · \(step.durationMS / 1_000)s · exit \(step.exitCode)",
+                        text: "\(backendTierLabel(action: step.action, provider: step.provider)) · \(step.effort) reasoning · \(nativeRecordReceipt(step)) · step \(step.sequence) · \(step.durationMS / 1_000)s · exit \(step.exitCode)",
                         provider: step.provider,
-                        permissionProfile: step.permissionProfile
+                        permissionProfile: step.permissionProfile,
+                        nativeRecordVerified: step.nativeRecord?.isVerified ?? false
                     ))
                 }
                 sessions[target].updatedAt = Date()
-                statusText = "Native session linked · evidence recorded"
+                let allVerified = summary.steps.allSatisfy { $0.nativeRecord?.isVerified == true }
+                statusText = allVerified
+                    ? "Native record verified · evidence recorded"
+                    : "Native record unverified · check the receipt"
             } catch {
                 guard let target = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
                 sessions[target].messages.append(ChatMessage(
@@ -1824,6 +1892,8 @@ private struct ConversationHeader: View {
                     Divider()
                     Button("Inspect Codex backend") { store.inspectBackend(.codex) }
                         .disabled(session.codexSessionID == nil)
+                    Button("Open in Codex Desktop") { store.openInCodexDesktop() }
+                        .disabled(session.codexSessionID == nil)
                     Button("Inspect Claude backend") { store.inspectBackend(.claude) }
                         .disabled(session.claudeSessionID == nil)
                 } label: {
@@ -2053,10 +2123,12 @@ private struct MessageView: View {
                         .tracking(1.3)
                         .foregroundStyle(Theme.pink)
                     Spacer()
-                    Text("VERIFIED")
+                    // Receipts saved before native-record verification existed
+                    // carry no flag and keep their historical label.
+                    Text(message.nativeRecordVerified == false ? "UNVERIFIED" : "VERIFIED")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
                         .tracking(1.1)
-                        .foregroundStyle(Theme.green)
+                        .foregroundStyle(message.nativeRecordVerified == false ? Theme.pink : Theme.green)
                 }
                 Text(message.text)
                     .font(.system(size: 10, design: .monospaced))

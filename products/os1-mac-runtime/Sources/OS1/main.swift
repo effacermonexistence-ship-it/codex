@@ -1,3 +1,4 @@
+import AppKit
 import CryptoKit
 import Darwin
 import Foundation
@@ -261,6 +262,26 @@ struct CapacityPlan: Codable {
     let claude: Int
 }
 
+/// Evidence that a provider step landed in the provider's own persistent
+/// session store, gathered after the turn completed and independently of the
+/// provider's success response. `persistence` is "verified" only when the
+/// record was read back; anything else carries the reason it could not be.
+struct NativeRecordEvidence: Codable {
+    let turnID: String?
+    let recordPath: String?
+    let persistence: String
+    let desktopVisibility: String
+
+    enum CodingKeys: String, CodingKey {
+        case turnID = "turn_id"
+        case recordPath = "record_path"
+        case persistence
+        case desktopVisibility = "desktop_visibility"
+    }
+
+    var isVerified: Bool { persistence == "verified" }
+}
+
 struct RunStepSummary: Codable {
     let sequence: Int
     let provider: String
@@ -272,6 +293,7 @@ struct RunStepSummary: Codable {
     let output: String
     let stderr: String
     let durationMS: Int64
+    let nativeRecord: NativeRecordEvidence?
 
     enum CodingKeys: String, CodingKey {
         case sequence, provider, action, effort, output, stderr
@@ -279,6 +301,7 @@ struct RunStepSummary: Codable {
         case permissionProfile = "permission_profile"
         case exitCode = "exit_code"
         case durationMS = "duration_ms"
+        case nativeRecord = "native_record"
     }
 }
 
@@ -290,6 +313,7 @@ struct RunSummary: Codable {
 struct ProviderExecution {
     let artifact: Artifact
     let sessionID: String
+    let nativeRecord: NativeRecordEvidence
 }
 
 enum Base64URL {
@@ -839,7 +863,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         _ = try request(
             "initialize",
             params: [
-                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.6.7"],
+                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.6.8"],
                 "capabilities": ["experimentalApi": true],
             ],
             deadline: deadline
@@ -875,10 +899,25 @@ final class CodexAppServerClient: @unchecked Sendable {
         if let model { params["model"] = model }
 
         let result: [String: Any]
+        var forkedFromDesktopOwnedThread = false
         if let existingSessionID {
             params["threadId"] = existingSessionID
             params["excludeTurns"] = true
-            result = try request("thread/resume", params: params, deadline: deadline)
+            do {
+                result = try request("thread/resume", params: params, deadline: deadline)
+            } catch {
+                guard codexWriterConflictMessage(error, threadID: existingSessionID) != nil else { throw error }
+
+                // Opening an OS-1 thread in Codex Desktop deliberately gives
+                // Desktop the single writer lock. Preserve continuity without
+                // asking the user to quit Desktop: fork the complete persisted
+                // history into a new first-class thread and execute there.
+                var forkParams = params
+                forkParams["ephemeral"] = false
+                forkParams["threadSource"] = "os1"
+                result = try request("thread/fork", params: forkParams, deadline: deadline)
+                forkedFromDesktopOwnedThread = true
+            }
         } else {
             params["ephemeral"] = false
             params["historyMode"] = "paginated"
@@ -892,8 +931,14 @@ final class CodexAppServerClient: @unchecked Sendable {
               var threadID = try normalizedSessionID(rawID) else {
             throw OS1Error.message("Codex did not return a persistent desktop thread ID")
         }
-        if let existingSessionID, existingSessionID != threadID {
+        if let existingSessionID, !forkedFromDesktopOwnedThread, existingSessionID != threadID {
             throw OS1Error.message("Codex resumed the wrong desktop thread")
+        }
+        if let existingSessionID, forkedFromDesktopOwnedThread {
+            guard threadID != existingSessionID,
+                  (thread["forkedFromId"] as? String) == existingSessionID else {
+                throw OS1Error.message("Codex did not preserve the Desktop-owned session history")
+            }
         }
 
         // Threads created by the legacy `codex exec` bridge are persisted, but the
@@ -919,7 +964,10 @@ final class CodexAppServerClient: @unchecked Sendable {
         }
 
         let existingName = (thread["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if existingName?.isEmpty != false {
+        // A fork is the new writable/visible continuation, so name it after
+        // the request that created this handoff instead of inheriting a stale
+        // title from the first turn in the chain.
+        if forkedFromDesktopOwnedThread || existingName?.isEmpty != false {
             _ = try request(
                 "thread/name/set",
                 params: ["threadId": threadID, "name": title],
@@ -937,7 +985,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         model: String?,
         effort: String,
         deadline: Date
-    ) throws -> Data {
+    ) throws -> CodexTurnOutput {
         var params: [String: Any] = [
             "threadId": threadID,
             "input": [["type": "text", "text": prompt]],
@@ -952,12 +1000,64 @@ final class CodexAppServerClient: @unchecked Sendable {
         guard let turn = result["turn"] as? [String: Any], let turnID = turn["id"] as? String else {
             throw OS1Error.message("Codex did not start a persistent desktop turn")
         }
-        return try waitForTurn(threadID: threadID, turnID: turnID, deadline: deadline)
+        let output = try waitForTurn(threadID: threadID, turnID: turnID, deadline: deadline)
+        return CodexTurnOutput(turnID: turnID, output: output)
+    }
+
+    /// Reads the thread and its turn list back from the same app-server after
+    /// `turn/completed`, then confirms the rollout file exists on disk. The
+    /// turn list is polled briefly because rollout persistence can trail the
+    /// completion notification by a few hundred milliseconds.
+    func verifyPersistedTurn(
+        threadID: String,
+        turnID: String,
+        finalAnswer: String,
+        deadline: Date
+    ) throws -> String {
+        let read = try request(
+            "thread/read",
+            params: ["threadId": threadID, "includeTurns": false],
+            deadline: deadline
+        )
+        guard let thread = read["thread"] as? [String: Any],
+              let rawID = thread["id"] as? String,
+              try normalizedSessionID(rawID) == threadID else {
+            throw OS1Error.message("Codex thread/read returned a different thread")
+        }
+        guard thread["ephemeral"] as? Bool != true else {
+            throw OS1Error.message("Codex thread is ephemeral")
+        }
+        guard let path = thread["path"] as? String, !path.isEmpty else {
+            throw OS1Error.message("Codex thread has no rollout path")
+        }
+        var attempts = 0
+        while true {
+            let listed = try request(
+                "thread/turns/list",
+                params: ["threadId": threadID, "limit": 20, "itemsView": "full", "sortDirection": "desc"],
+                deadline: deadline
+            )
+            if codexTurnIsPersisted(listed["data"], turnID: turnID, finalAnswer: finalAnswer) { break }
+            attempts += 1
+            guard attempts < 12, Date() < deadline else {
+                throw OS1Error.message("Codex turn is missing from the persisted turn list")
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard let size = try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber,
+              size.intValue > 0 else {
+            throw OS1Error.message("Codex rollout file is missing on disk")
+        }
+        return path
     }
 
     func close() {
         output.fileHandleForReading.readabilityHandler = nil
         try? input.fileHandleForWriting.close()
+        // stdin EOF is the app-server's orderly shutdown signal; give it time
+        // to finish outstanding writes before escalating to signals.
+        let gracefulDeadline = Date().addingTimeInterval(3)
+        while process.isRunning && Date() < gracefulDeadline { Thread.sleep(forTimeInterval: 0.05) }
         if process.isRunning {
             process.terminate()
             let deadline = Date().addingTimeInterval(1)
@@ -1037,8 +1137,10 @@ final class CodexAppServerClient: @unchecked Sendable {
                 if message["method"] != nil { deferredNotifications.append(message) }
                 continue
             }
-            if message["error"] != nil {
-                throw OS1Error.message("Codex desktop protocol rejected \(method)")
+            if let error = message["error"] {
+                let detail = ((error as? [String: Any])?["message"] as? String)
+                    .map { ": " + String($0.prefix(300)) } ?? ""
+                throw OS1Error.message("Codex desktop protocol rejected \(method)\(detail)")
             }
             return message["result"] as? [String: Any] ?? [:]
         }
@@ -1104,6 +1206,11 @@ final class CodexAppServerClient: @unchecked Sendable {
     }
 }
 
+struct CodexTurnOutput {
+    let turnID: String
+    let output: Data
+}
+
 func codexSessionTitle(from prompt: String) -> String {
     let compact = prompt.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
     let summary = compact.isEmpty ? "Governed task" : String(compact.prefix(72))
@@ -1114,6 +1221,133 @@ func codexThreadNeedsDesktopMigration(source: Any?) -> Bool {
     (source as? String)?.lowercased() == "exec"
 }
 
+/// True when a `thread/turns/list` payload contains the completed turn whose
+/// agent message carries the answer OS-1 is about to report.
+func codexTurnIsPersisted(_ turns: Any?, turnID: String, finalAnswer: String) -> Bool {
+    guard let turns = turns as? [[String: Any]] else { return false }
+    let wanted = finalAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+    return turns.contains { turn in
+        guard turn["id"] as? String == turnID,
+              turn["status"] as? String == "completed",
+              let items = turn["items"] as? [[String: Any]] else { return false }
+        return items.contains { item in
+            item["type"] as? String == "agentMessage" &&
+                (item["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) == wanted
+        }
+    }
+}
+
+let codexDesktopBundleID = "com.openai.codex"
+
+/// Codex threads have a single writer: whichever app-server process opens a
+/// thread takes `~/.codex/thread-writer-locks/<id>.lock` and Codex Desktop
+/// keeps every thread it has opened locked until it quits. OS-1 therefore
+/// forks the persisted history on the next turn when Desktop owns the prior
+/// thread, instead of failing or pretending that the session is synchronized.
+enum DesktopRevealMode: String {
+    case never, always
+}
+
+func codexDesktopIsRunning() -> Bool {
+    !NSRunningApplication.runningApplications(withBundleIdentifier: codexDesktopBundleID).isEmpty
+}
+
+/// The first-party `codex://threads/<id>` deep link makes a running Desktop
+/// read the thread through its own app-server, list it, and open it. It always
+/// raises the Desktop window.
+func revealInCodexDesktop(threadID: String) throws {
+    let result = try commandOutput("/usr/bin/open", ["-g", "codex://threads/\(threadID)"], timeout: 15)
+    guard result.0 == 0 else {
+        throw OS1Error.message("open exited with status \(result.0)")
+    }
+}
+
+func codexDesktopVisibility(
+    mode: DesktopRevealMode,
+    desktopRunning: Bool,
+    reveal: (String) throws -> Void,
+    threadID: String
+) -> String {
+    guard desktopRunning else { return "desktop_not_running" }
+    guard mode == .always else { return "not_revealed" }
+    do {
+        try reveal(threadID)
+        return "revealed"
+    } catch {
+        return "reveal_failed: \(error)"
+    }
+}
+
+/// Identifies the app-server's single-writer conflict. The runtime uses this
+/// signal to fork the persisted history and continue in a visible new thread.
+func codexWriterConflictMessage(_ error: Error, threadID: String) -> String? {
+    guard "\(error)".contains("already has an active writer") else { return nil }
+    return "Codex Desktop currently owns Codex session \(threadID)"
+}
+
+/// Claude Code writes every persistent session to
+/// `~/.claude/projects/<encoded cwd>/<session id>.jsonl`; the encoding of the
+/// cwd is an implementation detail, so search the project directories instead.
+/// A pre-existing transcript is not evidence for the current turn, so the
+/// file must have been written after `modifiedAfter` and must carry the
+/// assistant text OS-1 is about to report.
+func claudeTranscriptPath(
+    sessionID: String,
+    projectsRoot: URL? = nil,
+    modifiedAfter: Date? = nil,
+    containing assistantText: String? = nil
+) -> String? {
+    let root = projectsRoot ?? FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/projects", isDirectory: true)
+    guard let projects = try? FileManager.default.contentsOfDirectory(
+        at: root,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    ) else { return nil }
+    for project in projects {
+        let candidate = project.appendingPathComponent("\(sessionID).jsonl")
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: candidate.path),
+              let size = attributes[.size] as? NSNumber, size.intValue > 0 else { continue }
+        if let modifiedAfter {
+            // File timestamps carry second granularity on some volumes.
+            guard let modified = attributes[.modificationDate] as? Date,
+                  modified >= modifiedAfter.addingTimeInterval(-1) else { continue }
+        }
+        if let assistantText, !claudeTranscriptContains(candidate, assistantText: assistantText) { continue }
+        return candidate.path
+    }
+    return nil
+}
+
+/// Scans the tail of a Claude transcript for an assistant record carrying the
+/// reported answer. Print-mode results can concatenate several assistant
+/// messages, so matching the answer's head is enough.
+func claudeTranscriptContains(_ url: URL, assistantText: String) -> Bool {
+    let probe = String(assistantText.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
+    guard !probe.isEmpty, let handle = try? FileHandle(forReadingFrom: url) else { return false }
+    defer { try? handle.close() }
+    let tailBytes: UInt64 = 512 * 1_024
+    let size = (try? handle.seekToEnd()) ?? 0
+    try? handle.seek(toOffset: size > tailBytes ? size - tailBytes : 0)
+    let data = (try? handle.readToEnd()) ?? Data()
+    for line in data.split(separator: 0x0A) {
+        guard let record = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+              record["type"] as? String == "assistant",
+              let message = record["message"] as? [String: Any] else { continue }
+        let text: String
+        if let value = message["content"] as? String {
+            text = value
+        } else if let blocks = message["content"] as? [[String: Any]] {
+            text = blocks.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
+                .joined(separator: "\n")
+        } else {
+            continue
+        }
+        if text.contains(probe) { return true }
+    }
+    return false
+}
+
 func execute(
     ticket: Ticket,
     prompt: String,
@@ -1122,11 +1356,13 @@ func execute(
     providerSessionID: String?,
     model: String?,
     effort: String,
-    executorContract: ExecutorContract
+    executorContract: ExecutorContract,
+    desktopReveal: DesktopRevealMode
 ) throws -> ProviderExecution {
     let started = Date()
     let result: (Int32, Data, Data)
     let sessionID: String
+    let nativeRecord: NativeRecordEvidence
     let instructions = executorInstructions(contract: executorContract, ticket: ticket)
     if ticket.provider == "codex" {
         let codex = try findExecutable("codex")
@@ -1144,7 +1380,7 @@ func execute(
             title: codexSessionTitle(from: prompt),
             deadline: deadline
         )
-        let final = try appServer.runTurn(
+        let turn = try appServer.runTurn(
             threadID: actualSessionID,
             prompt: prompt,
             workspace: workspace,
@@ -1152,7 +1388,33 @@ func execute(
             effort: effort,
             deadline: deadline
         )
-        result = (0, final, appServer.stderr())
+        var recordPath: String?
+        var persistence = "verified"
+        do {
+            recordPath = try appServer.verifyPersistedTurn(
+                threadID: actualSessionID,
+                turnID: turn.turnID,
+                finalAnswer: String(decoding: turn.output, as: UTF8.self),
+                deadline: deadline
+            )
+        } catch {
+            persistence = "unverified: \(error)"
+        }
+        result = (0, turn.output, appServer.stderr())
+        // Release this process's writer lock before the Desktop is asked to
+        // open the thread; otherwise its own app-server hits the conflict.
+        appServer.close()
+        nativeRecord = NativeRecordEvidence(
+            turnID: turn.turnID,
+            recordPath: recordPath,
+            persistence: persistence,
+            desktopVisibility: codexDesktopVisibility(
+                mode: desktopReveal,
+                desktopRunning: codexDesktopIsRunning(),
+                reveal: revealInCodexDesktop(threadID:),
+                threadID: actualSessionID
+            )
+        )
         sessionID = actualSessionID
     } else {
         let claude = try findExecutable("claude")
@@ -1180,6 +1442,17 @@ func execute(
         let parsed = try parseClaudePrintResult(raw.1, requestedSessionID: requestedSessionID)
         sessionID = parsed.sessionID
         result = (raw.0, parsed.output, raw.2)
+        let transcript = claudeTranscriptPath(
+            sessionID: parsed.sessionID,
+            modifiedAfter: started,
+            containing: String(decoding: parsed.output, as: UTF8.self)
+        )
+        nativeRecord = NativeRecordEvidence(
+            turnID: nil,
+            recordPath: transcript,
+            persistence: transcript == nil ? "unverified: Claude transcript for this turn not found" : "verified",
+            desktopVisibility: "not_applicable"
+        )
     }
     return ProviderExecution(
         artifact: Artifact(
@@ -1195,7 +1468,8 @@ func execute(
             durationMS: Int64(Date().timeIntervalSince(started) * 1_000),
             workspaceDiffHash: workspaceHash(workspace)
         ),
-        sessionID: sessionID
+        sessionID: sessionID,
+        nativeRecord: nativeRecord
     )
 }
 
@@ -1208,7 +1482,8 @@ func runTask(
     claudeSessionID: String?,
     codexCapacity: Int,
     claudeCapacity: Int,
-    progress: Bool
+    progress: Bool,
+    desktopReveal: DesktopRevealMode = .never
 ) async throws -> RunSummary {
     let config = try RuntimeConfig.load()
     let canonicalWorkspace = URL(fileURLWithPath: workspace).standardizedFileURL.path
@@ -1261,7 +1536,8 @@ func runTask(
             providerSessionID: nativeSessions[ticket.provider] ?? nil,
             model: model,
             effort: effort,
-            executorContract: config.executorContract
+            executorContract: config.executorContract,
+            desktopReveal: desktopReveal
         )
         nativeSessions[ticket.provider] = execution.sessionID
         let artifact = execution.artifact
@@ -1275,7 +1551,8 @@ func runTask(
             exitCode: artifact.exitCode,
             output: artifact.output,
             stderr: artifact.stderr,
-            durationMS: artifact.durationMS
+            durationMS: artifact.durationMS,
+            nativeRecord: execution.nativeRecord
         ))
         let artifactData = try JSONEncoder().encode(artifact)
         let resultHash = sha256Hex(artifactData)
@@ -1307,6 +1584,11 @@ func runTask(
 func printRunSummary(_ summary: RunSummary) {
     for step in summary.steps {
         print("\n[\(step.provider.uppercased()) · \(step.action) · \(step.effort) · \(step.permissionProfile) · \(step.sessionID)]")
+        if let record = step.nativeRecord {
+            print("native record: \(record.persistence)"
+                + (record.recordPath.map { " · \($0)" } ?? "")
+                + " · desktop: \(record.desktopVisibility)")
+        }
         if !step.output.isEmpty { print(step.output) }
         if step.exitCode != 0 && !step.stderr.isEmpty {
             fputs("\(step.stderr)\n", stderr)
@@ -1344,6 +1626,79 @@ func selfTest() throws {
           !codexThreadNeedsDesktopMigration(source: "appServer"),
           !codexThreadNeedsDesktopMigration(source: nil) else {
         throw OS1Error.message("Codex desktop session title validation failed")
+    }
+    let persistedTurns: [[String: Any]] = [
+        ["id": "turn-2", "status": "completed", "items": [
+            ["type": "userMessage", "id": "u2"],
+            ["type": "agentMessage", "id": "m2", "text": "100 + 100 = 200입니다.\n", "phase": "final_answer"],
+        ]],
+        ["id": "turn-1", "status": "completed", "items": [
+            ["type": "agentMessage", "id": "m1", "text": "1 + 1 = 2입니다."],
+        ]],
+        ["id": "turn-0", "status": "inProgress", "items": [
+            ["type": "agentMessage", "id": "m0", "text": "pending"],
+        ]],
+    ]
+    guard codexTurnIsPersisted(persistedTurns, turnID: "turn-2", finalAnswer: "100 + 100 = 200입니다."),
+          codexTurnIsPersisted(persistedTurns, turnID: "turn-1", finalAnswer: "1 + 1 = 2입니다."),
+          !codexTurnIsPersisted(persistedTurns, turnID: "turn-2", finalAnswer: "1 + 1 = 2입니다."),
+          !codexTurnIsPersisted(persistedTurns, turnID: "turn-0", finalAnswer: "pending"),
+          !codexTurnIsPersisted(persistedTurns, turnID: "turn-9", finalAnswer: "100 + 100 = 200입니다."),
+          !codexTurnIsPersisted(nil, turnID: "turn-2", finalAnswer: "100 + 100 = 200입니다.") else {
+        throw OS1Error.message("Codex persisted turn validation failed")
+    }
+    var revealed: [String] = []
+    let recordReveal: (String) throws -> Void = { revealed.append($0) }
+    let failReveal: (String) throws -> Void = { _ in throw OS1Error.message("no desktop") }
+    guard codexDesktopVisibility(mode: .always, desktopRunning: false, reveal: recordReveal, threadID: "a") == "desktop_not_running",
+          codexDesktopVisibility(mode: .always, desktopRunning: true, reveal: recordReveal, threadID: "b") == "revealed",
+          codexDesktopVisibility(mode: .never, desktopRunning: true, reveal: recordReveal, threadID: "c") == "not_revealed",
+          codexDesktopVisibility(mode: .always, desktopRunning: true, reveal: failReveal, threadID: "d").hasPrefix("reveal_failed: "),
+          revealed == ["b"],
+          DesktopRevealMode(rawValue: "never") == .never,
+          DesktopRevealMode(rawValue: "auto") == nil,
+          codexWriterConflictMessage(
+              OS1Error.message("Codex desktop protocol rejected thread/resume: thread x already has an active writer"),
+              threadID: "x"
+          ) == "Codex Desktop currently owns Codex session x",
+          codexWriterConflictMessage(OS1Error.message("Codex desktop protocol rejected thread/resume"), threadID: "x") == nil else {
+        throw OS1Error.message("Codex desktop reveal policy validation failed")
+    }
+    let transcriptRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("os1-self-test-\(UUID().uuidString)", isDirectory: true)
+    let transcriptProject = transcriptRoot.appendingPathComponent("-Users-example-project", isDirectory: true)
+    try FileManager.default.createDirectory(at: transcriptProject, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: transcriptRoot) }
+    let transcriptSession = "8eaa48c6-af59-4f4c-a2be-9a0ec3b6fc21"
+    let transcriptURL = transcriptProject.appendingPathComponent("\(transcriptSession).jsonl")
+    try Data("""
+    {"type":"user","message":{"role":"user","content":"hello"}}
+    {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The answer is 42."}]}}
+    {"type":"result","result":"The answer is 42."}
+
+    """.utf8).write(to: transcriptURL)
+    FileManager.default.createFile(atPath: transcriptProject.appendingPathComponent("empty.jsonl").path, contents: nil)
+    let canonicalTranscript = transcriptURL.resolvingSymlinksInPath().path
+    // Directory enumeration resolves the temporary directory's /var symlink,
+    // so compare canonical paths.
+    func foundTranscript(modifiedAfter: Date? = nil, containing: String? = nil) -> Bool {
+        claudeTranscriptPath(
+            sessionID: transcriptSession,
+            projectsRoot: transcriptRoot,
+            modifiedAfter: modifiedAfter,
+            containing: containing
+        ).map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path } == canonicalTranscript
+    }
+    guard foundTranscript(),
+          foundTranscript(modifiedAfter: Date().addingTimeInterval(-60)),
+          !foundTranscript(modifiedAfter: Date().addingTimeInterval(120)),
+          foundTranscript(containing: "The answer is 42.\n"),
+          foundTranscript(containing: "answer is"),
+          !foundTranscript(containing: "The answer is 43."),
+          !foundTranscript(containing: "hello"),
+          claudeTranscriptPath(sessionID: "empty", projectsRoot: transcriptRoot) == nil,
+          claudeTranscriptPath(sessionID: "missing", projectsRoot: transcriptRoot) == nil else {
+        throw OS1Error.message("Claude transcript lookup validation failed")
     }
     let claudeSessionID = "01a05b4d-f206-7c71-bd11-128b24e755e0"
     let allowedClaudeResult = Data("""
@@ -1421,6 +1776,7 @@ func usage() {
       os1 run --workspace /path/to/project --prompt "task" [--provider auto|codex|claude]
               [--codex-session-id UUID] [--claude-session-id UUID]
               [--codex-capacity 0...100] [--claude-capacity 0...100]
+              [--desktop-reveal never|always]
       os1 version
     """)
 }
@@ -1432,7 +1788,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.6.7")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.6.8")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":
@@ -1451,6 +1807,7 @@ struct OS1Main {
                 var codexCapacity = 30
                 var claudeCapacity = 100
                 var outputFormat = "text"
+                var desktopReveal = DesktopRevealMode.always
                 var index = 1
                 while index < arguments.count {
                     switch arguments[index] {
@@ -1478,6 +1835,11 @@ struct OS1Main {
                         claudeCapacity = value; index += 2
                     case "--output-format" where index + 1 < arguments.count:
                         outputFormat = arguments[index + 1]; index += 2
+                    case "--desktop-reveal" where index + 1 < arguments.count:
+                        guard let mode = DesktopRevealMode(rawValue: arguments[index + 1]) else {
+                            throw OS1Error.message("--desktop-reveal must be never or always")
+                        }
+                        desktopReveal = mode; index += 2
                     default: throw OS1Error.message("Unknown OS-1 argument")
                     }
                 }
@@ -1502,7 +1864,8 @@ struct OS1Main {
                     claudeSessionID: claudeSessionID,
                     codexCapacity: codexCapacity,
                     claudeCapacity: claudeCapacity,
-                    progress: outputFormat == "text"
+                    progress: outputFormat == "text",
+                    desktopReveal: desktopReveal
                 )
                 if outputFormat == "json" {
                     let encoder = JSONEncoder()
