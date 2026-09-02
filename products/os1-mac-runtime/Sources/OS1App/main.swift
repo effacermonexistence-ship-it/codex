@@ -1230,7 +1230,7 @@ private enum Theme {
     static let pink = Color(red: 0.93, green: 0.70, blue: 0.80)
     static let pinkDeep = Color(red: 0.22, green: 0.10, blue: 0.16)
     static let green = Color(red: 0.28, green: 0.93, blue: 0.55)
-    static let constellationImage: NSImage? = {
+    @MainActor static let constellationImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "Constellation", withExtension: "png") else {
             return nil
         }
