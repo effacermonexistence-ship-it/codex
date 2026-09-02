@@ -51,7 +51,56 @@ func isSafeModelIdentifier(_ value: String) -> Bool {
 }
 
 func isSupportedEffort(_ value: String) -> Bool {
-    ["low", "medium", "high", "xhigh", "max"].contains(value)
+    ["low", "medium", "high", "xhigh", "max", "ultra"].contains(value)
+}
+
+struct CodexModelCapability: Codable, Equatable {
+    let slug: String
+    let defaultEffort: String
+    let supportedEfforts: [String]
+    let priority: Int
+
+    enum CodingKeys: String, CodingKey {
+        case slug, priority
+        case defaultEffort = "default_effort"
+        case supportedEfforts = "supported_efforts"
+    }
+}
+
+private struct CachedCodexReasoningLevel: Decodable {
+    let effort: String
+}
+
+private struct CachedCodexUpgrade: Decodable {
+    let retirementAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case retirementAt = "retirement_at"
+    }
+}
+
+private struct CachedCodexModel: Decodable {
+    let slug: String
+    let visibility: String
+    let priority: Int
+    let defaultReasoningLevel: String
+    let supportedReasoningLevels: [CachedCodexReasoningLevel]
+    let upgrade: CachedCodexUpgrade?
+
+    enum CodingKeys: String, CodingKey {
+        case slug, visibility, priority, upgrade
+        case defaultReasoningLevel = "default_reasoning_level"
+        case supportedReasoningLevels = "supported_reasoning_levels"
+    }
+}
+
+private struct CachedCodexCatalog: Decodable {
+    let models: [CachedCodexModel]
+}
+
+struct ActiveCodexCatalog {
+    let models: [CodexModelCapability]
+    let source: String
 }
 
 struct RuntimeConfig: Codable {
@@ -165,6 +214,7 @@ struct LocalRouteRequest: Codable {
     let attempt: Int
     let retryProvider: String?
     let stateDirectory: String?
+    let availableCodexModels: [CodexModelCapability]
 
     enum CodingKeys: String, CodingKey {
         case prompt, attempt
@@ -173,6 +223,7 @@ struct LocalRouteRequest: Codable {
         case claudeCapacity = "claude_capacity"
         case retryProvider = "retry_provider"
         case stateDirectory = "state_dir"
+        case availableCodexModels = "available_codex_models"
     }
 }
 
@@ -242,6 +293,49 @@ struct LocalVerification: Codable {
         case schema, outcome
         case reasonCode = "reason_code"
         case nextProvider = "next_provider"
+        case policySHA256 = "policy_sha256"
+    }
+}
+
+struct LocalExecuteRequest: Codable {
+    let routeID: String
+    let prompt: String
+    let stateDirectory: String?
+
+    enum CodingKeys: String, CodingKey {
+        case prompt
+        case routeID = "route_id"
+        case stateDirectory = "state_dir"
+    }
+}
+
+struct LocalExecuteResponse: Codable {
+    let schema: Int
+    let routeID: String
+    let output: String
+    let resultSHA256: String
+    let receiptPath: String
+    let policySHA256: String
+
+    enum CodingKeys: String, CodingKey {
+        case schema, output
+        case routeID = "route_id"
+        case resultSHA256 = "result_sha256"
+        case receiptPath = "receipt_path"
+        case policySHA256 = "policy_sha256"
+    }
+}
+
+private struct LocalDeterministicReceipt: Decodable {
+    let schema: Int
+    let routeID: String
+    let resultSHA256: String
+    let policySHA256: String
+
+    enum CodingKeys: String, CodingKey {
+        case schema
+        case routeID = "route_id"
+        case resultSHA256 = "result_sha256"
         case policySHA256 = "policy_sha256"
     }
 }
@@ -912,6 +1006,76 @@ func findExecutable(_ name: String) throws -> String {
     throw OS1Error.message("Required command is missing: \(name)")
 }
 
+private func parseCodexRetirementDate(_ value: String) -> Date? {
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) { return date }
+    return ISO8601DateFormatter().date(from: value)
+}
+
+func activeCodexCatalog(
+    config: RuntimeConfig,
+    cacheURL: URL? = nil,
+    now: Date = Date()
+) throws -> ActiveCodexCatalog {
+    let url = cacheURL ?? FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex/models_cache.json")
+    if let data = try? Data(contentsOf: url),
+       let cache = try? JSONDecoder().decode(CachedCodexCatalog.self, from: data) {
+        var seen = Set<String>()
+        let active = cache.models.compactMap { model -> CodexModelCapability? in
+            guard model.visibility == "list", isSafeModelIdentifier(model.slug),
+                  !seen.contains(model.slug) else { return nil }
+            if let retirement = model.upgrade?.retirementAt,
+               let retirementDate = parseCodexRetirementDate(retirement), retirementDate <= now {
+                return nil
+            }
+            let efforts = Array(NSOrderedSet(array: model.supportedReasoningLevels.map(\.effort)))
+                .compactMap { $0 as? String }
+                .filter { isSupportedEffort($0) && $0 != "none" }
+            guard !efforts.isEmpty, efforts.contains(model.defaultReasoningLevel) else { return nil }
+            seen.insert(model.slug)
+            return CodexModelCapability(
+                slug: model.slug,
+                defaultEffort: model.defaultReasoningLevel,
+                supportedEfforts: efforts,
+                priority: model.priority
+            )
+        }.sorted { ($0.priority, $0.slug) < ($1.priority, $1.slug) }
+        if !active.isEmpty {
+            return ActiveCodexCatalog(models: active, source: url.path)
+        }
+    }
+
+    guard let profile = config.modelProfiles?.codex else {
+        throw OS1Error.message("Codex model catalog is unavailable; open Codex once, then retry")
+    }
+    var seen = Set<String>()
+    let fallback = [profile.deep, profile.standard, profile.efficient].compactMap { slug -> CodexModelCapability? in
+        guard isSafeModelIdentifier(slug), seen.insert(slug).inserted else { return nil }
+        let supportsUltra = slug == "gpt-5.6-sol" || slug == "gpt-5.6-terra" || slug == "gpt-daybreak-blue-latest"
+        return CodexModelCapability(
+            slug: slug,
+            defaultEffort: slug == profile.efficient ? "low" : "medium",
+            supportedEfforts: ["low", "medium", "high", "xhigh", "max"] + (supportsUltra ? ["ultra"] : []),
+            priority: fallbackPriority(slug)
+        )
+    }.sorted { ($0.priority, $0.slug) < ($1.priority, $1.slug) }
+    guard !fallback.isEmpty else {
+        throw OS1Error.message("Codex model catalog is empty; reinstall OS-1")
+    }
+    return ActiveCodexCatalog(models: fallback, source: "OS-1 fallback profile")
+}
+
+private func fallbackPriority(_ slug: String) -> Int {
+    switch slug {
+    case "gpt-5.6-sol": return 1
+    case "gpt-5.6-terra": return 2
+    case "gpt-5.6-luna": return 3
+    default: return 100
+    }
+}
+
 func privateCoreCall<Request: Encodable, Response: Decodable>(
     _ mode: String,
     request: Request,
@@ -920,7 +1084,7 @@ func privateCoreCall<Request: Encodable, Response: Decodable>(
 ) throws -> Response {
     guard (config.routingMode ?? "remote") == "local_private",
           let corePath = RuntimeConfig.resolvedLocalPrivateCorePath(configuredPath: config.localPrivateCorePath),
-          ["route", "verify"].contains(mode) else {
+          ["route", "execute", "verify"].contains(mode) else {
         throw OS1Error.message("OS-1 local private core is unavailable; reinstall OS-1")
     }
     let python = try findExecutable("python3")
@@ -936,20 +1100,41 @@ func privateCoreCall<Request: Encodable, Response: Decodable>(
     }
 }
 
-func validateLocalRoute(_ decision: LocalRouteDecision) throws {
+func validateLocalRoute(_ decision: LocalRouteDecision, codexModels: [CodexModelCapability]) throws {
     let sha = /^[0-9a-f]{64}$/
     guard decision.schema == 1,
-          decision.routeID.hasPrefix("rcc-local-"), decision.routeID.count == 42,
-          ["codex", "claude"].contains(decision.provider),
-          ["agent_run", "agent_run_efficient", "agent_run_deep"].contains(decision.action),
+          decision.routeID.wholeMatch(of: /^rcc-local-[0-9a-f]{32}$/) != nil,
+          ["local", "codex", "claude"].contains(decision.provider),
+          ["deterministic_compute", "agent_run", "agent_run_efficient", "agent_run_deep"].contains(decision.action),
           ["read_only", "workspace_write", "full_access"].contains(decision.permissionProfile),
-          isSafeModelIdentifier(decision.model), isSupportedEffort(decision.effort),
+          isSafeModelIdentifier(decision.model),
+          isSupportedEffort(decision.effort) || decision.effort == "none",
           ["efficient", "standard", "frontier", "maximum"].contains(decision.tier),
           ["deterministic_exact", "executed_change", "executed_review", "source_review", "native_record"].contains(decision.verificationProfile),
           decision.policySHA256.wholeMatch(of: sha) != nil,
           decision.engineSHA256.wholeMatch(of: sha) != nil,
           decision.authoritySHA256.wholeMatch(of: sha) != nil else {
         throw OS1Error.message("OS-1 local RCC route contract rejected")
+    }
+    if decision.provider == "local" {
+        guard !decision.providerPinned,
+              decision.action == "deterministic_compute",
+              decision.model == "local-deterministic",
+              decision.effort == "none",
+              decision.permissionProfile == "read_only",
+              decision.verificationProfile == "deterministic_exact" else {
+            throw OS1Error.message("OS-1 local deterministic route contract rejected")
+        }
+    } else {
+        guard decision.action != "deterministic_compute", decision.effort != "none" else {
+            throw OS1Error.message("OS-1 provider route contract rejected")
+        }
+    }
+    if decision.provider == "codex" {
+        guard let capability = codexModels.first(where: { $0.slug == decision.model }),
+              capability.supportedEfforts.contains(decision.effort) else {
+            throw OS1Error.message("OS-1 rejected a Codex model or effort not exposed by this Codex installation")
+        }
     }
 }
 
@@ -1149,7 +1334,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         _ = try request(
             "initialize",
             params: [
-                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.7.7"],
+                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.7.8"],
                 "capabilities": ["experimentalApi": true],
             ],
             deadline: deadline
@@ -1899,6 +2084,82 @@ func execute(
     )
 }
 
+func executeLocalDeterministic(
+    decision: LocalRouteDecision,
+    prompt: String,
+    workspace: String,
+    config: RuntimeConfig
+) throws -> ProviderExecution {
+    let started = Date()
+    let response: LocalExecuteResponse = try privateCoreCall(
+        "execute",
+        request: LocalExecuteRequest(
+            routeID: decision.routeID,
+            prompt: prompt,
+            stateDirectory: config.localPrivateStatePath
+        ),
+        config: config,
+        as: LocalExecuteResponse.self
+    )
+    let digest = sha256Hex(Data(response.output.utf8))
+    let stateRoot = URL(fileURLWithPath: config.localPrivateStatePath ?? FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/OS-1/private-state", isDirectory: true).path)
+        .standardizedFileURL
+        .resolvingSymlinksInPath()
+    let receiptURL = URL(fileURLWithPath: response.receiptPath)
+        .standardizedFileURL
+        .resolvingSymlinksInPath()
+    let statePrefix = stateRoot.path.hasSuffix("/") ? stateRoot.path : stateRoot.path + "/"
+    guard response.schema == 1,
+          response.routeID == decision.routeID,
+          response.policySHA256 == decision.policySHA256,
+          !response.output.isEmpty,
+          response.resultSHA256 == digest,
+          receiptURL.path.hasPrefix(statePrefix),
+          FileManager.default.isReadableFile(atPath: receiptURL.path) else {
+        throw OS1Error.message("OS-1 local deterministic execution receipt rejected")
+    }
+    let persisted = try JSONDecoder().decode(LocalDeterministicReceipt.self, from: Data(contentsOf: receiptURL))
+    guard persisted.schema == 1,
+          persisted.routeID == decision.routeID,
+          persisted.resultSHA256 == digest,
+          persisted.policySHA256 == decision.policySHA256 else {
+        throw OS1Error.message("OS-1 local deterministic receipt read-back failed")
+    }
+    let raw = String(decision.routeID.suffix(32))
+    let part1 = String(raw.prefix(8))
+    let part2 = String(raw.dropFirst(8).prefix(4))
+    let part3 = String(raw.dropFirst(12).prefix(4))
+    let part4 = String(raw.dropFirst(16).prefix(4))
+    let part5 = String(raw.dropFirst(20).prefix(12))
+    let uuidText = "\(part1)-\(part2)-\(part3)-\(part4)-\(part5)"
+    guard let sessionID = UUID(uuidString: uuidText)?.uuidString.lowercased() else {
+        throw OS1Error.message("OS-1 local deterministic route identity rejected")
+    }
+    return ProviderExecution(
+        artifact: Artifact(
+            provider: decision.provider,
+            action: decision.action,
+            permissionProfile: decision.permissionProfile,
+            effort: decision.effort,
+            executorContractVersion: config.executorContract.version,
+            executorContractSHA256: config.executorContract.sha256,
+            exitCode: 0,
+            output: response.output,
+            stderr: "",
+            durationMS: Int64(Date().timeIntervalSince(started) * 1_000),
+            workspaceDiffHash: workspaceHash(workspace)
+        ),
+        sessionID: sessionID,
+        nativeRecord: NativeRecordEvidence(
+            turnID: decision.routeID,
+            recordPath: receiptURL.path,
+            persistence: "verified",
+            desktopVisibility: "local_only"
+        )
+    )
+}
+
 func runLocalTask(
     prompt: String,
     workspace: String,
@@ -1912,6 +2173,7 @@ func runLocalTask(
     desktopReveal: DesktopRevealMode,
     config: RuntimeConfig
 ) throws -> RunSummary {
+    let codexCatalog = try activeCodexCatalog(config: config)
     var steps: [RunStepSummary] = []
     var nativeSessions = [
         "codex": try normalizedSessionID(codexSessionID),
@@ -1931,12 +2193,13 @@ func runLocalTask(
                 claudeCapacity: claudeCapacity,
                 attempt: attempt,
                 retryProvider: retryProvider,
-                stateDirectory: config.localPrivateStatePath
+                stateDirectory: config.localPrivateStatePath,
+                availableCodexModels: codexCatalog.models
             ),
             config: config,
             as: LocalRouteDecision.self
         )
-        try validateLocalRoute(decision)
+        try validateLocalRoute(decision, codexModels: codexCatalog.models)
         let ticket = localTicket(decision, sequence: attempt)
         let beforeHash = workspaceHash(workspace)
         let executionPrompt: String
@@ -1950,17 +2213,26 @@ func runLocalTask(
         }
         let execution: ProviderExecution
         do {
-            execution = try execute(
-                ticket: ticket,
-                prompt: executionPrompt,
-                workspace: workspace,
-                timeout: config.executionTimeoutSeconds,
-                providerSessionID: nativeSessions[decision.provider] ?? nil,
-                model: decision.model,
-                effort: decision.effort,
-                executorContract: config.executorContract,
-                desktopReveal: desktopReveal
-            )
+            if decision.provider == "local" {
+                execution = try executeLocalDeterministic(
+                    decision: decision,
+                    prompt: prompt,
+                    workspace: workspace,
+                    config: config
+                )
+            } else {
+                execution = try execute(
+                    ticket: ticket,
+                    prompt: executionPrompt,
+                    workspace: workspace,
+                    timeout: config.executionTimeoutSeconds,
+                    providerSessionID: nativeSessions[decision.provider] ?? nil,
+                    model: decision.model,
+                    effort: decision.effort,
+                    executorContract: config.executorContract,
+                    desktopReveal: desktopReveal
+                )
+            }
         } catch {
             guard !decision.providerPinned, attempt < config.maximumSteps else { throw error }
             let fallbackProvider = decision.provider == "codex" ? "claude" : "codex"
@@ -1971,7 +2243,9 @@ func runLocalTask(
             }
             continue
         }
-        nativeSessions[decision.provider] = execution.sessionID
+        if decision.provider != "local" {
+            nativeSessions[decision.provider] = execution.sessionID
+        }
         let artifact = execution.artifact
         let afterHash = workspaceHash(workspace)
         let verification: LocalVerification = try privateCoreCall(
@@ -1996,7 +2270,7 @@ func runLocalTask(
         )
         guard verification.schema == 1,
               ["pass", "retry", "fail"].contains(verification.outcome),
-              ["codex", "claude"].contains(verification.nextProvider),
+              ["local", "codex", "claude"].contains(verification.nextProvider),
               verification.policySHA256 == decision.policySHA256 else {
             throw OS1Error.message("OS-1 local REVAS receipt contract rejected")
         }
@@ -2178,28 +2452,31 @@ func doctor() throws {
     }
     for command in ["codex", "claude"] { _ = try findExecutable(command) }
     if (config.routingMode ?? "remote") == "local_private" {
+        let catalog = try activeCodexCatalog(config: config)
         let decision: LocalRouteDecision = try privateCoreCall(
             "route",
             request: LocalRouteRequest(
-                prompt: "코덱스한테 1 + 1 시켜봐",
+                prompt: "원플러스 원이 뭐야?",
                 providerPreference: "auto",
                 codexCapacity: 30,
                 claudeCapacity: 100,
                 attempt: 1,
                 retryProvider: nil,
-                stateDirectory: config.localPrivateStatePath
+                stateDirectory: config.localPrivateStatePath,
+                availableCodexModels: catalog.models
             ),
             config: config,
             as: LocalRouteDecision.self
         )
-        try validateLocalRoute(decision)
-        guard decision.provider == "codex", decision.model == "gpt-5.6-luna",
-              decision.effort == "low", decision.action == "agent_run_efficient" else {
+        try validateLocalRoute(decision, codexModels: catalog.models)
+        guard decision.provider == "local", decision.model == "local-deterministic",
+              decision.effort == "none", decision.action == "deterministic_compute" else {
             throw OS1Error.message("OS-1 local RCC route probe failed")
         }
         print("OS-1 configuration: OK (local private RCC)")
         print("RCC source lock: \(decision.engineSHA256)")
-        print("Codex and Claude: available")
+        print("Codex catalog: \(catalog.models.count) active models from \(catalog.source)")
+        print("Local exact executor, Codex, and Claude: available")
         return
     }
     let key = try SigningKey.loadOrCreate()
@@ -2458,6 +2735,25 @@ func selfTest() throws {
           try tomlStringLiteral("line one\n\"line two\"").hasPrefix("\"") else {
         throw OS1Error.message("Model or effort profile resolution failed")
     }
+    let modelCacheURL = transcriptRoot.appendingPathComponent("models-cache.json")
+    try Data("""
+    {"models":[
+      {"slug":"gpt-current","visibility":"list","priority":2,"default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"ultra"}],"upgrade":null},
+      {"slug":"gpt-hidden","visibility":"hide","priority":1,"default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"}],"upgrade":null},
+      {"slug":"gpt-retired","visibility":"list","priority":3,"default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"medium"}],"upgrade":{"retirement_at":"2026-01-01T00:00:00Z"}},
+      {"slug":"gpt-active-old","visibility":"list","priority":4,"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"high"}],"upgrade":{"retirement_at":"2099-01-01T00:00:00Z"}}
+    ]}
+    """.utf8).write(to: modelCacheURL)
+    let cachedCatalog = try activeCodexCatalog(
+        config: config,
+        cacheURL: modelCacheURL,
+        now: ISO8601DateFormatter().date(from: "2026-09-02T00:00:00Z")!
+    )
+    guard cachedCatalog.models.map(\.slug) == ["gpt-current", "gpt-active-old"],
+          cachedCatalog.models[0].supportedEfforts == ["low", "medium", "ultra"],
+          !isSupportedEffort("none"), isSupportedEffort("ultra") else {
+        throw OS1Error.message("Active Codex model catalog validation failed")
+    }
     print("OS-1 native session, permission orchestration, model, effort, and executor contract self-test: OK")
 }
 
@@ -2483,7 +2779,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.7.7")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.7.8")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":

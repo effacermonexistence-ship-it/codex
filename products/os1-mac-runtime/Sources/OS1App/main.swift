@@ -123,6 +123,31 @@ private func providerIntentSelfTest() throws {
           composerText(base: "first line\n", dictated: "둘째 줄") == "first line\n둘째 줄" else {
         throw RunnerError.message("OS-1 voice dictation composer merge self-test failed.")
     }
+
+    let localStep = AppRunStep(
+        sequence: 1,
+        provider: "local",
+        action: "deterministic_compute",
+        model: "local-deterministic",
+        effort: "none",
+        revasDisposition: "adopted",
+        sessionID: "8eaa48c6-af59-4f4c-a2be-9a0ec3b6fc21",
+        permissionProfile: "read_only",
+        exitCode: 0,
+        output: "2",
+        stderr: "",
+        durationMS: 1,
+        nativeRecord: AppNativeRecord(
+            turnID: "rcc-local-8eaa48c6af594f4ca2be9a0ec3b6fc21",
+            recordPath: "/tmp/exact.json",
+            persistence: "verified",
+            desktopVisibility: "local_only"
+        )
+    )
+    guard backendTierLabel(action: localStep.action, provider: localStep.provider) == "Exact local RCC executor",
+          nativeRecordReceipt(localStep).contains("local exact receipt persisted") else {
+        throw RunnerError.message("OS-1 local exact execution UI self-test failed.")
+    }
 }
 
 private enum ComposerReturnAction: Equatable {
@@ -867,6 +892,7 @@ private func nativeRecordReceipt(_ step: AppRunStep) -> String {
         parts.append("native record \(record.persistence)")
     }
     switch record.desktopVisibility {
+    case "local_only": parts.append("local exact receipt persisted")
     case "revealed": parts.append("Codex Desktop: synced and opened")
     case "claude_revealed": parts.append("Claude Desktop: synced and opened")
     case "not_revealed": parts.append("\(step.provider == "claude" ? "Claude" : "Codex") Desktop: kept in background")
@@ -892,6 +918,9 @@ private enum RunnerError: LocalizedError {
 }
 
 private func backendTierLabel(action: String, provider: String) -> String {
+    if provider == "local" || action == "deterministic_compute" {
+        return "Exact local RCC executor"
+    }
     let engine = provider == "codex" ? "Codex" : "Claude"
     switch action {
     case "agent_run_efficient": return "Efficient \(engine) backend"
@@ -1585,7 +1614,8 @@ private final class SessionStore: ObservableObject {
                         text: String(message.text.prefix(120_000)),
                         provider: message.provider,
                         permissionProfile: message.permissionProfile,
-                        timestamp: message.timestamp
+                        timestamp: message.timestamp,
+                        nativeRecordVerified: message.nativeRecordVerified
                     )
                 }
                 return copy
@@ -2675,11 +2705,17 @@ private struct MessageView: View {
         case .assistant:
             VStack(alignment: .leading, spacing: 9) {
                 HStack(spacing: 7) {
-                    ProviderBrandIcon(
-                        provider: message.provider == "claude" ? .claude : .codex,
-                        size: 14,
-                        filled: false
-                    )
+                    if message.provider == "local" {
+                        Image(systemName: "function")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .frame(width: 14, height: 14)
+                    } else {
+                        ProviderBrandIcon(
+                            provider: message.provider == "claude" ? .claude : .codex,
+                            size: 14,
+                            filled: false
+                        )
+                    }
                     Text((message.provider ?? "OS-1").uppercased())
                     if let permission = message.permissionProfile {
                         Text("· \(permission.replacingOccurrences(of: "_", with: " "))")
@@ -2687,9 +2723,9 @@ private struct MessageView: View {
                     }
                 }
                 .font(.system(size: 10, weight: .bold, design: .rounded))
-                .foregroundStyle(message.provider == "claude"
-                    ? ProviderChoice.claude.tint
-                    : ProviderChoice.codex.tint)
+                .foregroundStyle(message.provider == "local"
+                    ? Theme.green
+                    : (message.provider == "claude" ? ProviderChoice.claude.tint : ProviderChoice.codex.tint))
                 Text(message.text)
                     .font(.system(size: 13))
                     .foregroundStyle(Theme.text)
