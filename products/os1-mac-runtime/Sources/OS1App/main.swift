@@ -78,6 +78,10 @@ private func explicitlyRequestedProvider(in request: String) -> ProviderChoice? 
     }
 }
 
+private func providerDisplayName(_ provider: String?) -> String {
+    provider == "local" ? "OS-1" : (provider ?? "OS-1").uppercased()
+}
+
 private func providerIntentSelfTest() throws {
     let codexRequests = [
         "코덱스한테 말시켜봐",
@@ -105,6 +109,11 @@ private func providerIntentSelfTest() throws {
             ? [] : ["last directed provider"])
     guard failures.isEmpty else {
         throw RunnerError.message("OS-1 provider intent self-test failed: \(failures.joined(separator: " | "))")
+    }
+
+    guard providerDisplayName("local") == "OS-1",
+          providerDisplayName("codex") == "CODEX" else {
+        throw RunnerError.message("OS-1 provider display-name self-test failed.")
     }
 
     guard composerReturnAction(shiftPressed: false) == .send,
@@ -1953,7 +1962,7 @@ private final class SessionStore: ObservableObject {
         let text = relevant.map { message in
             let speaker = message.role == .user
                 ? "USER"
-                : (message.provider?.uppercased() ?? "ASSISTANT")
+                : providerDisplayName(message.provider)
             return "\(speaker):\n\(String(message.text.prefix(12_000)))"
         }.joined(separator: "\n\n")
         return String(text.suffix(180_000))
@@ -2797,7 +2806,7 @@ private struct ConversationHeader: View {
         } else {
             value = store.selectedSession?.lastProvider ?? "RCC"
         }
-        return value.uppercased()
+        return providerDisplayName(value)
     }
 
     var body: some View {
@@ -3102,9 +3111,7 @@ private struct MessageView: View {
             VStack(alignment: .leading, spacing: 9) {
                 HStack(spacing: 7) {
                     if message.provider == "local" {
-                        Image(systemName: "function")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .frame(width: 14, height: 14)
+                        OmarAGILogo(size: 14)
                     } else {
                         ProviderBrandIcon(
                             provider: message.provider == "claude" ? .claude : .codex,
@@ -3112,7 +3119,7 @@ private struct MessageView: View {
                             filled: false
                         )
                     }
-                    Text((message.provider ?? "OS-1").uppercased())
+                    Text(providerDisplayName(message.provider))
                     if let permission = message.permissionProfile {
                         Text("· \(permission.replacingOccurrences(of: "_", with: " "))")
                             .foregroundStyle(Theme.muted)
