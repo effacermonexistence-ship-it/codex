@@ -4,7 +4,7 @@ set -euo pipefail
 readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly runtime_root="$(cd "$script_dir/.." && pwd)"
 readonly repository_root="$(cd "$runtime_root/../.." && pwd)"
-readonly version="${OS1_VERSION:-0.7.4}"
+readonly version="${OS1_VERSION:-0.7.5}"
 readonly output_dir="${OS1_RELEASE_OUTPUT_DIR:-$runtime_root/release}"
 readonly stage_dir="$output_dir/stage"
 readonly component_pkg="$output_dir/OS-1-component.pkg"
@@ -118,6 +118,7 @@ codesign --force --sign "$codesign_identity" --options runtime \
   --identifier com.omaragi.os1.runtime.bundled \
   "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Resources/os1"
 codesign --force --sign "$codesign_identity" --options runtime \
+  --entitlements "$runtime_root/Resources/OS1.entitlements" \
   --identifier com.omaragi.os1 "$stage_dir/Applications/Open OS-1 Codex.app"
 codesign --verify --strict --verbose=2 "$stage_dir/usr/local/bin/os1"
 codesign --verify --deep --strict --verbose=2 "$stage_dir/Applications/Open OS-1 Codex.app"
