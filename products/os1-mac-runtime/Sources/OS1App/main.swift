@@ -104,6 +104,26 @@ private func providerIntentSelfTest() throws {
     guard failures.isEmpty else {
         throw RunnerError.message("OS-1 provider intent self-test failed: \(failures.joined(separator: " | "))")
     }
+
+    guard composerReturnAction(shiftPressed: false) == .send,
+          composerReturnAction(shiftPressed: true) == .newline else {
+        throw RunnerError.message("OS-1 composer keyboard self-test failed.")
+    }
+
+    var queue = ["first", "second", "third"]
+    let drained = [queue.removeFirst(), queue.removeFirst(), queue.removeFirst()]
+    guard drained == ["first", "second", "third"], queue.isEmpty else {
+        throw RunnerError.message("OS-1 queued submission FIFO self-test failed.")
+    }
+}
+
+private enum ComposerReturnAction: Equatable {
+    case send
+    case newline
+}
+
+private func composerReturnAction(shiftPressed: Bool) -> ComposerReturnAction {
+    shiftPressed ? .newline : .send
 }
 
 private struct NativeSessionSummary: Identifiable, Sendable {
@@ -532,6 +552,37 @@ private struct SessionEnvelope: Codable {
     let sessions: [ConversationSession]
 }
 
+private struct PendingSubmission: Identifiable, Sendable {
+    let id: UUID
+    let sessionID: UUID
+    let userMessageID: UUID
+    let request: String
+    let provider: ProviderChoice
+    let workspace: String
+    let codexCapacity: Int
+    let claudeCapacity: Int
+
+    init(
+        id: UUID = UUID(),
+        sessionID: UUID,
+        userMessageID: UUID,
+        request: String,
+        provider: ProviderChoice,
+        workspace: String,
+        codexCapacity: Int,
+        claudeCapacity: Int
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.userMessageID = userMessageID
+        self.request = request
+        self.provider = provider
+        self.workspace = workspace
+        self.codexCapacity = codexCapacity
+        self.claudeCapacity = claudeCapacity
+    }
+}
+
 private struct AppNativeRecord: Decodable, Sendable {
     let turnID: String?
     let recordPath: String?
@@ -784,7 +835,9 @@ private final class SessionStore: ObservableObject {
     @Published var nativeMessages: [NativeSessionMessage] = []
     @Published var isLoadingNativeSessions = false
     @Published var isRunning = false
+    @Published private(set) var activeSessionID: UUID?
     @Published var pendingProvider: ProviderChoice?
+    @Published private(set) var queuedSubmissions: [PendingSubmission] = []
     @Published var statusText = "Ready"
     @Published var alertMessage: String?
 
@@ -806,6 +859,15 @@ private final class SessionStore: ObservableObject {
     var selectedSession: ConversationSession? {
         guard let index = selectedIndex else { return nil }
         return sessions[index]
+    }
+
+    var selectedSessionQueueCount: Int {
+        guard let selectedSessionID else { return 0 }
+        return queuedSubmissions.lazy.filter { $0.sessionID == selectedSessionID }.count
+    }
+
+    func isSessionRunning(_ sessionID: UUID) -> Bool {
+        isRunning && activeSessionID == sessionID
     }
 
     var filteredSessions: [ConversationSession] {
@@ -872,15 +934,16 @@ private final class SessionStore: ObservableObject {
     }
 
     func showClaudexHome() {
-        guard !isRunning else { return }
         surface = .auto
         chooseProvider(.auto)
-        statusText = "Claudex home · RCC auto routing"
+        statusText = isRunning
+            ? "Claudex home · a governed task is running"
+            : "Claudex home · RCC auto routing"
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func inspectBackend(_ provider: ProviderChoice) {
-        guard !isRunning, provider != .auto else { return }
+        guard provider != .auto else { return }
         surface = provider
         nativeSearch = ""
         let preferredID = provider == .codex
@@ -1041,7 +1104,7 @@ private final class SessionStore: ObservableObject {
 
     func send() {
         let request = composer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !request.isEmpty, !isRunning, let index = selectedIndex else { return }
+        guard !request.isEmpty, let index = selectedIndex else { return }
         var isDirectory: ObjCBool = false
         let workspace = sessions[index].workspace
         guard fileManager.fileExists(atPath: workspace, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -1049,49 +1112,90 @@ private final class SessionStore: ObservableObject {
             return
         }
 
-        let sessionID = sessions[index].id
         let configuredProvider = sessions[index].provider
         let provider = configuredProvider == .auto
             ? (explicitlyRequestedProvider(in: request) ?? .auto)
             : configuredProvider
-        let codexSessionID = sessions[index].codexSessionID
-        let claudeSessionID = sessions[index].claudeSessionID
-        let context = handoffContext(for: sessions[index], nextProvider: provider)
         if sessions[index].messages.isEmpty {
             sessions[index].title = title(for: request)
         }
-        sessions[index].messages.append(ChatMessage(role: .user, text: request))
+        let userMessage = ChatMessage(role: .user, text: request)
         sessions[index].updatedAt = Date()
         composer = ""
+
+        let submission = PendingSubmission(
+            sessionID: sessions[index].id,
+            userMessageID: userMessage.id,
+            request: request,
+            provider: provider,
+            workspace: workspace,
+            codexCapacity: sessions[index].effectiveCodexCapacity,
+            claudeCapacity: sessions[index].effectiveClaudeCapacity
+        )
+        if isRunning {
+            queuedSubmissions.append(submission)
+            statusText = "Task queued · \(queuedSubmissions.count) waiting"
+            save()
+            return
+        }
+        sessions[index].messages.append(userMessage)
+        start(submission)
+    }
+
+    private func start(_ submission: PendingSubmission) {
+        guard !isRunning,
+              let index = sessions.firstIndex(where: { $0.id == submission.sessionID }) else {
+            runNextQueuedSubmissionIfNeeded()
+            return
+        }
+        let existingUserMessage = sessions[index].messages.contains { $0.id == submission.userMessageID }
+        let context = handoffContext(
+            for: sessions[index],
+            nextProvider: submission.provider,
+            before: existingUserMessage ? submission.userMessageID : nil
+        )
+        if !existingUserMessage {
+            sessions[index].messages.append(ChatMessage(
+                id: submission.userMessageID,
+                role: .user,
+                text: submission.request
+            ))
+            sessions[index].updatedAt = Date()
+        }
+        let codexSessionID = sessions[index].codexSessionID
+        let claudeSessionID = sessions[index].claudeSessionID
         isRunning = true
-        pendingProvider = provider == .auto ? nil : provider
-        statusText = provider == .auto
+        activeSessionID = submission.sessionID
+        pendingProvider = submission.provider == .auto ? nil : submission.provider
+        statusText = submission.provider == .auto
             ? "RCC is choosing the best engine…"
-            : "\(provider.title) is working…"
+            : "\(submission.provider.title) is working…"
         save()
 
         Task {
             do {
                 let summary = try await OS1Runner.run(
-                    workspace: workspace,
-                    prompt: request,
-                    provider: provider,
+                    workspace: submission.workspace,
+                    prompt: submission.request,
+                    provider: submission.provider,
                     context: context,
                     codexSessionID: codexSessionID,
                     claudeSessionID: claudeSessionID,
-                    codexCapacity: sessions[index].effectiveCodexCapacity,
-                    claudeCapacity: sessions[index].effectiveClaudeCapacity
+                    codexCapacity: submission.codexCapacity,
+                    claudeCapacity: submission.claudeCapacity
                 )
-                guard let target = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+                guard let target = sessions.firstIndex(where: { $0.id == submission.sessionID }) else {
+                    throw RunnerError.message("The queued OS-1 session no longer exists.")
+                }
                 if summary.status != "complete" {
                     throw RunnerError.message("OS-1 did not return a completed governed run.")
                 }
-                if provider != .auto, summary.steps.isEmpty {
-                    throw RunnerError.message("OS-1 did not create or resume the requested \(provider.title) backend session.")
+                if submission.provider != .auto, summary.steps.isEmpty {
+                    throw RunnerError.message("OS-1 did not create or resume the requested \(submission.provider.title) backend session.")
                 }
-                if provider != .auto,
-                   summary.steps.contains(where: { $0.provider != provider.rawValue }) {
-                    throw RunnerError.message("OS-1 rejected a backend mismatch. The request targeted \(provider.title), but a different backend answered.")
+                if submission.provider != .auto,
+                   summary.steps.contains(where: { $0.provider != submission.provider.rawValue }) {
+                    throw RunnerError.message("OS-1 rejected a backend mismatch. The request targeted \(submission.provider.title), but a different backend answered.")
                 }
                 if summary.steps.contains(where: { UUID(uuidString: $0.sessionID) == nil }) {
                     throw RunnerError.message("OS-1 rejected an invalid native backend session link.")
@@ -1100,7 +1204,7 @@ private final class SessionStore: ObservableObject {
                     sessions[target].messages.append(ChatMessage(
                         role: .assistant,
                         text: "The governed route completed without an additional model step.",
-                        provider: provider.rawValue
+                        provider: submission.provider.rawValue
                     ))
                 }
                 for step in summary.steps {
@@ -1134,18 +1238,31 @@ private final class SessionStore: ObservableObject {
                     ? "Native record verified · evidence recorded"
                     : "Native record unverified · check the receipt"
             } catch {
-                guard let target = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
-                sessions[target].messages.append(ChatMessage(
-                    role: .system,
-                    text: error.localizedDescription
-                ))
-                sessions[target].updatedAt = Date()
+                if let target = sessions.firstIndex(where: { $0.id == submission.sessionID }) {
+                    sessions[target].messages.append(ChatMessage(
+                        role: .system,
+                        text: error.localizedDescription
+                    ))
+                    sessions[target].updatedAt = Date()
+                }
                 statusText = "Needs attention"
             }
             isRunning = false
+            activeSessionID = nil
             pendingProvider = nil
             save()
+            runNextQueuedSubmissionIfNeeded()
         }
+    }
+
+    private func runNextQueuedSubmissionIfNeeded() {
+        guard !isRunning, !queuedSubmissions.isEmpty else { return }
+        let next = queuedSubmissions.removeFirst()
+        guard sessions.contains(where: { $0.id == next.sessionID }) else {
+            runNextQueuedSubmissionIfNeeded()
+            return
+        }
+        start(next)
     }
 
     private func title(for request: String) -> String {
@@ -1153,10 +1270,21 @@ private final class SessionStore: ObservableObject {
         return String(firstLine.prefix(48))
     }
 
-    private func handoffContext(for session: ConversationSession, nextProvider: ProviderChoice) -> String {
+    private func handoffContext(
+        for session: ConversationSession,
+        nextProvider: ProviderChoice,
+        before userMessageID: UUID? = nil
+    ) -> String {
         guard !session.messages.isEmpty else { return "" }
         if nextProvider != .auto, session.lastProvider == nextProvider.rawValue { return "" }
-        let relevant = session.messages.filter { $0.role == .user || $0.role == .assistant }.suffix(16)
+        let boundedMessages: ArraySlice<ChatMessage>
+        if let userMessageID,
+           let messageIndex = session.messages.firstIndex(where: { $0.id == userMessageID }) {
+            boundedMessages = session.messages[..<messageIndex]
+        } else {
+            boundedMessages = session.messages[...]
+        }
+        let relevant = boundedMessages.filter { $0.role == .user || $0.role == .assistant }.suffix(16)
         let text = relevant.map { message in
             let speaker = message.role == .user
                 ? "USER"
@@ -1230,6 +1358,11 @@ private enum Theme {
     static let pink = Color(red: 0.93, green: 0.70, blue: 0.80)
     static let pinkDeep = Color(red: 0.22, green: 0.10, blue: 0.16)
     static let green = Color(red: 0.28, green: 0.93, blue: 0.55)
+    static let radiusShell: CGFloat = 22
+    static let radiusPanel: CGFloat = 18
+    static let radiusControl: CGFloat = 13
+    static let radiusMessage: CGFloat = 16
+    static let radiusComposer: CGFloat = 22
     @MainActor static let constellationImage: NSImage? = {
         guard let url = Bundle.main.url(forResource: "Constellation", withExtension: "png") else {
             return nil
@@ -1364,7 +1497,12 @@ private struct RootView: View {
                         }
                     }
                     .background(Theme.background.opacity(0.97))
-                    .overlay(Rectangle().stroke(Theme.borderStrong, lineWidth: 1))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.radiusShell, style: .continuous)
+                            .stroke(Theme.borderStrong, lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusShell, style: .continuous))
+                    .shadow(color: Color.black.opacity(0.42), radius: 22, y: 12)
                 }
                 .padding(12)
             }
@@ -1438,7 +1576,6 @@ private struct ProviderRail: View {
                 OmarAGILogo(size: 48)
             }
             .buttonStyle(.plain)
-            .disabled(store.isRunning)
             .help("Claudex home")
             .accessibilityLabel("Claudex home")
             .padding(.bottom, 8)
@@ -1451,7 +1588,7 @@ private struct ProviderRail: View {
                     linked: provider == .codex
                         ? store.selectedSession?.codexSessionID != nil
                         : store.selectedSession?.claudeSessionID != nil,
-                    disabled: store.isRunning
+                    disabled: false
                 ) { store.inspectBackend(provider) }
             }
 
@@ -1500,9 +1637,10 @@ private struct BackendStatus: View {
             .frame(width: 58, height: 80)
             .background(linked ? provider.tint.opacity(selected ? 0.13 : (active ? 0.08 : 0.025)) : Color.black.opacity(0.25))
             .overlay(
-                Rectangle()
+                RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
                     .stroke(linked ? provider.tint.opacity(selected || active ? 0.75 : 0.25) : Theme.border, lineWidth: selected ? 1.3 : 1)
             )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
         }
         .buttonStyle(.plain)
         .disabled(disabled)
@@ -1557,7 +1695,11 @@ private struct NativeSessionBrowser: View {
                 .padding(.horizontal, 16)
                 .frame(height: 48)
                 .background(Color.black.opacity(0.24))
-                .overlay(Rectangle().stroke(Theme.borderStrong))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                        .stroke(Theme.borderStrong)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
                 .padding(.horizontal, 20)
                 .padding(.bottom, 16)
 
@@ -1771,9 +1913,10 @@ private struct NativeMessageCard: View {
             .padding(16)
             .background(message.role == .user ? Color.black.opacity(0.5) : provider.tint.opacity(0.025))
             .overlay(
-                Rectangle()
+                RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous)
                     .stroke(message.role == .user ? Theme.borderStrong : provider.tint.opacity(0.18))
             )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous))
             if message.role != .user { Spacer(minLength: 60) }
         }
     }
@@ -1831,7 +1974,11 @@ private struct SessionSidebar: View {
                     .padding(.horizontal, 16)
                     .frame(height: 54)
                     .background(Color.black.opacity(0.24))
-                    .overlay(Rectangle().stroke(Theme.borderStrong))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                            .stroke(Theme.borderStrong)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 20)
@@ -1844,7 +1991,11 @@ private struct SessionSidebar: View {
             .padding(.horizontal, 16)
             .frame(height: 48)
             .background(Color.black.opacity(0.24))
-            .overlay(Rectangle().stroke(Theme.borderStrong))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                    .stroke(Theme.borderStrong)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
             .padding(.horizontal, 20)
             .padding(.top, 12)
 
@@ -1945,7 +2096,11 @@ private struct ConversationView: View {
                 if session.messages.isEmpty {
                     WelcomeView(store: store, session: session)
                 } else {
-                    MessageTimeline(session: session, isRunning: store.isRunning)
+                    MessageTimeline(
+                        session: session,
+                        isRunning: store.isSessionRunning(session.id),
+                        queuedSubmissions: store.queuedSubmissions.filter { $0.sessionID == session.id }
+                    )
                 }
                 ComposerView(store: store, session: session)
             }
@@ -1957,10 +2112,20 @@ private struct ConversationView: View {
 private struct ConversationHeader: View {
     @ObservedObject var store: SessionStore
 
+    private var providerLabel: String {
+        let value: String
+        if store.activeSessionID == store.selectedSessionID {
+            value = store.pendingProvider?.rawValue ?? store.selectedSession?.lastProvider ?? "RCC"
+        } else {
+            value = store.selectedSession?.lastProvider ?? "RCC"
+        }
+        return value.uppercased()
+    }
+
     var body: some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("\((store.pendingProvider?.rawValue ?? store.selectedSession?.lastProvider ?? "RCC").uppercased()) · \(store.selectedSession?.title ?? "OS-1 CLAUDEX")")
+                Text("\(providerLabel) · \(store.selectedSession?.title ?? "OS-1 CLAUDEX")")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
@@ -2018,7 +2183,11 @@ private struct ConversationHeader: View {
                     .padding(.horizontal, 10)
                     .frame(height: 35)
                     .background(Color.black.opacity(0.3))
-                    .overlay(Rectangle().stroke(Theme.border))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                            .stroke(Theme.border)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
@@ -2035,7 +2204,11 @@ private struct ConversationHeader: View {
                     .padding(.horizontal, 11)
                     .frame(height: 35)
                     .background(Color.black.opacity(0.3))
-                    .overlay(Rectangle().stroke(Theme.border))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                            .stroke(Theme.border)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .disabled(store.isRunning)
@@ -2106,7 +2279,11 @@ private struct WelcomeView: View {
                             .padding(.horizontal, 14)
                             .frame(height: 46)
                             .background(Color.black.opacity(0.3))
-                            .overlay(Rectangle().stroke(Theme.border))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                                    .stroke(Theme.border)
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
                         }
                         .buttonStyle(.plain)
                     }
@@ -2141,13 +2318,18 @@ private struct WelcomeStep: View {
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 108, alignment: .topLeading)
         .background(Color.black.opacity(0.3))
-        .overlay(Rectangle().stroke(Theme.border))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.radiusPanel, style: .continuous)
+                .stroke(Theme.border)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: Theme.radiusPanel, style: .continuous))
     }
 }
 
 private struct MessageTimeline: View {
     let session: ConversationSession
     let isRunning: Bool
+    let queuedSubmissions: [PendingSubmission]
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -2156,12 +2338,44 @@ private struct MessageTimeline: View {
                     ForEach(session.messages) { message in
                         MessageView(message: message).id(message.id)
                     }
+                    ForEach(queuedSubmissions) { submission in
+                        HStack {
+                            Spacer(minLength: 100)
+                            VStack(alignment: .trailing, spacing: 7) {
+                                Text(submission.request)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(Theme.text.opacity(0.72))
+                                    .multilineTextAlignment(.trailing)
+                                Label("QUEUED", systemImage: "text.line.last.and.arrowtriangle.forward")
+                                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                                    .foregroundStyle(Theme.pink)
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 13)
+                            .background(Theme.panelRaised.opacity(0.72))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous)
+                                    .stroke(Theme.pink.opacity(0.24))
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous))
+                        }
+                        .id(submission.id)
+                    }
                     if isRunning {
                         HStack(spacing: 10) {
                             ProgressView().controlSize(.small)
                             Text("Working in \(session.workspace)…")
                                 .font(.system(size: 12))
                                 .foregroundStyle(Theme.muted)
+                            if !queuedSubmissions.isEmpty {
+                                Text("\(queuedSubmissions.count) queued")
+                                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                                    .foregroundStyle(Theme.pink)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 5)
+                                    .background(Theme.pinkDeep)
+                                    .clipShape(Capsule())
+                            }
                             Spacer()
                         }
                         .padding(.vertical, 12)
@@ -2200,7 +2414,11 @@ private struct MessageView: View {
                     .padding(.horizontal, 18)
                     .padding(.vertical, 16)
                     .background(Color.black.opacity(0.28))
-                    .overlay(Rectangle().stroke(Theme.borderStrong))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous)
+                            .stroke(Theme.borderStrong)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous))
             }
         case .assistant:
             VStack(alignment: .leading, spacing: 9) {
@@ -2250,7 +2468,11 @@ private struct MessageView: View {
             .padding(16)
             .frame(maxWidth: .infinity, minHeight: 70, alignment: .leading)
             .background(Color.black.opacity(0.36))
-            .overlay(Rectangle().stroke(Theme.borderStrong))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous)
+                    .stroke(Theme.borderStrong)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous))
         case .system:
             HStack(spacing: 8) {
                 Image(systemName: "diamond")
@@ -2270,23 +2492,78 @@ private struct MessageView: View {
     }
 }
 
+/// Keeps SwiftUI's native focus, accessibility, undo, and IME behavior while
+/// applying Codex's Return-to-send convention only to the focused composer.
+@MainActor
+private final class ComposerKeyMonitor: ObservableObject {
+    var isFocused = false
+    var submit: (() -> Void)?
+    private var eventMonitor: Any?
+
+    func start() {
+        guard eventMonitor == nil else { return }
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.isFocused else { return event }
+            let isReturn = event.keyCode == 36 || event.keyCode == 76
+            guard isReturn,
+                  composerReturnAction(shiftPressed: event.modifierFlags.contains(.shift)) == .send else {
+                return event
+            }
+            if let textView = NSApp.keyWindow?.firstResponder as? NSTextView,
+               textView.hasMarkedText() {
+                return event
+            }
+            self.submit?()
+            return nil
+        }
+    }
+
+    func stop() {
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+        eventMonitor = nil
+    }
+
+}
+
+private struct ClaudexComposerEditor: View {
+    @Binding var text: String
+    let onSubmit: () -> Void
+    @StateObject private var keyMonitor = ComposerKeyMonitor()
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        TextEditor(text: $text)
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(Theme.text)
+            .scrollContentBackground(.hidden)
+            .focused($isFocused)
+            .onAppear {
+                keyMonitor.submit = onSubmit
+                isFocused = true
+                keyMonitor.isFocused = true
+                keyMonitor.start()
+            }
+            .onChange(of: isFocused) { focused in
+                keyMonitor.isFocused = focused
+            }
+            .onDisappear {
+                keyMonitor.isFocused = false
+                keyMonitor.stop()
+            }
+    }
+}
+
 private struct ComposerView: View {
     @ObservedObject var store: SessionStore
     let session: ConversationSession
-    @FocusState private var focused: Bool
 
     var body: some View {
         VStack(spacing: 10) {
             HStack(alignment: .bottom, spacing: 12) {
-                TextEditor(text: $store.composer)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(Theme.text)
-                    .scrollContentBackground(.hidden)
-                    .focused($focused)
+                ClaudexComposerEditor(text: $store.composer, onSubmit: store.send)
                     .frame(minHeight: 70, maxHeight: 130)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
-                    .disabled(store.isRunning)
                     .overlay(alignment: .topLeading) {
                         if store.composer.isEmpty {
                             Text("Route a governed task through OS-1…")
@@ -2299,7 +2576,7 @@ private struct ComposerView: View {
                     }
 
                 Button { store.send() } label: {
-                    Image(systemName: store.isRunning ? "hourglass" : "arrow.up")
+                    Image(systemName: "arrow.up")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(Color.black.opacity(0.86))
                         .frame(width: 44, height: 44)
@@ -2307,12 +2584,17 @@ private struct ComposerView: View {
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .disabled(store.isRunning || store.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(store.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help(store.isRunning ? "Add this task to the queue" : "Send task")
             }
             .padding(12)
             .background(Color.black.opacity(0.5))
-            .overlay(Rectangle().stroke(Theme.borderStrong))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.radiusComposer, style: .continuous)
+                    .stroke(Theme.borderStrong)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusComposer, style: .continuous))
+            .shadow(color: Color.black.opacity(0.32), radius: 16, y: 8)
 
             HStack {
                 Label(URL(fileURLWithPath: session.workspace).lastPathComponent, systemImage: "folder")
@@ -2324,8 +2606,13 @@ private struct ComposerView: View {
                 Text("Codex \(session.codexSessionID == nil ? "not linked" : "linked")")
                 Text("·")
                 Text("Claude \(session.claudeSessionID == nil ? "not linked" : "linked")")
+                if store.selectedSessionQueueCount > 0 {
+                    Text("·")
+                    Label("\(store.selectedSessionQueueCount) queued", systemImage: "text.line.last.and.arrowtriangle.forward")
+                        .foregroundStyle(Theme.pink)
+                }
                 Spacer()
-                Text("⌘↩ send")
+                Text("↩ send · ⇧↩ newline")
             }
             .font(.system(size: 9, weight: .medium, design: .rounded))
             .foregroundStyle(Theme.muted)
