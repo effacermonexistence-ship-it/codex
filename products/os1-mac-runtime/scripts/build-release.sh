@@ -4,12 +4,16 @@ set -euo pipefail
 readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly runtime_root="$(cd "$script_dir/.." && pwd)"
 readonly repository_root="$(cd "$runtime_root/../.." && pwd)"
-readonly version="${OS1_VERSION:-0.6.8}"
+readonly version="${OS1_VERSION:-0.7.3}"
 readonly output_dir="${OS1_RELEASE_OUTPUT_DIR:-$runtime_root/release}"
 readonly stage_dir="$output_dir/stage"
 readonly component_pkg="$output_dir/OS-1-component.pkg"
 readonly unsigned_pkg="$output_dir/OS-1-${version}-unsigned.pkg"
 readonly final_pkg="$output_dir/OS-1-${version}.pkg"
+readonly private_core_source="${OS1_PRIVATE_CORE_SOURCE:-$runtime_root/.private-core}"
+readonly arm64_build_dir="${OS1_ARM64_BUILD_DIR:-$runtime_root/.build-release-arm64}"
+readonly x86_64_build_dir="${OS1_X86_64_BUILD_DIR:-$runtime_root/.build-release-x86_64}"
+readonly skip_build="${OS1_SKIP_BUILD:-0}"
 readonly codesign_identity="${OS1_CODESIGN_IDENTITY:--}"
 readonly installer_identity="${OS1_INSTALLER_IDENTITY:-}"
 
@@ -23,36 +27,70 @@ mkdir -p \
   "$stage_dir/Applications/Open OS-1 Codex.app/Contents/MacOS" \
   "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Resources" \
   "$stage_dir/usr/local/bin" \
-  "$stage_dir/Library/Application Support/OS-1"
+  "$stage_dir/Library/Application Support/OS-1/private-core"
 
-swift build --package-path "$runtime_root" -c release \
-  --triple arm64-apple-macosx13.0 \
-  --build-path "$output_dir/build-arm64"
-swift build --package-path "$runtime_root" -c release \
-  --triple x86_64-apple-macosx13.0 \
-  --build-path "$output_dir/build-x86_64"
+[[ -f "$private_core_source/os1_local_core.py" ]]
+printf '%s  %s\n' \
+  '3e28b1db2b40a8a88bfb8064250c5c1169d631a45860375dc261dac9daea6466' \
+  "$private_core_source/OMAR_LUA_RCC_ENGINE_v26_CLEAN_CONSOLIDATED.txt" | shasum -a 256 -c -
+printf '%s  %s\n' \
+  '274886b0db8df88c86046d9c5be8140f245e97d01250f9827cae1f1dcb28c093' \
+  "$private_core_source/darwin_routed_rcc.py" | shasum -a 256 -c -
+printf '%s  %s\n' \
+  '6ebfffbb585ef451c4028fda92ee53977a7de2bad2e9302d92bd4011390d60b4' \
+  "$private_core_source/darwin_router_state.json" | shasum -a 256 -c -
+printf '%s  %s\n' \
+  '92c54350e9eb6fcba28155db5efbbba4bde29a9936f291a058c319448247ba6a' \
+  "$private_core_source/hinton_forward_forward_state.json" | shasum -a 256 -c -
+
+if [[ "$skip_build" == "1" ]]; then
+  [[ -x "$arm64_build_dir/arm64-apple-macosx/release/os1" ]]
+  [[ -x "$arm64_build_dir/arm64-apple-macosx/release/OS1App" ]]
+  [[ -x "$x86_64_build_dir/x86_64-apple-macosx/release/os1" ]]
+  [[ -x "$x86_64_build_dir/x86_64-apple-macosx/release/OS1App" ]]
+else
+  swift build --package-path "$runtime_root" -c release \
+    --triple arm64-apple-macosx13.0 \
+    --build-path "$arm64_build_dir"
+  swift build --package-path "$runtime_root" -c release \
+    --triple x86_64-apple-macosx13.0 \
+    --build-path "$x86_64_build_dir"
+fi
 
 lipo -create \
-  "$output_dir/build-arm64/arm64-apple-macosx/release/os1" \
-  "$output_dir/build-x86_64/x86_64-apple-macosx/release/os1" \
+  "$arm64_build_dir/arm64-apple-macosx/release/os1" \
+  "$x86_64_build_dir/x86_64-apple-macosx/release/os1" \
   -output "$stage_dir/usr/local/bin/os1"
 install -m 0755 "$stage_dir/usr/local/bin/os1" \
   "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Resources/os1"
 lipo -create \
-  "$output_dir/build-arm64/arm64-apple-macosx/release/OS1App" \
-  "$output_dir/build-x86_64/x86_64-apple-macosx/release/OS1App" \
+  "$arm64_build_dir/arm64-apple-macosx/release/OS1App" \
+  "$x86_64_build_dir/x86_64-apple-macosx/release/OS1App" \
   -output "$stage_dir/Applications/Open OS-1 Codex.app/Contents/MacOS/OS1App"
 
 install -m 0644 "$runtime_root/Resources/Info.plist" \
   "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Info.plist"
 install -m 0644 "$runtime_root/Resources/OmarAGI.png" \
   "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Resources/OmarAGI.png"
+install -m 0644 "$runtime_root/Resources/Codex.png" \
+  "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Resources/Codex.png"
+install -m 0644 "$runtime_root/Resources/ClaudeCode.png" \
+  "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Resources/ClaudeCode.png"
+install -m 0644 "$runtime_root/Resources/Constellation.png" \
+  "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Resources/Constellation.png"
 install -m 0644 "$runtime_root/Resources/OmarAGI.icns" \
   "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Resources/OmarAGI.icns"
 install -m 0644 "$runtime_root/Config/production.json" \
   "$stage_dir/Applications/Open OS-1 Codex.app/Contents/Resources/config.json"
 install -m 0644 "$runtime_root/Config/production.json" \
   "$stage_dir/Library/Application Support/OS-1/config.json"
+for private_file in \
+  os1_local_core.py OMAR_LUA_RCC_ENGINE_v26_CLEAN_CONSOLIDATED.txt \
+  darwin_routed_rcc.py darwin_benchmark_priors.json \
+  darwin_prompt_lineage.json darwin_router_state.json hinton_forward_forward_state.json; do
+  install -m 0644 "$private_core_source/$private_file" \
+    "$stage_dir/Library/Application Support/OS-1/private-core/$private_file"
+done
 xattr -cr "$stage_dir"
 
 codesign --force --sign "$codesign_identity" --options runtime \
@@ -86,6 +124,10 @@ fi
 pkgutil --check-signature "$final_pkg" || [[ -z "$installer_identity" ]]
 pkgutil --payload-files "$final_pkg" | grep -q 'usr/local/bin/os1'
 pkgutil --payload-files "$final_pkg" | grep -q 'Applications/Open OS-1 Codex.app'
+pkgutil --payload-files "$final_pkg" | grep -q 'Applications/Open OS-1 Codex.app/Contents/Resources/Codex.png'
+pkgutil --payload-files "$final_pkg" | grep -q 'Applications/Open OS-1 Codex.app/Contents/Resources/ClaudeCode.png'
+pkgutil --payload-files "$final_pkg" | grep -q 'Applications/Open OS-1 Codex.app/Contents/Resources/Constellation.png'
+pkgutil --payload-files "$final_pkg" | grep -q 'Library/Application Support/OS-1/private-core/os1_local_core.py'
 
 node "$repository_root/products/os1-route-core/scripts/client-artifact-scan.mjs" \
   "$stage_dir/usr/local/bin/os1" \

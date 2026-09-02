@@ -13,6 +13,7 @@ enum OS1Error: Error, CustomStringConvertible {
 }
 
 struct ProviderModelProfile: Codable {
+    let standard: String
     let efficient: String
     let deep: String
 }
@@ -58,6 +59,9 @@ struct RuntimeConfig: Codable {
     let ticketVerifyingKeyRaw: String
     let maximumSteps: Int
     let executionTimeoutSeconds: Int
+    let routingMode: String?
+    let localPrivateCorePath: String?
+    let localPrivateStatePath: String?
     let modelProfiles: ModelProfiles?
     let effortProfiles: EffortProfiles?
     let executorContract: ExecutorContract
@@ -67,6 +71,9 @@ struct RuntimeConfig: Codable {
         case ticketVerifyingKeyRaw = "ticket_verifying_key_raw"
         case maximumSteps = "maximum_steps"
         case executionTimeoutSeconds = "execution_timeout_seconds"
+        case routingMode = "routing_mode"
+        case localPrivateCorePath = "local_private_core_path"
+        case localPrivateStatePath = "local_private_state_path"
         case modelProfiles = "model_profiles"
         case effortProfiles = "effort_profiles"
         case executorContract = "executor_contract"
@@ -81,6 +88,21 @@ struct RuntimeConfig: Codable {
         }
         let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
         return URL(fileURLWithPath: String(decoding: bytes, as: UTF8.self)).resolvingSymlinksInPath()
+    }
+
+    static func resolvedLocalPrivateCorePath(configuredPath: String?) -> String? {
+        let executableDirectory = executableURL().deletingLastPathComponent()
+        let userSupport = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/OS-1/private-core/os1_local_core.py")
+        let candidates = [
+            configuredPath,
+            executableDirectory.appendingPathComponent("private-core/os1_local_core.py").path,
+            userSupport.path,
+            "/Library/Application Support/OS-1/private-core/os1_local_core.py",
+        ].compactMap { $0 }
+        return candidates.first { path in
+            path.hasPrefix("/") && FileManager.default.isReadableFile(atPath: path)
+        }
     }
 
     static func load() throws -> RuntimeConfig {
@@ -99,13 +121,19 @@ struct RuntimeConfig: Codable {
         ].compactMap { $0 }
         for path in paths where FileManager.default.fileExists(atPath: path) {
             let value = try JSONDecoder().decode(RuntimeConfig.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
-            guard URL(string: value.apiURL)?.scheme == "https",
+            let routingMode = value.routingMode ?? "remote"
+            let remoteConfigurationValid = routingMode == "remote" && URL(string: value.apiURL)?.scheme == "https"
+            let localConfigurationValid = routingMode == "local_private" &&
+                resolvedLocalPrivateCorePath(configuredPath: value.localPrivateCorePath) != nil
+            guard (remoteConfigurationValid || localConfigurationValid),
                   value.maximumSteps >= 1, value.maximumSteps <= 4,
                   value.executionTimeoutSeconds >= 60,
                   value.modelProfiles.map({ profiles in
                       [
+                          profiles.codex.standard,
                           profiles.codex.efficient,
                           profiles.codex.deep,
+                          profiles.claude.standard,
                           profiles.claude.efficient,
                           profiles.claude.deep,
                       ].allSatisfy(isSafeModelIdentifier)
@@ -126,6 +154,95 @@ struct RuntimeConfig: Codable {
             return value
         }
         throw OS1Error.message("OS-1 configuration is missing; reinstall OS-1")
+    }
+}
+
+struct LocalRouteRequest: Codable {
+    let prompt: String
+    let providerPreference: String
+    let codexCapacity: Int
+    let claudeCapacity: Int
+    let attempt: Int
+    let retryProvider: String?
+    let stateDirectory: String?
+
+    enum CodingKeys: String, CodingKey {
+        case prompt, attempt
+        case providerPreference = "provider_preference"
+        case codexCapacity = "codex_capacity"
+        case claudeCapacity = "claude_capacity"
+        case retryProvider = "retry_provider"
+        case stateDirectory = "state_dir"
+    }
+}
+
+struct LocalRouteDecision: Codable {
+    let schema: Int
+    let routeID: String
+    let provider: String
+    let providerPinned: Bool
+    let action: String
+    let permissionProfile: String
+    let model: String
+    let effort: String
+    let tier: String
+    let verificationProfile: String
+    let policySHA256: String
+    let engineSHA256: String
+    let authoritySHA256: String
+
+    enum CodingKeys: String, CodingKey {
+        case schema, provider, action, model, effort, tier
+        case routeID = "route_id"
+        case providerPinned = "provider_pinned"
+        case permissionProfile = "permission_profile"
+        case verificationProfile = "verification_profile"
+        case policySHA256 = "policy_sha256"
+        case engineSHA256 = "engine_sha256"
+        case authoritySHA256 = "authority_sha256"
+    }
+}
+
+struct LocalVerifyRequest: Codable {
+    let routeID: String
+    let prompt: String
+    let output: String
+    let stderr: String
+    let verificationProfile: String
+    let nativePersistence: String
+    let exitCode: Int32
+    let attempt: Int
+    let beforeWorkspaceHash: String
+    let afterWorkspaceHash: String
+    let providerPinned: Bool
+    let provider: String
+    let stateDirectory: String?
+
+    enum CodingKeys: String, CodingKey {
+        case prompt, output, stderr, attempt, provider
+        case routeID = "route_id"
+        case verificationProfile = "verification_profile"
+        case nativePersistence = "native_persistence"
+        case exitCode = "exit_code"
+        case beforeWorkspaceHash = "before_workspace_hash"
+        case afterWorkspaceHash = "after_workspace_hash"
+        case providerPinned = "provider_pinned"
+        case stateDirectory = "state_dir"
+    }
+}
+
+struct LocalVerification: Codable {
+    let schema: Int
+    let outcome: String
+    let reasonCode: String
+    let nextProvider: String
+    let policySHA256: String
+
+    enum CodingKeys: String, CodingKey {
+        case schema, outcome
+        case reasonCode = "reason_code"
+        case nextProvider = "next_provider"
+        case policySHA256 = "policy_sha256"
     }
 }
 
@@ -286,7 +403,9 @@ struct RunStepSummary: Codable {
     let sequence: Int
     let provider: String
     let action: String
+    let model: String?
     let effort: String
+    let revasDisposition: String
     let sessionID: String
     let permissionProfile: String
     let exitCode: Int32
@@ -296,7 +415,8 @@ struct RunStepSummary: Codable {
     let nativeRecord: NativeRecordEvidence?
 
     enum CodingKeys: String, CodingKey {
-        case sequence, provider, action, effort, output, stderr
+        case sequence, provider, action, model, effort, output, stderr
+        case revasDisposition = "revas_disposition"
         case sessionID = "session_id"
         case permissionProfile = "permission_profile"
         case exitCode = "exit_code"
@@ -609,8 +729,7 @@ func verifyTicket(_ ticket: Ticket, config: RuntimeConfig) throws {
     }
 }
 
-func configuredModel(provider: String, action: String, config: RuntimeConfig) throws -> String? {
-    if action == "agent_run" { return nil }
+func configuredModel(provider: String, action: String, config: RuntimeConfig) throws -> String {
     guard let profiles = config.modelProfiles else {
         throw OS1Error.message("OS-1 model profiles are missing; reinstall OS-1")
     }
@@ -621,6 +740,7 @@ func configuredModel(provider: String, action: String, config: RuntimeConfig) th
     default: throw OS1Error.message("Server ticket contract rejected")
     }
     switch action {
+    case "agent_run": return profile.standard
     case "agent_run_efficient": return profile.efficient
     case "agent_run_deep": return profile.deep
     default: throw OS1Error.message("Server ticket contract rejected")
@@ -702,6 +822,7 @@ func findExecutable(_ name: String) throws -> String {
         "\(home)/.local/bin/\(name)",
         "/opt/homebrew/bin/\(name)",
         "/usr/local/bin/\(name)",
+        name == "python3" ? "/usr/bin/python3" : "",
         name == "codex" ? "/Applications/ChatGPT.app/Contents/Resources/codex" : "",
     ]
     for candidate in candidates where !candidate.isEmpty {
@@ -714,6 +835,60 @@ func findExecutable(_ name: String) throws -> String {
         }
     }
     throw OS1Error.message("Required command is missing: \(name)")
+}
+
+func privateCoreCall<Request: Encodable, Response: Decodable>(
+    _ mode: String,
+    request: Request,
+    config: RuntimeConfig,
+    as responseType: Response.Type
+) throws -> Response {
+    guard (config.routingMode ?? "remote") == "local_private",
+          let corePath = RuntimeConfig.resolvedLocalPrivateCorePath(configuredPath: config.localPrivateCorePath),
+          ["route", "verify"].contains(mode) else {
+        throw OS1Error.message("OS-1 local private core is unavailable; reinstall OS-1")
+    }
+    let python = try findExecutable("python3")
+    let input = try JSONEncoder().encode(request)
+    let result = try commandOutput(python, [corePath, mode, "-"], input: input, timeout: 30)
+    guard result.0 == 0 else {
+        throw OS1Error.message("OS-1 local private core rejected the request")
+    }
+    do {
+        return try JSONDecoder().decode(Response.self, from: result.1)
+    } catch {
+        throw OS1Error.message("OS-1 local private core returned an invalid receipt")
+    }
+}
+
+func validateLocalRoute(_ decision: LocalRouteDecision) throws {
+    let sha = /^[0-9a-f]{64}$/
+    guard decision.schema == 1,
+          decision.routeID.hasPrefix("rcc-local-"), decision.routeID.count == 42,
+          ["codex", "claude"].contains(decision.provider),
+          ["agent_run", "agent_run_efficient", "agent_run_deep"].contains(decision.action),
+          ["read_only", "workspace_write", "full_access"].contains(decision.permissionProfile),
+          isSafeModelIdentifier(decision.model), isSupportedEffort(decision.effort),
+          ["efficient", "standard", "frontier", "maximum"].contains(decision.tier),
+          ["deterministic_exact", "executed_change", "executed_review", "source_review", "native_record"].contains(decision.verificationProfile),
+          decision.policySHA256.wholeMatch(of: sha) != nil,
+          decision.engineSHA256.wholeMatch(of: sha) != nil,
+          decision.authoritySHA256.wholeMatch(of: sha) != nil else {
+        throw OS1Error.message("OS-1 local RCC route contract rejected")
+    }
+}
+
+func localTicket(_ decision: LocalRouteDecision, sequence: Int) -> Ticket {
+    Ticket(
+        executionID: decision.routeID,
+        sequence: sequence,
+        provider: decision.provider,
+        action: decision.action,
+        permissionProfile: decision.permissionProfile,
+        expiresAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(3_600)),
+        nonce: UUID().uuidString.lowercased(),
+        signature: "local-private-core"
+    )
 }
 
 func githubToken() throws -> String {
@@ -772,10 +947,42 @@ func boundedString(_ data: Data, maximum: Int) -> String {
 
 func workspaceHash(_ workspace: String) -> String {
     guard let git = try? findExecutable("git"),
-          let result = try? commandOutput(git, ["-C", workspace, "status", "--porcelain=v1", "-z"], timeout: 20) else {
+          let inside = try? commandOutput(git, ["-C", workspace, "rev-parse", "--is-inside-work-tree"], timeout: 20),
+          inside.0 == 0 else {
         return sha256Hex(Data())
     }
-    return sha256Hex(result.1)
+    var material = Data("os1-workspace-state-v2\n".utf8)
+    for arguments in [
+        ["-C", workspace, "status", "--porcelain=v1", "-z"],
+        ["-C", workspace, "diff", "--binary", "--no-ext-diff", "HEAD", "--"],
+    ] {
+        guard let result = try? commandOutput(git, arguments, timeout: 30), result.0 == 0 else {
+            return sha256Hex(Data())
+        }
+        material.append(result.1)
+        material.append(0)
+    }
+    if let untracked = try? commandOutput(
+        git, ["-C", workspace, "ls-files", "--others", "--exclude-standard", "-z"], timeout: 30
+    ), untracked.0 == 0 {
+        var remaining = 16 * 1_024 * 1_024
+        for rawPath in untracked.1.split(separator: 0) where remaining > 0 {
+            let relative = String(decoding: rawPath, as: UTF8.self)
+            let url = URL(fileURLWithPath: workspace, isDirectory: true).appendingPathComponent(relative).standardizedFileURL
+            guard url.path.hasPrefix(URL(fileURLWithPath: workspace, isDirectory: true).standardizedFileURL.path + "/"),
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  (attributes[.type] as? FileAttributeType) == .typeRegular else { continue }
+            material.append(Data(relative.utf8))
+            material.append(0)
+            if let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) {
+                let prefix = data.prefix(remaining)
+                material.append(prefix)
+                remaining -= prefix.count
+            }
+            material.append(0)
+        }
+    }
+    return sha256Hex(material)
 }
 
 func readSessionContext(_ path: String?) throws -> String? {
@@ -837,7 +1044,11 @@ final class CodexAppServerClient: @unchecked Sendable {
         stderrHandle = try FileHandle(forWritingTo: temporary)
 
         process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = ["app-server"]
+        // OS-1 does not need the user's unrelated Cloudflare MCP to create a
+        // native Codex thread. When that MCP is logged out, app-server startup
+        // otherwise waits through repeated OAuth transport failures before a
+        // simple turn can begin.
+        process.arguments = ["app-server", "-c", "mcp_servers.cloudflare-api.enabled=false"]
         process.currentDirectoryURL = URL(fileURLWithPath: workspace, isDirectory: true)
         process.standardInput = input
         process.standardOutput = output
@@ -863,7 +1074,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         _ = try request(
             "initialize",
             params: [
-                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.6.8"],
+                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.7.3"],
                 "capabilities": ["experimentalApi": true],
             ],
             deadline: deadline
@@ -1217,6 +1428,12 @@ func codexSessionTitle(from prompt: String) -> String {
     return "OS-1 Codex · \(summary)"
 }
 
+func claudeSessionTitle(from prompt: String) -> String {
+    let compact = prompt.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    let summary = compact.isEmpty ? "Governed task" : String(compact.prefix(72))
+    return "OS-1 Claude · \(summary)"
+}
+
 func codexThreadNeedsDesktopMigration(source: Any?) -> Bool {
     (source as? String)?.lowercased() == "exec"
 }
@@ -1275,6 +1492,82 @@ func codexDesktopVisibility(
         return "revealed"
     } catch {
         return "reveal_failed: \(error)"
+    }
+}
+
+/// Claude Desktop keeps its own session index in addition to Claude Code's
+/// JSONL transcripts. A transcript is not visible in the Desktop sidebar until
+/// the first-party `claude://resume` importer registers it here.
+func claudeDesktopSessionMetadataPath(
+    sessionID: String,
+    sessionsRoot: URL? = nil
+) -> String? {
+    guard let normalized = try? normalizedSessionID(sessionID) else { return nil }
+    let root = sessionsRoot ?? FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Claude/claude-code-sessions", isDirectory: true)
+    guard let enumerator = FileManager.default.enumerator(
+        at: root,
+        includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+        options: [.skipsHiddenFiles, .skipsPackageDescendants]
+    ) else { return nil }
+
+    var inspected = 0
+    for case let candidate as URL in enumerator {
+        guard candidate.pathExtension == "json",
+              candidate.lastPathComponent.hasPrefix("local_") else { continue }
+        inspected += 1
+        guard inspected <= 10_000 else { return nil }
+        guard let values = try? candidate.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true,
+              (values.fileSize ?? 0) > 0,
+              (values.fileSize ?? 0) <= 4 * 1_024 * 1_024,
+              let data = try? Data(contentsOf: candidate),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawCLI = object["cliSessionId"] as? String,
+              (try? normalizedSessionID(rawCLI)) == normalized else { continue }
+        return candidate.path
+    }
+    return nil
+}
+
+/// Imports a Claude Code transcript through Claude Desktop's supported URL
+/// handler, waits until Desktop's own metadata index acknowledges the CLI
+/// session, and returns the persistent Desktop record used as evidence.
+func revealInClaudeDesktop(
+    sessionID: String,
+    sessionsRoot: URL? = nil,
+    timeout: TimeInterval = 15
+) throws -> String {
+    let normalized = try normalizedSessionID(sessionID)!
+    let result = try commandOutput(
+        "/usr/bin/open",
+        ["-g", "claude://resume?session=\(normalized)"],
+        timeout: 15
+    )
+    guard result.0 == 0 else {
+        throw OS1Error.message("open exited with status \(result.0)")
+    }
+    let deadline = Date().addingTimeInterval(timeout)
+    repeat {
+        if let path = claudeDesktopSessionMetadataPath(sessionID: normalized, sessionsRoot: sessionsRoot) {
+            return path
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+    } while Date() < deadline
+    throw OS1Error.message("Claude Desktop did not register the native session")
+}
+
+func claudeDesktopVisibility(
+    mode: DesktopRevealMode,
+    reveal: (String) throws -> String,
+    sessionID: String
+) -> String {
+    guard mode == .always else { return "not_revealed" }
+    do {
+        _ = try reveal(sessionID)
+        return "claude_revealed"
+    } catch {
+        return "claude_reveal_failed: \(error)"
     }
 }
 
@@ -1418,13 +1711,24 @@ func execute(
         sessionID = actualSessionID
     } else {
         let claude = try findExecutable("claude")
-        let requestedSessionID = try normalizedSessionID(providerSessionID) ?? UUID().uuidString.lowercased()
+        let previousSessionID = try normalizedSessionID(providerSessionID)
+        // Once Desktop imports a CLI transcript it starts its own long-lived
+        // Claude process for that session. Starting another `--resume` writer
+        // against the same JSONL would make the two backends race. OS-1 keeps
+        // the governed conversation context, but forks the next Claude turn
+        // into a fresh native session that Desktop can safely own and display.
+        let desktopOwnsPrevious = previousSessionID.flatMap {
+            claudeDesktopSessionMetadataPath(sessionID: $0)
+        } != nil
+        let requestedSessionID = (previousSessionID == nil || desktopOwnsPrevious)
+            ? UUID().uuidString.lowercased()
+            : previousSessionID!
         var arguments = ["-p", "--output-format", "json"]
         if let model { arguments += ["--model", model] }
         arguments += ["--effort", effort]
         arguments += ["--append-system-prompt", instructions]
-        if providerSessionID == nil {
-            arguments += ["--session-id", requestedSessionID]
+        if previousSessionID == nil || desktopOwnsPrevious {
+            arguments += ["--session-id", requestedSessionID, "--name", claudeSessionTitle(from: prompt)]
         } else {
             arguments += ["--resume", requestedSessionID]
         }
@@ -1447,11 +1751,18 @@ func execute(
             modifiedAfter: started,
             containing: String(decoding: parsed.output, as: UTF8.self)
         )
+        let desktopVisibility = transcript == nil
+            ? "claude_reveal_failed: transcript unavailable"
+            : claudeDesktopVisibility(
+                mode: desktopReveal,
+                reveal: { try revealInClaudeDesktop(sessionID: $0) },
+                sessionID: parsed.sessionID
+            )
         nativeRecord = NativeRecordEvidence(
             turnID: nil,
             recordPath: transcript,
             persistence: transcript == nil ? "unverified: Claude transcript for this turn not found" : "verified",
-            desktopVisibility: "not_applicable"
+            desktopVisibility: desktopVisibility
         )
     }
     return ProviderExecution(
@@ -1473,6 +1784,135 @@ func execute(
     )
 }
 
+func runLocalTask(
+    prompt: String,
+    workspace: String,
+    providerPreference: String,
+    context: String?,
+    codexSessionID: String?,
+    claudeSessionID: String?,
+    codexCapacity: Int,
+    claudeCapacity: Int,
+    progress: Bool,
+    desktopReveal: DesktopRevealMode,
+    config: RuntimeConfig
+) throws -> RunSummary {
+    var steps: [RunStepSummary] = []
+    var nativeSessions = [
+        "codex": try normalizedSessionID(codexSessionID),
+        "claude": try normalizedSessionID(claudeSessionID),
+    ]
+    let localPrompt = providerPrompt(current: prompt, context: context)
+    var retryProvider: String?
+    var retryReason: String?
+
+    for attempt in 1...config.maximumSteps {
+        let decision: LocalRouteDecision = try privateCoreCall(
+            "route",
+            request: LocalRouteRequest(
+                prompt: prompt,
+                providerPreference: providerPreference,
+                codexCapacity: codexCapacity,
+                claudeCapacity: claudeCapacity,
+                attempt: attempt,
+                retryProvider: retryProvider,
+                stateDirectory: config.localPrivateStatePath
+            ),
+            config: config,
+            as: LocalRouteDecision.self
+        )
+        try validateLocalRoute(decision)
+        let ticket = localTicket(decision, sequence: attempt)
+        let beforeHash = workspaceHash(workspace)
+        let executionPrompt: String
+        if let retryReason {
+            executionPrompt = localPrompt + "\n\nOS-1 verification did not adopt the prior candidate (\(retryReason)). Re-execute the original request using a changed verification or execution path, then provide concrete evidence."
+        } else {
+            executionPrompt = localPrompt
+        }
+        if progress {
+            print("OS-1 local RCC step \(attempt): \(decision.provider) / \(decision.model) / \(decision.effort) / \(decision.permissionProfile)")
+        }
+        let execution: ProviderExecution
+        do {
+            execution = try execute(
+                ticket: ticket,
+                prompt: executionPrompt,
+                workspace: workspace,
+                timeout: config.executionTimeoutSeconds,
+                providerSessionID: nativeSessions[decision.provider] ?? nil,
+                model: decision.model,
+                effort: decision.effort,
+                executorContract: config.executorContract,
+                desktopReveal: desktopReveal
+            )
+        } catch {
+            guard !decision.providerPinned, attempt < config.maximumSteps else { throw error }
+            let fallbackProvider = decision.provider == "codex" ? "claude" : "codex"
+            retryProvider = fallbackProvider
+            retryReason = "EXECUTOR_UNAVAILABLE"
+            if progress {
+                print("OS-1 \(decision.provider) backend unavailable; changing route to \(fallbackProvider)")
+            }
+            continue
+        }
+        nativeSessions[decision.provider] = execution.sessionID
+        let artifact = execution.artifact
+        let afterHash = workspaceHash(workspace)
+        let verification: LocalVerification = try privateCoreCall(
+            "verify",
+            request: LocalVerifyRequest(
+                routeID: decision.routeID,
+                prompt: prompt,
+                output: artifact.output,
+                stderr: artifact.stderr,
+                verificationProfile: decision.verificationProfile,
+                nativePersistence: execution.nativeRecord.persistence,
+                exitCode: artifact.exitCode,
+                attempt: attempt,
+                beforeWorkspaceHash: beforeHash,
+                afterWorkspaceHash: afterHash,
+                providerPinned: decision.providerPinned,
+                provider: decision.provider,
+                stateDirectory: config.localPrivateStatePath
+            ),
+            config: config,
+            as: LocalVerification.self
+        )
+        guard verification.schema == 1,
+              ["pass", "retry", "fail"].contains(verification.outcome),
+              ["codex", "claude"].contains(verification.nextProvider),
+              verification.policySHA256 == decision.policySHA256 else {
+            throw OS1Error.message("OS-1 local REVAS receipt contract rejected")
+        }
+        let disposition = verification.outcome == "pass" ? "adopted" : verification.outcome
+        steps.append(RunStepSummary(
+            sequence: attempt,
+            provider: decision.provider,
+            action: decision.action,
+            model: decision.model,
+            effort: decision.effort,
+            revasDisposition: disposition,
+            sessionID: execution.sessionID,
+            permissionProfile: decision.permissionProfile,
+            exitCode: artifact.exitCode,
+            output: artifact.output,
+            stderr: artifact.stderr,
+            durationMS: artifact.durationMS,
+            nativeRecord: execution.nativeRecord
+        ))
+        if verification.outcome == "pass" {
+            return RunSummary(status: "complete", steps: steps)
+        }
+        if verification.outcome == "fail" {
+            throw OS1Error.message("OS-1 local REVAS rejected the result after governed retries")
+        }
+        retryProvider = verification.nextProvider
+        retryReason = verification.reasonCode
+    }
+    throw OS1Error.message("OS-1 local RCC maximum step limit reached")
+}
+
 func runTask(
     prompt: String,
     workspace: String,
@@ -1490,6 +1930,21 @@ func runTask(
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: canonicalWorkspace, isDirectory: &isDirectory), isDirectory.boolValue else {
         throw OS1Error.message("Workspace directory does not exist")
+    }
+    if (config.routingMode ?? "remote") == "local_private" {
+        return try runLocalTask(
+            prompt: prompt,
+            workspace: canonicalWorkspace,
+            providerPreference: providerPreference,
+            context: context,
+            codexSessionID: codexSessionID,
+            claudeSessionID: claudeSessionID,
+            codexCapacity: codexCapacity,
+            claudeCapacity: claudeCapacity,
+            progress: progress,
+            desktopReveal: desktopReveal,
+            config: config
+        )
     }
     let key = try SigningKey.loadOrCreate()
     let id = try deviceID()
@@ -1541,19 +1996,6 @@ func runTask(
         )
         nativeSessions[ticket.provider] = execution.sessionID
         let artifact = execution.artifact
-        steps.append(RunStepSummary(
-            sequence: ticket.sequence,
-            provider: ticket.provider,
-            action: ticket.action,
-            effort: effort,
-            sessionID: execution.sessionID,
-            permissionProfile: ticket.permissionProfile,
-            exitCode: artifact.exitCode,
-            output: artifact.output,
-            stderr: artifact.stderr,
-            durationMS: artifact.durationMS,
-            nativeRecord: execution.nativeRecord
-        ))
         let artifactData = try JSONEncoder().encode(artifact)
         let resultHash = sha256Hex(artifactData)
         let artifactRef = "r2://os1-private-results/\(ticket.executionID)/\(ticket.sequence)/\(resultHash).json"
@@ -1573,6 +2015,22 @@ func runTask(
         let uploaded: [String: String] = try await client.post("/v1/artifacts", body: upload, as: [String: String].self)
         guard uploaded["artifact_ref"] == artifactRef else { throw OS1Error.message("Artifact upload binding failed") }
         route = try await client.post("/v1/results", body: submission, as: RouteResponse.self)
+        let revasDisposition = route.status == "complete" ? "adopted" : (route.ticket == nil ? "rejected" : "retry")
+        steps.append(RunStepSummary(
+            sequence: ticket.sequence,
+            provider: ticket.provider,
+            action: ticket.action,
+            model: model,
+            effort: effort,
+            revasDisposition: revasDisposition,
+            sessionID: execution.sessionID,
+            permissionProfile: ticket.permissionProfile,
+            exitCode: artifact.exitCode,
+            output: artifact.output,
+            stderr: artifact.stderr,
+            durationMS: artifact.durationMS,
+            nativeRecord: execution.nativeRecord
+        ))
         if route.status == "failed" {
             throw OS1Error.message("OS-1 verification rejected the result after governed retries")
         }
@@ -1583,7 +2041,7 @@ func runTask(
 
 func printRunSummary(_ summary: RunSummary) {
     for step in summary.steps {
-        print("\n[\(step.provider.uppercased()) · \(step.action) · \(step.effort) · \(step.permissionProfile) · \(step.sessionID)]")
+        print("\n[\(step.provider.uppercased()) · \(step.action) · \(step.model ?? "provider-default") · \(step.effort) · REVAS \(step.revasDisposition) · \(step.permissionProfile) · \(step.sessionID)]")
         if let record = step.nativeRecord {
             print("native record: \(record.persistence)"
                 + (record.recordPath.map { " · \($0)" } ?? "")
@@ -1603,9 +2061,35 @@ func doctor() throws {
           try validateExecutorContract(config.executorContract) else {
         throw OS1Error.message("OS-1 model or effort profiles are missing; reinstall OS-1")
     }
+    for command in ["codex", "claude"] { _ = try findExecutable(command) }
+    if (config.routingMode ?? "remote") == "local_private" {
+        let decision: LocalRouteDecision = try privateCoreCall(
+            "route",
+            request: LocalRouteRequest(
+                prompt: "코덱스한테 1 + 1 시켜봐",
+                providerPreference: "auto",
+                codexCapacity: 30,
+                claudeCapacity: 100,
+                attempt: 1,
+                retryProvider: nil,
+                stateDirectory: config.localPrivateStatePath
+            ),
+            config: config,
+            as: LocalRouteDecision.self
+        )
+        try validateLocalRoute(decision)
+        guard decision.provider == "codex", decision.model == "gpt-5.6-luna",
+              decision.effort == "low", decision.action == "agent_run_efficient" else {
+            throw OS1Error.message("OS-1 local RCC route probe failed")
+        }
+        print("OS-1 configuration: OK (local private RCC)")
+        print("RCC source lock: \(decision.engineSHA256)")
+        print("Codex and Claude: available")
+        return
+    }
     let key = try SigningKey.loadOrCreate()
     _ = try deviceID()
-    for command in ["gh", "codex", "claude"] { _ = try findExecutable(command) }
+    _ = try findExecutable("gh")
     _ = try githubToken()
     print("OS-1 configuration: OK (\(config.apiURL))")
     print("OS-1 device key: \(key.securityMode)")
@@ -1620,6 +2104,8 @@ func selfTest() throws {
     }
     guard codexSessionTitle(from: "  1 + 1   테스트  ") == "OS-1 Codex · 1 + 1 테스트",
           codexSessionTitle(from: "").hasPrefix("OS-1 Codex · "),
+          claudeSessionTitle(from: "  QM과 GR   통합  ") == "OS-1 Claude · QM과 GR 통합",
+          claudeSessionTitle(from: "").hasPrefix("OS-1 Claude · "),
           codexThreadNeedsDesktopMigration(source: "exec"),
           codexThreadNeedsDesktopMigration(source: "EXEC"),
           !codexThreadNeedsDesktopMigration(source: "vscode"),
@@ -1700,6 +2186,49 @@ func selfTest() throws {
           claudeTranscriptPath(sessionID: "missing", projectsRoot: transcriptRoot) == nil else {
         throw OS1Error.message("Claude transcript lookup validation failed")
     }
+    let desktopMetadataRoot = transcriptRoot.appendingPathComponent("desktop-sessions", isDirectory: true)
+    let desktopAccountRoot = desktopMetadataRoot
+        .appendingPathComponent("account", isDirectory: true)
+        .appendingPathComponent("organization", isDirectory: true)
+    try FileManager.default.createDirectory(at: desktopAccountRoot, withIntermediateDirectories: true)
+    let desktopMetadataURL = desktopAccountRoot
+        .appendingPathComponent("local_\(transcriptSession).json")
+    try Data("""
+    {"sessionId":"local_\(transcriptSession)","cliSessionId":"\(transcriptSession)","cwd":"/tmp/project"}
+    """.utf8).write(to: desktopMetadataURL)
+    let expectedDesktopMetadata = desktopMetadataURL.resolvingSymlinksInPath().path
+    var claudeRevealed: [String] = []
+    let recordClaudeReveal: (String) throws -> String = {
+        claudeRevealed.append($0)
+        return expectedDesktopMetadata
+    }
+    let failClaudeReveal: (String) throws -> String = { _ in throw OS1Error.message("no Claude Desktop") }
+    guard claudeDesktopSessionMetadataPath(
+              sessionID: transcriptSession,
+              sessionsRoot: desktopMetadataRoot
+          ).map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }) == expectedDesktopMetadata,
+          claudeDesktopSessionMetadataPath(
+              sessionID: "01a05b4d-f206-7c71-bd11-128b24e755e1",
+              sessionsRoot: desktopMetadataRoot
+          ) == nil,
+          claudeDesktopVisibility(
+              mode: .always,
+              reveal: recordClaudeReveal,
+              sessionID: transcriptSession
+          ) == "claude_revealed",
+          claudeDesktopVisibility(
+              mode: .never,
+              reveal: recordClaudeReveal,
+              sessionID: transcriptSession
+          ) == "not_revealed",
+          claudeDesktopVisibility(
+              mode: .always,
+              reveal: failClaudeReveal,
+              sessionID: transcriptSession
+          ).hasPrefix("claude_reveal_failed: "),
+          claudeRevealed == [transcriptSession] else {
+        throw OS1Error.message("Claude Desktop session synchronization validation failed")
+    }
     let claudeSessionID = "01a05b4d-f206-7c71-bd11-128b24e755e0"
     let allowedClaudeResult = Data("""
     {"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"\(claudeSessionID)","permission_denials":[]}
@@ -1731,9 +2260,12 @@ func selfTest() throws {
         ticketVerifyingKeyRaw: String(repeating: "A", count: 43),
         maximumSteps: 4,
         executionTimeoutSeconds: 60,
+        routingMode: "remote",
+        localPrivateCorePath: nil,
+        localPrivateStatePath: nil,
         modelProfiles: ModelProfiles(
-            codex: ProviderModelProfile(efficient: "codex-fast", deep: "codex-deep"),
-            claude: ProviderModelProfile(efficient: "claude-fast", deep: "claude-deep")
+            codex: ProviderModelProfile(standard: "codex-standard", efficient: "codex-fast", deep: "codex-deep"),
+            claude: ProviderModelProfile(standard: "claude-standard", efficient: "claude-fast", deep: "claude-deep")
         ),
         effortProfiles: EffortProfiles(
             codex: ProviderEffortProfile(standard: "medium", efficient: "low", deep: "xhigh"),
@@ -1753,7 +2285,7 @@ func selfTest() throws {
             ]
         )
     )
-    guard try configuredModel(provider: "codex", action: "agent_run", config: config) == nil,
+    guard try configuredModel(provider: "codex", action: "agent_run", config: config) == "codex-standard",
           try configuredModel(provider: "codex", action: "agent_run_efficient", config: config) == "codex-fast",
           try configuredModel(provider: "claude", action: "agent_run_deep", config: config) == "claude-deep",
           try configuredEffort(provider: "codex", action: "agent_run", config: config) == "medium",
@@ -1788,11 +2320,16 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.6.8")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.7.3")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":
                 let config = try RuntimeConfig.load()
+                if (config.routingMode ?? "remote") == "local_private" {
+                    try doctor()
+                    print("OS-1 local private RCC requires no remote device registration")
+                    return
+                }
                 let client = APIClient(config: config, token: try githubToken(), deviceID: try deviceID())
                 let key = try SigningKey.loadOrCreate()
                 try await register(client: client, key: key)
@@ -1807,7 +2344,7 @@ struct OS1Main {
                 var codexCapacity = 30
                 var claudeCapacity = 100
                 var outputFormat = "text"
-                var desktopReveal = DesktopRevealMode.always
+                var desktopReveal = DesktopRevealMode.never
                 var index = 1
                 while index < arguments.count {
                     switch arguments[index] {

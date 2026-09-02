@@ -552,7 +552,9 @@ private struct AppRunStep: Decodable, Sendable {
     let sequence: Int
     let provider: String
     let action: String
+    let model: String?
     let effort: String
+    let revasDisposition: String
     let sessionID: String
     let permissionProfile: String
     let exitCode: Int32
@@ -562,7 +564,8 @@ private struct AppRunStep: Decodable, Sendable {
     let nativeRecord: AppNativeRecord?
 
     enum CodingKeys: String, CodingKey {
-        case sequence, provider, action, effort, output, stderr
+        case sequence, provider, action, model, effort, output, stderr
+        case revasDisposition = "revas_disposition"
         case sessionID = "session_id"
         case permissionProfile = "permission_profile"
         case exitCode = "exit_code"
@@ -584,9 +587,11 @@ private func nativeRecordReceipt(_ step: AppRunStep) -> String {
     }
     switch record.desktopVisibility {
     case "revealed": parts.append("Codex Desktop: synced and opened")
-    case "not_revealed": parts.append("Codex Desktop: not opened")
+    case "claude_revealed": parts.append("Claude Desktop: synced and opened")
+    case "not_revealed": parts.append("\(step.provider == "claude" ? "Claude" : "Codex") Desktop: kept in background")
     case "desktop_not_running": parts.append("Codex Desktop: lists on launch")
     case let value where value.hasPrefix("reveal_failed"): parts.append("Codex Desktop: open failed")
+    case let value where value.hasPrefix("claude_reveal_failed"): parts.append("Claude Desktop: sync failed")
     default: break
     }
     return parts.joined(separator: " · ")
@@ -713,7 +718,10 @@ private enum OS1Runner {
         arguments += [
             "--codex-capacity", String(codexCapacity),
             "--claude-capacity", String(claudeCapacity),
-            "--desktop-reveal", "always",
+            // Codex and Claude are execution backends. Keep OS-1 in front;
+            // users can explicitly open a linked native session from the
+            // routing menu when they actually want to inspect that app.
+            "--desktop-reveal", "never",
         ]
 
         let process = Process()
@@ -939,6 +947,23 @@ private final class SessionStore: ObservableObject {
         save()
     }
 
+    /// Claude Code transcripts remain synchronized in OS-1 without opening
+    /// Claude Desktop. This explicit action imports and opens the linked CLI
+    /// session only when the user asks to inspect the native backend.
+    func openInClaudeDesktop() {
+        guard !isRunning, let index = selectedIndex,
+              let id = sessions[index].claudeSessionID,
+              let url = URL(string: "claude://resume?session=\(id)") else { return }
+        NSWorkspace.shared.open(url)
+        sessions[index].messages.append(ChatMessage(
+            role: .system,
+            text: "Opened Claude session \(id) in Claude Desktop. The next OS-1 Claude turn will continue in a new linked native session so Desktop remains the sole writer for the opened record."
+        ))
+        sessions[index].updatedAt = Date()
+        statusText = "Opened in Claude Desktop"
+        save()
+    }
+
     func selectNativeSession(_ id: String) {
         selectedNativeSessionID = id
         loadSelectedNativeTranscript()
@@ -1097,10 +1122,10 @@ private final class SessionStore: ObservableObject {
                     ))
                     sessions[target].messages.append(ChatMessage(
                         role: .receipt,
-                        text: "\(backendTierLabel(action: step.action, provider: step.provider)) · \(step.effort) reasoning · \(nativeRecordReceipt(step)) · step \(step.sequence) · \(step.durationMS / 1_000)s · exit \(step.exitCode)",
+                        text: "\(backendTierLabel(action: step.action, provider: step.provider)) · \(step.model ?? "provider default") · \(step.effort) reasoning · REVAS \(step.revasDisposition) · \(nativeRecordReceipt(step)) · step \(step.sequence) · \(step.durationMS / 1_000)s · exit \(step.exitCode)",
                         provider: step.provider,
                         permissionProfile: step.permissionProfile,
-                        nativeRecordVerified: step.nativeRecord?.isVerified ?? false
+                        nativeRecordVerified: (step.nativeRecord?.isVerified ?? false) && step.revasDisposition == "adopted"
                     ))
                 }
                 sessions[target].updatedAt = Date()
@@ -1205,6 +1230,68 @@ private enum Theme {
     static let pink = Color(red: 0.93, green: 0.70, blue: 0.80)
     static let pinkDeep = Color(red: 0.22, green: 0.10, blue: 0.16)
     static let green = Color(red: 0.28, green: 0.93, blue: 0.55)
+    static let constellationImage: NSImage? = {
+        guard let url = Bundle.main.url(forResource: "Constellation", withExtension: "png") else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
+    }()
+}
+
+private struct OmarAGILogo: View {
+    let size: CGFloat
+
+    var body: some View {
+        Group {
+            if let url = Bundle.main.url(forResource: "OmarAGI", withExtension: "png"),
+               let image = NSImage(contentsOf: url) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .antialiased(true)
+                    .scaledToFit()
+            } else {
+                ZStack {
+                    Circle().stroke(Theme.pink, lineWidth: max(4, size * 0.18))
+                    Circle().fill(Color.white.opacity(0.94)).frame(width: max(4, size * 0.12))
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .contentShape(Circle())
+    }
+}
+
+private struct ProviderBrandIcon: View {
+    let provider: ProviderChoice
+    let size: CGFloat
+    var filled = true
+
+    private var resourceName: String {
+        provider == .claude ? "ClaudeCode" : "Codex"
+    }
+
+    var body: some View {
+        Group {
+            if let url = Bundle.main.url(forResource: resourceName, withExtension: "png"),
+               let image = NSImage(contentsOf: url) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .antialiased(true)
+                    .scaledToFit()
+            } else {
+                Image(systemName: provider == .claude ? "sun.max.fill" : "chevron.left.forwardslash.chevron.right")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(provider.tint)
+                    .padding(size * 0.2)
+            }
+        }
+        .frame(width: size, height: size)
+        .opacity(filled ? 1 : 0.96)
+        .accessibilityHidden(true)
+    }
 }
 
 @main
@@ -1243,24 +1330,57 @@ private struct OS1DesktopApp: App {
 
 private struct RootView: View {
     @ObservedObject var store: SessionStore
+    @State private var backdropOffset = CGSize.zero
 
     var body: some View {
-        ZStack {
-            CosmicBackdrop()
-            HStack(spacing: 0) {
-                ProviderRail(store: store)
-                Rectangle().fill(Theme.border).frame(width: 1)
-                if store.surface == .auto {
-                    SessionSidebar(store: store)
-                    Rectangle().fill(Theme.border).frame(width: 1)
-                    ConversationView(store: store)
-                } else {
-                    NativeSessionBrowser(store: store, provider: store.surface)
+        GeometryReader { geometry in
+            ZStack {
+                CosmicBackdrop(offset: backdropOffset)
+                VStack(spacing: 0) {
+                    HStack {
+                        Text("INTERACTIVE PRODUCT VIEW")
+                        Spacer()
+                        HStack(spacing: 8) {
+                            Circle().fill(Theme.green).frame(width: 7, height: 7)
+                                .shadow(color: Theme.green.opacity(0.82), radius: 6)
+                            Text("GOVERNANCE ACTIVE")
+                        }
+                    }
+                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                    .tracking(1.7)
+                    .foregroundStyle(Theme.muted)
+                    .padding(.horizontal, 3)
+                    .frame(height: 28, alignment: .top)
+
+                    HStack(spacing: 0) {
+                        ProviderRail(store: store)
+                        Rectangle().fill(Theme.border).frame(width: 1)
+                        if store.surface == .auto {
+                            SessionSidebar(store: store)
+                            Rectangle().fill(Theme.border).frame(width: 1)
+                            ConversationView(store: store)
+                        } else {
+                            NativeSessionBrowser(store: store, provider: store.surface)
+                        }
+                    }
+                    .background(Theme.background.opacity(0.97))
+                    .overlay(Rectangle().stroke(Theme.borderStrong, lineWidth: 1))
+                }
+                .padding(12)
+            }
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    let width = max(geometry.size.width, 1)
+                    let height = max(geometry.size.height, 1)
+                    backdropOffset = CGSize(
+                        width: ((location.x / width) - 0.5) * -12,
+                        height: ((location.y / height) - 0.5) * -9
+                    )
+                case .ended:
+                    backdropOffset = .zero
                 }
             }
-            .background(Theme.background.opacity(0.97))
-            .overlay(Rectangle().stroke(Theme.borderStrong, lineWidth: 1))
-            .padding(12)
         }
         .frame(minWidth: 1_100, minHeight: 680)
         .background(Theme.background)
@@ -1276,37 +1396,36 @@ private struct RootView: View {
 }
 
 private struct CosmicBackdrop: View {
+    let offset: CGSize
+
     var body: some View {
-        Canvas { context, size in
-            let width = max(size.width, 1)
-            let height = max(size.height, 1)
-            for index in 0..<82 {
-                let x = CGFloat((index * 83 + 17) % 997) / 997 * width
-                let y = CGFloat((index * 47 + 31) % 991) / 991 * height
-                let diameter = CGFloat(index % 4 == 0 ? 1.4 : 0.8)
-                let tint = index % 5 == 0 ? Theme.pink : Color.white
-                context.fill(
-                    Path(ellipseIn: CGRect(x: x, y: y, width: diameter, height: diameter)),
-                    with: .color(tint.opacity(index % 5 == 0 ? 0.16 : 0.10))
+        GeometryReader { geometry in
+            ZStack {
+                Color.black
+                if let image = Theme.constellationImage {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFill()
+                        .frame(
+                            width: geometry.size.width * 1.07,
+                            height: geometry.size.height * 1.07
+                        )
+                        .offset(offset)
+                        .opacity(0.72)
+                }
+                RadialGradient(
+                    colors: [Color.black.opacity(0.10), Color.black.opacity(0.72)],
+                    center: UnitPoint(x: 0.52, y: 0.42),
+                    startRadius: 20,
+                    endRadius: max(geometry.size.width, geometry.size.height) * 0.72
                 )
             }
-            for index in stride(from: 0, to: 28, by: 4) {
-                var path = Path()
-                let start = CGPoint(
-                    x: CGFloat((index * 97 + 23) % 997) / 997 * width,
-                    y: CGFloat((index * 61 + 19) % 991) / 991 * height
-                )
-                let end = CGPoint(
-                    x: min(width, start.x + CGFloat(90 + index * 7)),
-                    y: min(height, start.y + CGFloat(42 + index * 3))
-                )
-                path.move(to: start)
-                path.addLine(to: end)
-                context.stroke(path, with: .color(Theme.pink.opacity(0.035)), lineWidth: 0.6)
-            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
         }
-        .background(Color.black)
         .allowsHitTesting(false)
+        .animation(.linear(duration: 0.11), value: offset)
     }
 }
 
@@ -1316,16 +1435,7 @@ private struct ProviderRail: View {
     var body: some View {
         VStack(spacing: 22) {
             Button { store.showClaudexHome() } label: {
-                ZStack {
-                    Circle()
-                        .fill(AngularGradient(
-                            colors: [Theme.pink, .pink, .red, Theme.pink],
-                            center: .center
-                        ))
-                    Circle().fill(Theme.background).padding(8)
-                    Circle().fill(Color.white.opacity(0.94)).frame(width: 6, height: 6)
-                }
-                .frame(width: 43, height: 43)
+                OmarAGILogo(size: 48)
             }
             .buttonStyle(.plain)
             .disabled(store.isRunning)
@@ -1374,12 +1484,7 @@ private struct BackendStatus: View {
     var body: some View {
         Button(action: action) {
             VStack(spacing: 9) {
-                Image(systemName: provider.symbol)
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(selected ? Color.black.opacity(0.82) : provider.tint)
-                    .frame(width: 27, height: 27)
-                    .background(selected ? provider.tint : provider.tint.opacity(0.16))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                ProviderBrandIcon(provider: provider, size: 28)
                 Text(provider == .claude ? "CLAUDE" : "CODEX")
                     .font(.system(size: 7, weight: .bold, design: .rounded))
                     .tracking(1.1)
@@ -1644,7 +1749,11 @@ private struct NativeMessageCard: View {
             if message.role == .user { Spacer(minLength: 100) }
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 7) {
-                    Image(systemName: message.role == .user ? "person.crop.circle.fill" : provider.symbol)
+                    if message.role == .user {
+                        Image(systemName: "person.crop.circle.fill")
+                    } else {
+                        ProviderBrandIcon(provider: provider, size: 14, filled: false)
+                    }
                     Text(message.role == .user ? "YOU" : (provider == .claude ? "CLAUDE CODE" : "CODEX"))
                     Spacer()
                     if let timestamp = message.timestamp {
@@ -1679,8 +1788,7 @@ private struct RailButton: View {
     var body: some View {
         Button(action: action) {
             VStack(spacing: 7) {
-                Image(systemName: provider.symbol)
-                    .font(.system(size: 17, weight: .semibold))
+                ProviderBrandIcon(provider: provider, size: 24)
                 Text(provider.title.uppercased())
                     .font(.system(size: 8, weight: .bold, design: .rounded))
             }
@@ -1896,6 +2004,8 @@ private struct ConversationHeader: View {
                         .disabled(session.codexSessionID == nil)
                     Button("Inspect Claude backend") { store.inspectBackend(.claude) }
                         .disabled(session.claudeSessionID == nil)
+                    Button("Open in Claude Desktop") { store.openInClaudeDesktop() }
+                        .disabled(session.claudeSessionID == nil)
                 } label: {
                     Label(
                         session.provider == .auto
@@ -2095,9 +2205,11 @@ private struct MessageView: View {
         case .assistant:
             VStack(alignment: .leading, spacing: 9) {
                 HStack(spacing: 7) {
-                    Image(systemName: message.provider == "claude"
-                        ? ProviderChoice.claude.symbol
-                        : ProviderChoice.codex.symbol)
+                    ProviderBrandIcon(
+                        provider: message.provider == "claude" ? .claude : .codex,
+                        size: 14,
+                        filled: false
+                    )
                     Text((message.provider ?? "OS-1").uppercased())
                     if let permission = message.permissionProfile {
                         Text("· \(permission.replacingOccurrences(of: "_", with: " "))")
