@@ -94,15 +94,15 @@ test('accepts the exact separated golden and post-reset v138 snapshot control', 
     golden_snapshot_id: GOLDEN_SNAPSHOT_ID,
     current_snapshot_id: CURRENT_SNAPSHOT_ID,
     catalog: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG.json`, sha256: SNAPSHOT_CATALOG_SHA256 },
-    seal: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG_SEAL.json`, sha256: '83bb0c7a7e4746e02eac324d6b6696c503578dd3724f16b774432b2b69fdcd4d' },
+    seal: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG_SEAL.json`, sha256: 'c941daeb91b05602708855df8ec0153f6bca8f62d97ecaaf3920dd02c05a2a26' },
     restore_tool: { key: `${prefix}/scv-timestamped-restore.js`, sha256: '4044f96616a504c9049657fbe628b63246b56a626fa57cdb5f67dc1307d3f206' },
     restore_receipts: {
-      pre_v138_omar_reset_2: {
-        key: `${prefix}/receipts/pre-v138-omar-reset-2-20260902T191130Z.json`,
+      pre_v140_omar_reset: {
+        key: `${prefix}/receipts/pre-v140-omar-reset-20260902T211747Z.json`,
         sha256: PRE_RESTORE_RECEIPT_SHA256
       },
-      current_post_v138_omar_reset_2: {
-        key: `${prefix}/receipts/current-post-v138-omar-reset-2-20260902T191131Z.json`,
+      current_post_v140_omar_reset: {
+        key: `${prefix}/receipts/current-post-v140-omar-reset-20260902T211750Z.json`,
         sha256: POST_RESTORE_RECEIPT_SHA256
       }
     },
@@ -133,15 +133,15 @@ test('rejects a current snapshot pointer that overlays the golden snapshot', asy
     golden_snapshot_id: GOLDEN_SNAPSHOT_ID,
     current_snapshot_id: GOLDEN_SNAPSHOT_ID,
     catalog: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG.json`, sha256: SNAPSHOT_CATALOG_SHA256 },
-    seal: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG_SEAL.json`, sha256: '83bb0c7a7e4746e02eac324d6b6696c503578dd3724f16b774432b2b69fdcd4d' },
+    seal: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG_SEAL.json`, sha256: 'c941daeb91b05602708855df8ec0153f6bca8f62d97ecaaf3920dd02c05a2a26' },
     restore_tool: { key: `${prefix}/scv-timestamped-restore.js`, sha256: '4044f96616a504c9049657fbe628b63246b56a626fa57cdb5f67dc1307d3f206' },
     restore_receipts: {
-      pre_v138_omar_reset_2: {
-        key: `${prefix}/receipts/pre-v138-omar-reset-2-20260902T191130Z.json`,
+      pre_v140_omar_reset: {
+        key: `${prefix}/receipts/pre-v140-omar-reset-20260902T211747Z.json`,
         sha256: PRE_RESTORE_RECEIPT_SHA256
       },
-      current_post_v138_omar_reset_2: {
-        key: `${prefix}/receipts/current-post-v138-omar-reset-2-20260902T191131Z.json`,
+      current_post_v140_omar_reset: {
+        key: `${prefix}/receipts/current-post-v140-omar-reset-20260902T211750Z.json`,
         sha256: POST_RESTORE_RECEIPT_SHA256
       }
     },

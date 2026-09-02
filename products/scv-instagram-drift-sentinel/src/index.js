@@ -1,28 +1,30 @@
-const SENTINEL_SCHEMA = 'scv-instagram-drift-sentinel-2026-09-02-v4-v138-second-omar-reset'
-const RELEASE_ID = 'scv-instagram-single-20260902-v138'
-const CONTENT_FINGERPRINT = 'f113716920061dea80bd1eca7387258e8761460be6b3947b6fe2c2d01d5d683b'
-const RELEASE_MANIFEST = 'd10d9c6c63203439354e74162f54ced1e790a561ca2502b6906038c45947cf70'
+const SENTINEL_SCHEMA = 'scv-instagram-drift-sentinel-2026-09-02-v6-v140-catalog-bound'
+const RELEASE_ID = 'scv-instagram-single-20260902-v140'
+const CONTENT_FINGERPRINT = '91ee1d30355c3235eec25f65bd7f117bdf7642d066c0d373a54c6a1c0a5f5f6d'
+const RELEASE_MANIFEST = '7e6b12b23987978f9be28241089541f18b405d7a38471571eeaea3d87f74a3f8'
 const VISIBLE_MODEL = 'gpt-5.4-mini-2026-03-17'
-const SNAPSHOT_CONTROL_VERSION = '20260902T192026Z'
-const SNAPSHOT_COUNT = 31
+const SNAPSHOT_CONTROL_VERSION = '20260902T211822Z'
+const SNAPSHOT_COUNT = 37
 const GOLDEN_SNAPSHOT_ID = 'scv-instagram-20260420T152810-local-origin'
-const PRE_RESET_SNAPSHOT_ID = 'scv-instagram-20260902T191130Z-v138-pre-omar-reset-2'
-const CURRENT_SNAPSHOT_ID = 'scv-instagram-20260902T191131Z-v138-post-omar-reset-2-current'
-const SNAPSHOT_CATALOG_SHA256 = '6b376d3b1d4f04d69f1c1a394aa9815989569a93682c9fbb6ed6426f065a03ed'
-const SNAPSHOT_SEAL_SHA256 = '83bb0c7a7e4746e02eac324d6b6696c503578dd3724f16b774432b2b69fdcd4d'
+const PRE_RESET_SNAPSHOT_ID = 'scv-instagram-20260902T211747Z-v140-pre-omar-reset'
+const CURRENT_SNAPSHOT_ID = 'scv-instagram-20260902T211750Z-v140-post-omar-reset-current'
+const SNAPSHOT_CATALOG_SHA256 = '459ca7506e728ad606e43fe1d8fd313e3c735dbe691186924496fc6aebdcf475'
+const SNAPSHOT_SEAL_SHA256 = 'c941daeb91b05602708855df8ec0153f6bca8f62d97ecaaf3920dd02c05a2a26'
 const SNAPSHOT_RESTORE_TOOL_SHA256 = '4044f96616a504c9049657fbe628b63246b56a626fa57cdb5f67dc1307d3f206'
-const RESET_RECEIPT_SHA256 = '6bf342e97aa17760f8dbd4048f94d2fda1ef8bf6162165362f266c5998fa7e46'
-// Second v138 Omar.system reset (before the owner's red-team): the code-locked
-// audit was already zero at the pre-reset point because an immediately preceding
-// operator run purged the state but failed closed during post-reset capture
-// without writing a receipt; the receipted reset must be zero at both points.
+const RESET_RECEIPT_SHA256 = '6ee8bdebeeb761e008495b8ce31647dde3b7bea161a4cd4f38190f35236f27ed'
+// v140 post-fix Omar.system reset (2026-09-02T21:17:50Z): the debug thread had
+// already been purged after the v139 red-team, so the pre-reset audit is zero;
+// the post-reset point must be zero.
 const PRE_RESET_AUDIT_REMAINING_COUNT = 0
-const PRE_RESTORE_RECEIPT_SHA256 = 'e73c55c1393630cc5fe06150623e969085da79d1aeb03978e2a8432761a2647c'
-const POST_RESTORE_RECEIPT_SHA256 = 'de7eb25dce039dc76fd00aec16b8bd195e9fd1b544b1adacd314b63e8a4b09cc'
+const PRE_RESTORE_RECEIPT_SHA256 = '380b4de5fc0ed73930fa603d773a70dd698c8b961e0961f514163de678608688'
+const POST_RESTORE_RECEIPT_SHA256 = 'c1a2fff47d23305d157b468eab438868712ffe90ce213568e6c56f865b643aa5'
 const MAX_CANARY_AGE_MS = 90 * 60 * 1000
 const MAX_DRIFT_AGE_MS = 3 * 60 * 1000
 const FETCH_TIMEOUT_MS = 20_000
-const MAX_BODY_BYTES = 64 * 1024
+// 2026-09-02: the timestamped catalog passed 64 KiB at 37 snapshots and the
+// v5 sentinel reported snapshot_catalog_object_too_large; the bound is a guard
+// against runaway bodies, not a size budget for the catalog.
+const MAX_BODY_BYTES = 1024 * 1024
 const PREFIX = 'scv-instagram-automation/drift-attestations'
 const SNAPSHOT_LATEST_KEY = 'scv-instagram-automation/timestamped-snapshots/LATEST.json'
 
@@ -180,15 +182,15 @@ async function checkSnapshotControl(archive, options = {}) {
     check(latest?.seal?.sha256 === SNAPSHOT_SEAL_SHA256, 'snapshot_seal_pointer_hash')
     check(latest?.restore_tool?.key === `${expectedPrefix}/scv-timestamped-restore.js`, 'snapshot_restore_tool_key')
     check(latest?.restore_tool?.sha256 === SNAPSHOT_RESTORE_TOOL_SHA256, 'snapshot_restore_tool_pointer_hash')
-    check(latest?.restore_receipts?.pre_v138_omar_reset_2?.key ===
-      `${expectedPrefix}/receipts/pre-v138-omar-reset-2-20260902T191130Z.json`,
+    check(latest?.restore_receipts?.pre_v140_omar_reset?.key ===
+      `${expectedPrefix}/receipts/pre-v140-omar-reset-20260902T211747Z.json`,
     'snapshot_pre_restore_receipt_key')
-    check(latest?.restore_receipts?.pre_v138_omar_reset_2?.sha256 === PRE_RESTORE_RECEIPT_SHA256,
+    check(latest?.restore_receipts?.pre_v140_omar_reset?.sha256 === PRE_RESTORE_RECEIPT_SHA256,
       'snapshot_pre_restore_receipt_hash')
-    check(latest?.restore_receipts?.current_post_v138_omar_reset_2?.key ===
-      `${expectedPrefix}/receipts/current-post-v138-omar-reset-2-20260902T191131Z.json`,
+    check(latest?.restore_receipts?.current_post_v140_omar_reset?.key ===
+      `${expectedPrefix}/receipts/current-post-v140-omar-reset-20260902T211750Z.json`,
     'snapshot_post_restore_receipt_key')
-    check(latest?.restore_receipts?.current_post_v138_omar_reset_2?.sha256 ===
+    check(latest?.restore_receipts?.current_post_v140_omar_reset?.sha256 ===
       POST_RESTORE_RECEIPT_SHA256, 'snapshot_post_restore_receipt_hash')
     check(latest?.restore_requires_exact_snapshot_id === true, 'snapshot_exact_id_required')
     check(latest?.production_cutover_automatic === false, 'snapshot_automatic_cutover')
