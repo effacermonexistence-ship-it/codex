@@ -120,7 +120,12 @@ private func providerIntentSelfTest() throws {
 
     guard composerText(base: "", dictated: "안녕하세요") == "안녕하세요",
           composerText(base: "기존 작업", dictated: "계속해") == "기존 작업 계속해",
-          composerText(base: "first line\n", dictated: "둘째 줄") == "first line\n둘째 줄" else {
+          composerText(base: "first line\n", dictated: "둘째 줄") == "first line\n둘째 줄",
+          dictationText(committed: "첫 문장.", current: "둘째 문장") == "첫 문장. 둘째 문장",
+          composerText(
+            base: "이미 적은 내용",
+            dictated: dictationText(committed: "첫 구간", current: "둘째 구간")
+          ) == "이미 적은 내용 첫 구간 둘째 구간" else {
         throw RunnerError.message("OS-1 voice dictation composer merge self-test failed.")
     }
 
@@ -166,41 +171,110 @@ private func composerText(base: String, dictated transcript: String) -> String {
     return base + " " + transcript
 }
 
-/// AVAudioEngine calls its tap on a realtime queue. Keeping the Speech request
-/// in an explicitly Sendable bridge prevents Swift 6 from inheriting the
-/// controller's MainActor isolation into that callback and trapping at runtime.
-private final class SpeechAudioBufferSink: @unchecked Sendable {
-    private let request: SFSpeechAudioBufferRecognitionRequest
+private func dictationText(committed: String, current: String) -> String {
+    composerText(base: committed, dictated: current)
+}
 
-    init(request: SFSpeechAudioBufferRecognitionRequest) {
+private enum VoiceDictationPhase: Equatable {
+    case idle
+    case authorizing
+    case listening
+    case finalizing
+    case transcribing
+}
+
+private struct LocalWhisperConfiguration: Sendable {
+    let executableURL: URL
+    let modelID: String
+}
+
+private struct LocalWhisperResult: Decodable {
+    let text: String
+}
+
+/// AVAudioEngine calls its tap on a realtime queue. This explicitly Sendable
+/// bridge owns either the live Speech request or the local recording file and
+/// prevents the controller's MainActor isolation from leaking into that queue.
+private final class SpeechAudioBufferSink: @unchecked Sendable {
+    private let request: SFSpeechAudioBufferRecognitionRequest?
+    private let audioFile: AVAudioFile?
+    private let onLevel: @Sendable (CGFloat) -> Void
+    private var lastLevelUpdate = Date.distantPast
+
+    init(
+        request: SFSpeechAudioBufferRecognitionRequest? = nil,
+        audioFile: AVAudioFile? = nil,
+        onLevel: @escaping @Sendable (CGFloat) -> Void
+    ) {
         self.request = request
+        self.audioFile = audioFile
+        self.onLevel = onLevel
     }
 
     nonisolated func append(_ buffer: AVAudioPCMBuffer) {
-        request.append(buffer)
+        request?.append(buffer)
+        try? audioFile?.write(from: buffer)
+        guard Date().timeIntervalSince(lastLevelUpdate) >= 0.075,
+              let samples = buffer.floatChannelData?[0] else { return }
+        lastLevelUpdate = Date()
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return }
+        var sum: Float = 0
+        for index in 0..<frameCount {
+            let sample = samples[index]
+            sum += sample * sample
+        }
+        let rms = sqrt(sum / Float(frameCount))
+        let decibels = 20 * log10(max(rms, 0.000_01))
+        let normalized = CGFloat(max(0, min(1, (decibels + 52) / 52)))
+        onLevel(normalized)
     }
 }
 
 @MainActor
 private final class VoiceDictationController: ObservableObject {
-    @Published private(set) var isRecording = false
-    @Published private(set) var isAuthorizing = false
+    @Published private(set) var phase: VoiceDictationPhase = .idle
     @Published private(set) var level: CGFloat = 0
+    @Published private(set) var elapsedSeconds = 0
 
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var audioBufferSink: SpeechAudioBufferSink?
-    private var meterTimer: Timer?
+    private var elapsedTimer: Timer?
+    private var finishTimeoutTask: Task<Void, Never>?
+    private var restartTask: Task<Void, Never>?
+    private var localTranscriptionTask: Task<Void, Never>?
+    private var localWhisper: LocalWhisperConfiguration?
+    private var localRecordingURL: URL?
     private var baseText = ""
+    private var committedTranscript = ""
+    private var currentTranscript = ""
     private var onTranscript: ((String) -> Void)?
     private var onFailure: ((String) -> Void)?
+    private var onFinish: (() -> Void)?
     private var tapInstalled = false
     private var wantsRecording = false
     private var recognitionGeneration = 0
-    private var latestText = ""
+    private var consecutiveRecoveryCount = 0
 
-    var isActive: Bool { wantsRecording || isRecording || isAuthorizing }
+    var isActive: Bool { phase != .idle }
+    var isRecording: Bool { phase == .listening }
+    var isAuthorizing: Bool { phase == .authorizing }
+    var isFinalizing: Bool { phase == .finalizing || phase == .transcribing }
+    var engineLabel: String { localWhisper == nil ? "Apple speech" : "Local Whisper" }
+    var statusLabel: String {
+        switch phase {
+        case .idle: return "Voice"
+        case .authorizing: return "Starting…"
+        case .listening: return "Listening"
+        case .finalizing: return "Finishing…"
+        case .transcribing: return "Transcribing…"
+        }
+    }
+    var elapsedLabel: String {
+        String(format: "%d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
+    }
 
     func toggle(
         initialText: String,
@@ -208,43 +282,125 @@ private final class VoiceDictationController: ObservableObject {
         onFailure: @escaping (String) -> Void
     ) {
         if isActive {
-            stop()
+            finish()
             return
         }
         baseText = initialText
-        latestText = initialText
+        committedTranscript = ""
+        currentTranscript = ""
+        localWhisper = localWhisperConfiguration()
+        localRecordingURL = nil
         self.onTranscript = onTranscript
         self.onFailure = onFailure
+        self.onFinish = nil
         wantsRecording = true
-        isAuthorizing = true
+        phase = .authorizing
+        elapsedSeconds = 0
+        startElapsedTimer()
         Task { await authorizeAndStart() }
     }
 
-    func stop() {
+    /// Finish keeps the recognition task alive briefly so the final spoken
+    /// words reach the composer. This is deliberately different from cancel.
+    func finish(onComplete: (() -> Void)? = nil) {
+        if let onComplete { onFinish = onComplete }
+        guard isActive, !isFinalizing else { return }
         wantsRecording = false
-        tearDownRecognition()
-        isRecording = false
-        isAuthorizing = false
-        level = 0
+        if let configuration = localWhisper, let recordingURL = localRecordingURL {
+            phase = .transcribing
+            stopAudioCapture()
+            transcribeLocally(configuration: configuration, recordingURL: recordingURL)
+            return
+        }
+        phase = .finalizing
+        stopAudioCapture()
+        let generation = recognitionGeneration
+        finishTimeoutTask?.cancel()
+        finishTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard !Task.isCancelled, let self,
+                  self.phase == .finalizing,
+                  self.recognitionGeneration == generation else { return }
+            self.completeFinalization()
+        }
     }
 
-    private func tearDownRecognition() {
-        recognitionGeneration += 1
+    /// Cancel is lossless: it restores the exact text that existed before the
+    /// microphone was started.
+    func cancel() {
+        guard isActive else { return }
+        let restore = baseText
+        let transcriptHandler = onTranscript
+        resetRecognition(cancelTask: true)
+        phase = .idle
+        level = 0
+        elapsedSeconds = 0
+        transcriptHandler?(restore)
+        clearCallbacks()
+    }
+
+    /// Session changes and view teardown use cancellation so a late Speech
+    /// callback can never write into a different composer.
+    func stop() {
+        cancel()
+    }
+
+    private func stopAudioCapture() {
         if audioEngine.isRunning { audioEngine.stop() }
         if tapInstalled {
             audioEngine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
         recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
+        audioBufferSink = nil
+    }
+
+    private func resetRecognition(cancelTask: Bool) {
+        wantsRecording = false
+        recognitionGeneration += 1
+        restartTask?.cancel()
+        restartTask = nil
+        finishTimeoutTask?.cancel()
+        finishTimeoutTask = nil
+        localTranscriptionTask?.cancel()
+        localTranscriptionTask = nil
+        stopAudioCapture()
+        if cancelTask { recognitionTask?.cancel() }
         recognitionTask = nil
         recognitionRequest = nil
         audioBufferSink = nil
-        meterTimer?.invalidate()
-        meterTimer = nil
+        elapsedTimer?.invalidate()
+        elapsedTimer = nil
+        removeLocalRecording()
     }
 
     private func authorizeAndStart() async {
+        let microphoneGranted: Bool
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .notDetermined:
+            microphoneGranted = await AVCaptureDevice.requestAccess(for: .audio)
+        case .authorized:
+            microphoneGranted = true
+        default:
+            microphoneGranted = false
+        }
+        guard phase == .authorizing, wantsRecording else { return }
+        guard microphoneGranted else {
+            fail("Microphone access is off. Allow Open OS-1 Codex in System Settings → Privacy & Security → Microphone.")
+            return
+        }
+
+        if let configuration = localWhisper ?? localWhisperConfiguration() {
+            do {
+                localWhisper = configuration
+                try startLocalWhisperCapture()
+                return
+            } catch {
+                localWhisper = nil
+                removeLocalRecording()
+            }
+        }
+
         let speechStatus: SFSpeechRecognizerAuthorizationStatus
         switch SFSpeechRecognizer.authorizationStatus() {
         case .notDetermined:
@@ -256,24 +412,9 @@ private final class VoiceDictationController: ObservableObject {
         case let existing:
             speechStatus = existing
         }
-        guard isAuthorizing, wantsRecording else { return }
+        guard phase == .authorizing, wantsRecording else { return }
         guard speechStatus == .authorized else {
-            fail("Speech recognition access is off. Allow Open OS-1 Codex in System Settings → Privacy & Security → Speech Recognition.")
-            return
-        }
-
-        let microphoneGranted: Bool
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .notDetermined:
-            microphoneGranted = await AVCaptureDevice.requestAccess(for: .audio)
-        case .authorized:
-            microphoneGranted = true
-        default:
-            microphoneGranted = false
-        }
-        guard isAuthorizing, wantsRecording else { return }
-        guard microphoneGranted else {
-            fail("Microphone access is off. Allow Open OS-1 Codex in System Settings → Privacy & Security → Microphone.")
+            fail("Local Whisper is unavailable and Speech Recognition access is off. Install Handy or allow Open OS-1 Codex in System Settings → Privacy & Security → Speech Recognition.")
             return
         }
 
@@ -284,10 +425,70 @@ private final class VoiceDictationController: ObservableObject {
         }
     }
 
+    private func localWhisperConfiguration() -> LocalWhisperConfiguration? {
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser
+        let executableCandidates = [
+            URL(fileURLWithPath: "/Applications/Handy.app/Contents/MacOS/handy"),
+            home.appendingPathComponent("Applications/Handy.app/Contents/MacOS/handy"),
+        ]
+        guard let executableURL = executableCandidates.first(where: {
+            fileManager.isExecutableFile(atPath: $0.path)
+        }) else { return nil }
+
+        let support = home.appendingPathComponent("Library/Application Support/com.pais.handy")
+        let settingsURL = support.appendingPathComponent("settings_store.json")
+        guard let data = try? Data(contentsOf: settingsURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let settings = root["settings"] as? [String: Any],
+              let modelID = settings["selected_model"] as? String,
+              !modelID.isEmpty else { return nil }
+        let modelURL = support.appendingPathComponent("models").appendingPathComponent(
+            URL(fileURLWithPath: modelID).lastPathComponent
+        )
+        guard fileManager.fileExists(atPath: modelURL.path) else { return nil }
+        return LocalWhisperConfiguration(executableURL: executableURL, modelID: modelID)
+    }
+
+    private func startLocalWhisperCapture() throws {
+        let inputNode = audioEngine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw RunnerError.message("No microphone audio format is available.")
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("os1-dictation-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let recordingURL = directory.appendingPathComponent("recording.caf")
+        let audioFile = try AVAudioFile(forWriting: recordingURL, settings: format.settings)
+        localRecordingURL = recordingURL
+        let bufferSink = SpeechAudioBufferSink(audioFile: audioFile) { @Sendable [weak self] value in
+            Task { @MainActor [weak self] in
+                guard let self, self.phase == .listening else { return }
+                self.level = max(value, self.level * 0.62)
+            }
+        }
+        audioBufferSink = bufferSink
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: 1_024,
+            format: format,
+            block: { @Sendable [bufferSink] buffer, _ in
+                bufferSink.append(buffer)
+            }
+        )
+        tapInstalled = true
+        audioEngine.prepare()
+        try audioEngine.start()
+        phase = .listening
+        recognitionGeneration += 1
+    }
+
     private func startRecognition() throws {
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "ko-KR")),
+        let locale = preferredDictationLocale()
+        guard let recognizer = SFSpeechRecognizer(locale: locale),
               recognizer.isAvailable else {
-            throw RunnerError.message("Korean speech recognition is not available on this Mac right now.")
+            throw RunnerError.message("Speech recognition is not available on this Mac right now.")
         }
 
         recognitionTask?.cancel()
@@ -295,11 +496,20 @@ private final class VoiceDictationController: ObservableObject {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
+        request.contextualStrings = [
+            "OS-1", "OmarAGI", "Codex", "Claude Code", "RCC", "REVAS",
+            "Luna", "Terra", "Sol", "GitHub", "Cloudflare", "레바스", "코덱스", "클로드"
+        ]
+        if #available(macOS 13.0, *) {
+            request.addsPunctuation = true
         }
         recognitionRequest = request
-        let bufferSink = SpeechAudioBufferSink(request: request)
+        let bufferSink = SpeechAudioBufferSink(request: request) { @Sendable [weak self] value in
+            Task { @MainActor [weak self] in
+                guard let self, self.phase == .listening else { return }
+                self.level = max(value, self.level * 0.62)
+            }
+        }
         audioBufferSink = bufferSink
 
         let inputNode = audioEngine.inputNode
@@ -318,9 +528,7 @@ private final class VoiceDictationController: ObservableObject {
         tapInstalled = true
         audioEngine.prepare()
         try audioEngine.start()
-        isAuthorizing = false
-        isRecording = true
-        startLevelMeter(inputNode: inputNode)
+        phase = .listening
 
         recognitionGeneration += 1
         let generation = recognitionGeneration
@@ -330,17 +538,30 @@ private final class VoiceDictationController: ObservableObject {
             let errorMessage = error?.localizedDescription
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                guard self.wantsRecording,
+                guard self.phase != .idle,
                       self.recognitionGeneration == generation else { return }
-                if let transcript {
-                    let merged = composerText(base: self.baseText, dictated: transcript)
-                    self.latestText = merged
-                    self.onTranscript?(merged)
+                if let transcript, !transcript.isEmpty {
+                    self.currentTranscript = transcript
+                    self.consecutiveRecoveryCount = 0
+                    self.publishTranscript()
                 }
-                if let errorMessage, !isFinal {
-                    self.fail("Voice input stopped: \(errorMessage)")
-                } else if isFinal {
-                    self.restartAfterFinalResult()
+                if isFinal {
+                    self.commitCurrentSegment()
+                    if self.wantsRecording {
+                        self.restartAfterFinalResult()
+                    } else {
+                        self.completeFinalization()
+                    }
+                } else if let errorMessage {
+                    if self.wantsRecording, self.consecutiveRecoveryCount < 3 {
+                        self.consecutiveRecoveryCount += 1
+                        self.commitCurrentSegment()
+                        self.restartAfterFinalResult(delayNanoseconds: 220_000_000)
+                    } else if self.phase == .finalizing {
+                        self.completeFinalization()
+                    } else {
+                        self.fail("Voice input stopped: \(errorMessage)")
+                    }
                 }
             }
         }
@@ -348,14 +569,17 @@ private final class VoiceDictationController: ObservableObject {
 
     /// Speech may finalize a segment after a pause. Keep the microphone UI and
     /// user intent active while transparently rolling into a fresh segment.
-    private func restartAfterFinalResult() {
+    private func restartAfterFinalResult(delayNanoseconds: UInt64 = 120_000_000) {
         guard wantsRecording else { return }
-        baseText = latestText
-        tearDownRecognition()
-        isRecording = true
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 120_000_000)
-            guard let self, self.wantsRecording else { return }
+        recognitionGeneration += 1
+        stopAudioCapture()
+        recognitionTask = nil
+        recognitionRequest = nil
+        phase = .listening
+        restartTask?.cancel()
+        restartTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard !Task.isCancelled, let self, self.wantsRecording else { return }
             do {
                 try self.startRecognition()
             } catch {
@@ -364,20 +588,166 @@ private final class VoiceDictationController: ObservableObject {
         }
     }
 
-    private func startLevelMeter(inputNode: AVAudioInputNode) {
-        meterTimer?.invalidate()
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self, weak inputNode] _ in
-            guard let inputNode else { return }
-            let raw = CGFloat(max(0, min(1, inputNode.volume)))
-            Task { @MainActor [weak self] in
-                self?.level = max(0.18, raw)
+    private func transcribeLocally(
+        configuration: LocalWhisperConfiguration,
+        recordingURL: URL
+    ) {
+        let generation = recognitionGeneration
+        localTranscriptionTask?.cancel()
+        localTranscriptionTask = Task { [weak self] in
+            do {
+                let transcript = try await Task.detached(priority: .userInitiated) {
+                    try Self.performLocalWhisperTranscription(
+                        configuration: configuration,
+                        recordingURL: recordingURL
+                    )
+                }.value
+                guard !Task.isCancelled, let self,
+                      self.phase == .transcribing,
+                      self.recognitionGeneration == generation else { return }
+                self.currentTranscript = transcript
+                self.publishTranscript()
+                self.completeFinalization()
+            } catch {
+                guard !Task.isCancelled, let self,
+                      self.phase == .transcribing,
+                      self.recognitionGeneration == generation else { return }
+                self.fail("Local Whisper could not transcribe this recording: \(error.localizedDescription)")
             }
         }
     }
 
+    nonisolated private static func performLocalWhisperTranscription(
+        configuration: LocalWhisperConfiguration,
+        recordingURL: URL
+    ) throws -> String {
+        let waveURL = recordingURL.deletingLastPathComponent().appendingPathComponent("recording.wav")
+        defer { try? FileManager.default.removeItem(at: recordingURL.deletingLastPathComponent()) }
+
+        _ = try runProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/afconvert"),
+            arguments: [
+                "-f", "WAVE", "-d", "LEI16@16000", "-c", "1",
+                recordingURL.path, waveURL.path,
+            ]
+        )
+        let output = try runProcess(
+            executableURL: configuration.executableURL,
+            arguments: [
+                "--transcribe-file", waveURL.path,
+                "--model", configuration.modelID,
+                "--json",
+            ]
+        )
+        let decoder = JSONDecoder()
+        let result: LocalWhisperResult
+        if let decoded = try? decoder.decode(LocalWhisperResult.self, from: output) {
+            result = decoded
+        } else if let line = String(data: output, encoding: .utf8)?
+            .split(separator: "\n")
+            .reversed()
+            .first(where: { $0.first == "{" }),
+            let data = String(line).data(using: .utf8) {
+            result = try decoder.decode(LocalWhisperResult.self, from: data)
+        } else {
+            throw RunnerError.message("Handy returned an unreadable transcription result.")
+        }
+        let transcript = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !transcript.isEmpty else {
+            throw RunnerError.message("No speech was detected.")
+        }
+        return transcript
+    }
+
+    nonisolated private static func runProcess(
+        executableURL: URL,
+        arguments: [String]
+    ) throws -> Data {
+        let process = Process()
+        let standardOutput = Pipe()
+        let standardError = Pipe()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardOutput = standardOutput
+        process.standardError = standardError
+        try process.run()
+        process.waitUntilExit()
+        let output = standardOutput.fileHandleForReading.readDataToEndOfFile()
+        let errorOutput = standardError.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else {
+            let detail = String(data: errorOutput, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw RunnerError.message(detail?.isEmpty == false ? detail! : "Voice engine exited unexpectedly.")
+        }
+        return output
+    }
+
+    private func removeLocalRecording() {
+        guard let localRecordingURL else { return }
+        try? FileManager.default.removeItem(at: localRecordingURL.deletingLastPathComponent())
+        self.localRecordingURL = nil
+    }
+
+    private func preferredDictationLocale() -> Locale {
+        let preferred = Locale.preferredLanguages
+        if let korean = preferred.first(where: { $0.lowercased().hasPrefix("ko") }) {
+            return Locale(identifier: korean)
+        }
+        return Locale.current
+    }
+
+    private func publishTranscript() {
+        let dictated = dictationText(committed: committedTranscript, current: currentTranscript)
+        onTranscript?(composerText(base: baseText, dictated: dictated))
+    }
+
+    private func commitCurrentSegment() {
+        guard !currentTranscript.isEmpty else { return }
+        committedTranscript = dictationText(committed: committedTranscript, current: currentTranscript)
+        currentTranscript = ""
+        publishTranscript()
+    }
+
+    private func completeFinalization() {
+        guard phase != .idle else { return }
+        commitCurrentSegment()
+        let completion = onFinish
+        resetRecognition(cancelTask: true)
+        phase = .idle
+        level = 0
+        clearCallbacks()
+        completion?()
+    }
+
+    private func startElapsedTimer() {
+        elapsedTimer?.invalidate()
+        elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.phase != .idle else { return }
+                self.elapsedSeconds += 1
+            }
+        }
+    }
+
+    private func clearCallbacks() {
+        onTranscript = nil
+        onFailure = nil
+        onFinish = nil
+        baseText = ""
+        committedTranscript = ""
+        currentTranscript = ""
+        localWhisper = nil
+        consecutiveRecoveryCount = 0
+    }
+
     private func fail(_ message: String) {
-        stop()
-        onFailure?(message)
+        commitCurrentSegment()
+        let failure = onFailure
+        resetRecognition(cancelTask: true)
+        phase = .idle
+        level = 0
+        clearCallbacks()
+        failure?(message)
     }
 }
 
@@ -1378,12 +1748,26 @@ private final class SessionStore: ObservableObject {
         )
     }
 
+    func finishVoiceDictation() {
+        voiceDictation.finish()
+    }
+
+    @discardableResult
+    func cancelVoiceDictation() -> Bool {
+        guard voiceDictation.isActive else { return false }
+        voiceDictation.cancel()
+        return true
+    }
+
     func stopVoiceDictation() {
         voiceDictation.stop()
     }
 
     func send() {
-        voiceDictation.stop()
+        if voiceDictation.isActive {
+            voiceDictation.finish { [weak self] in self?.send() }
+            return
+        }
         let request = composer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !request.isEmpty, let index = selectedIndex else { return }
         var isDirectory: ObjCBool = false
@@ -1738,6 +2122,18 @@ private struct OS1DesktopApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New session pair") { store.createSession() }
                     .keyboardShortcut("n", modifiers: [.command])
+            }
+            CommandMenu("Voice") {
+                Button(store.voiceDictation.isActive ? "Finish Dictation" : "Start Dictation") {
+                    store.toggleVoiceDictation()
+                }
+                .keyboardShortcut(.space, modifiers: [.command, .shift])
+
+                Button("Cancel Dictation") {
+                    _ = store.cancelVoiceDictation()
+                }
+                .keyboardShortcut(.escape, modifiers: [])
+                .disabled(!store.voiceDictation.isActive)
             }
         }
     }
@@ -2786,12 +3182,16 @@ private struct MessageView: View {
 private final class ComposerKeyMonitor: ObservableObject {
     var isFocused = false
     var submit: (() -> Void)?
+    var cancelVoice: (() -> Bool)?
     private var eventMonitor: Any?
 
     func start() {
         guard eventMonitor == nil else { return }
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.isFocused else { return event }
+            if event.keyCode == 53, self.cancelVoice?() == true {
+                return nil
+            }
             let isReturn = event.keyCode == 36 || event.keyCode == 76
             guard isReturn,
                   composerReturnAction(shiftPressed: event.modifierFlags.contains(.shift)) == .send else {
@@ -2816,6 +3216,7 @@ private final class ComposerKeyMonitor: ObservableObject {
 private struct ClaudexComposerEditor: View {
     @Binding var text: String
     let onSubmit: () -> Void
+    let onCancelVoice: () -> Bool
     @StateObject private var keyMonitor = ComposerKeyMonitor()
     @FocusState private var isFocused: Bool
 
@@ -2827,6 +3228,7 @@ private struct ClaudexComposerEditor: View {
             .focused($isFocused)
             .onAppear {
                 keyMonitor.submit = onSubmit
+                keyMonitor.cancelVoice = onCancelVoice
                 isFocused = true
                 keyMonitor.isFocused = true
                 keyMonitor.start()
@@ -2841,39 +3243,102 @@ private struct ClaudexComposerEditor: View {
     }
 }
 
-private struct VoiceDictationButton: View {
-    @ObservedObject var controller: VoiceDictationController
-    let toggle: () -> Void
+private struct VoiceWaveform: View {
+    let level: CGFloat
+
+    private let weights: [CGFloat] = [0.44, 0.72, 1, 0.62, 0.86]
 
     var body: some View {
-        Button(action: toggle) {
-            ZStack {
-                if controller.isRecording {
-                    Circle()
-                        .stroke(Theme.pink.opacity(0.38), lineWidth: 2)
-                        .scaleEffect(1 + controller.level * 0.16)
-                        .opacity(0.85 - controller.level * 0.25)
-                }
-                Circle()
-                    .fill(controller.isRecording ? Theme.pink : Theme.panelRaised)
-                if controller.isAuthorizing {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(Theme.pink)
-                } else {
-                    Image(systemName: controller.isRecording ? "stop.fill" : "mic.fill")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(controller.isRecording ? Color.black.opacity(0.86) : Theme.text)
-                }
+        HStack(alignment: .center, spacing: 3) {
+            ForEach(Array(weights.enumerated()), id: \.offset) { _, weight in
+                Capsule()
+                    .fill(Theme.pink)
+                    .frame(width: 3, height: 6 + (max(0.12, level) * 17 * weight))
             }
-            .frame(width: 44, height: 44)
-            .overlay(
-                Circle().stroke(controller.isRecording ? Theme.pink : Theme.borderStrong)
-            )
         }
-        .buttonStyle(.plain)
-        .help(controller.isRecording ? "Stop voice input" : "Dictate task")
-        .accessibilityLabel(controller.isRecording ? "Stop voice input" : "Start voice input")
+        .frame(width: 28, height: 28)
+        .animation(.easeOut(duration: 0.09), value: level)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct VoiceDictationControl: View {
+    @ObservedObject var controller: VoiceDictationController
+    let start: () -> Void
+    let finish: () -> Void
+    let cancel: () -> Void
+
+    var body: some View {
+        Group {
+            if controller.isActive {
+                HStack(spacing: 6) {
+                    Button(action: cancel) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                            .frame(width: 30, height: 30)
+                            .foregroundStyle(Theme.muted)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Cancel and restore the previous text (Esc)")
+                    .accessibilityLabel("Cancel voice input")
+
+                    if controller.isAuthorizing || controller.isFinalizing {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(Theme.pink)
+                            .frame(width: 28, height: 28)
+                    } else {
+                        VoiceWaveform(level: controller.level)
+                    }
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(controller.statusLabel)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Theme.text)
+                        Text("\(controller.engineLabel) · \(controller.elapsedLabel)")
+                            .font(.system(size: 9, weight: .medium, design: .rounded))
+                            .foregroundStyle(Theme.muted)
+                            .fixedSize()
+                    }
+                    .frame(minWidth: 52, alignment: .leading)
+
+                    Button(action: finish) {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(Color.black.opacity(0.86))
+                            .frame(width: 32, height: 32)
+                            .background(Theme.pink)
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(controller.isFinalizing)
+                    .help("Use this transcript")
+                    .accessibilityLabel("Finish voice input")
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
+                .background(Theme.panelRaised)
+                .overlay(
+                    Capsule().stroke(Theme.pink.opacity(0.56), lineWidth: 1)
+                )
+                .clipShape(Capsule())
+                .transition(.opacity.combined(with: .scale(scale: 0.94)))
+            } else {
+                Button(action: start) {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                        .frame(width: 44, height: 44)
+                        .background(Theme.panelRaised)
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(Theme.borderStrong))
+                }
+                .buttonStyle(.plain)
+                .help("Dictate task (⌘⇧Space)")
+                .accessibilityLabel("Start voice input")
+            }
+        }
+        .animation(.easeInOut(duration: 0.16), value: controller.isActive)
     }
 }
 
@@ -2884,7 +3349,11 @@ private struct ComposerView: View {
     var body: some View {
         VStack(spacing: 10) {
             HStack(alignment: .bottom, spacing: 12) {
-                ClaudexComposerEditor(text: $store.composer, onSubmit: store.send)
+                ClaudexComposerEditor(
+                    text: $store.composer,
+                    onSubmit: store.send,
+                    onCancelVoice: store.cancelVoiceDictation
+                )
                     .frame(minHeight: 70, maxHeight: 130)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
@@ -2899,9 +3368,11 @@ private struct ComposerView: View {
                         }
                     }
 
-                VoiceDictationButton(
+                VoiceDictationControl(
                     controller: store.voiceDictation,
-                    toggle: store.toggleVoiceDictation
+                    start: store.toggleVoiceDictation,
+                    finish: store.finishVoiceDictation,
+                    cancel: { _ = store.cancelVoiceDictation() }
                 )
 
                 Button { store.send() } label: {
@@ -2940,17 +3411,16 @@ private struct ComposerView: View {
                     Label("\(store.selectedSessionQueueCount) queued", systemImage: "text.line.last.and.arrowtriangle.forward")
                         .foregroundStyle(Theme.pink)
                 }
-                if store.voiceDictation.isRecording {
+                if store.voiceDictation.isActive {
                     Text("·")
-                    Label("Listening…", systemImage: "waveform")
-                        .foregroundStyle(Theme.pink)
-                } else if store.voiceDictation.isAuthorizing {
-                    Text("·")
-                    Text("Starting microphone…")
+                    Label(
+                        "\(store.voiceDictation.statusLabel) · \(store.voiceDictation.engineLabel) · \(store.voiceDictation.elapsedLabel)",
+                        systemImage: "waveform"
+                    )
                         .foregroundStyle(Theme.pink)
                 }
                 Spacer()
-                Text("mic dictate · ↩ send · ⇧↩ newline")
+                Text("⌘⇧Space dictate · Esc cancel · ↩ send · ⇧↩ newline")
             }
             .font(.system(size: 9, weight: .medium, design: .rounded))
             .foregroundStyle(Theme.muted)
