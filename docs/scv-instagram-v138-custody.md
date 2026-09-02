@@ -83,7 +83,7 @@ block. All ten production workers were running with the exact expected command s
 
 - Private catalog pointer:
   `scv-instagram-automation/timestamped-snapshots/LATEST.json`
-- Catalog control version: `20260902T055310Z (built and sealed locally; R2 publication pending, see below)`
+- Catalog control version: `20260902T055310Z`
 - Snapshot count: `29`
 - April golden snapshot, unchanged:
   `scv-instagram-20260420T152810-local-origin`
@@ -102,9 +102,9 @@ block. All ten production workers were running with the exact expected command s
 - Exact-target reset receipt SHA-256:
   `2e3af658b6a0c22b940c74e35d9d5ab44c521f6c922d1c8b23689b53a249de11`
 - Pre-reset staged-restore receipt SHA-256:
-  `pending (staged restore from the published R2 control has not run yet)`
+  `c3b536365dd1934a89403c429998cf14a01db4635fe8a6f292552c1ee3ebd806`
 - Post-reset staged-restore receipt SHA-256:
-  `pending (staged restore from the published R2 control has not run yet)`
+  `484f183b08411b5aad97fa8f43c7861a9e027911e644012265c28eca3a8e084e`
 
 All ten production workers were stopped and verified before capture. The
 code-locked debug audit changed from six matching artifacts to zero, the reset
@@ -117,16 +117,15 @@ Both archives and the reset receipt were downloaded from the production
 container, hashed byte for byte against the operator output, and restored into
 new local directories where the tree hashes and entry counts were reproduced.
 
-## Pending private publication
-
-The v138 runtime archive, both production-state archives, the reset receipt,
-and the sealed 29-snapshot catalog control set were built, hashed, and verified
-locally, but Cloudflare authentication for the pinned Wrangler was not available
-in the session that shipped v138. The R2 uploads, byte-for-byte readbacks, the
-exact-ID staged restore drills from the published control, the `LATEST.json`
-pointer update, and the sentinel redeploy are therefore still pending. The April
-golden pointer and the v137 current point in R2 are unchanged; nothing was
-overwritten. This record will be updated when publication completes.
+The runtime archive, both state archives, reset receipt, catalog, seal, and
+restore receipts were uploaded to R2 after the owner re-authenticated the pinned
+Wrangler, then downloaded again and checked byte for byte. The restore tool
+first restored both exact v138 timestamps from the locally sealed control, and
+then again from the published control after `LATEST.json` moved to
+`20260902T055310Z`; every drill reported `production_mutated: false` and
+reproduced the receipt tree hashes and entry counts. The April golden pointer
+remained separate, the v138 post-reset point became current, and the v137
+current point was retained as history.
 
 ## Live red-team and visibility boundary
 
@@ -155,7 +154,7 @@ probe or an explicit operator resolution closes it.
 ## Independent drift sentinel
 
 - Worker: `scv-instagram-drift-sentinel`
-- Worker version: `pending (the Worker still attests the v137 coordinates until it is redeployed)`
+- Worker version: `c3dc52f3-f530-4172-b345-be7fa19f15f0`
 - Schedule: every five minutes
 - Safe health endpoint:
   `https://scv-instagram-drift-sentinel.omar-git-r2-backup.workers.dev/health`
@@ -166,6 +165,12 @@ The Worker checks the exact v138 release ID, source fingerprint, release
 manifest, critical drift, fail-close state, voice and vision capabilities, and
 dated visible model. It also verifies the sealed 29-snapshot R2 timeline, the
 distinct April golden and v138 current pointers, the pre-to-post reset link,
-the debug audit counts, the reset receipt hash, and both exact-ID staged
+the six-to-zero debug audit, the reset receipt hash, and both exact-ID staged
 restore receipt hashes. Its source contains no credentials or customer message
-content. Redeploying the Worker for v138 requires Cloudflare authentication that was not available in the session that shipped v138; until then its scheduled attestations fail closed against the retired v137 expectation, which is the intended behaviour for a release the sentinel has not been told about.
+content. Between the v138 production deployment and the Worker redeploy its
+scheduled attestations failed closed against the retired v137 expectation, which
+is the intended behaviour for a release the sentinel has not been told about.
+The first scheduled v138 attestation at `2026-09-02T18:55:28.000Z` passed
+production, staging, and snapshot control with zero consecutive failures; its
+SHA-256 is
+`3e74c7f2b43407cfcef9a3128a2dd5bd780efa3541c181aef01770040702e924`.
