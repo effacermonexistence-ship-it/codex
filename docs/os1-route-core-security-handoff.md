@@ -191,6 +191,11 @@ surrogate routing, client-output fabrication on an owner-controlled Mac, and
 decision-boundary approximation remain structural residual risks and must be
 measured and documented rather than marked resolved.
 
+Each timestamped private R2 recovery set stores the source snapshot, unsigned
+development package, explicit terminal beta ZIP, release manifest, policy
+candidate, and a hash manifest tied to the exact Git revision. The beta ZIP is
+recovery material only; archiving it does not activate a public release.
+
 After both Developer ID identities are installed in the login keychain and a
 notarytool keychain profile has been created, the release builder is invoked as:
 

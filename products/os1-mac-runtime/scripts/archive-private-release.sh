@@ -8,10 +8,11 @@ readonly policy_candidate="${1:?policy candidate path required}"
 readonly release_id="${2:?release id required}"
 readonly archive_dir="/tmp/os1-private-archive.${release_id}"
 readonly package_path="$runtime_root/release/OS-1-0.8.0.pkg"
+readonly beta_bundle_path="$runtime_root/release/OS-1-0.8.0-macOS-beta.zip"
 readonly release_manifest="$runtime_root/release/latest.json"
 
 [[ "$release_id" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
-[[ -f "$policy_candidate" && -f "$package_path" && -f "$release_manifest" ]]
+[[ -f "$policy_candidate" && -f "$package_path" && -f "$beta_bundle_path" && -f "$release_manifest" ]]
 [[ ! -e "$archive_dir" ]]
 
 if find \
@@ -52,6 +53,7 @@ COPYFILE_DISABLE=1 tar \
   pnpm-lock.yaml pnpm-workspace.yaml package.json
 
 install -m 0600 "$package_path" "$archive_dir/OS-1-0.8.0-development.pkg"
+install -m 0600 "$beta_bundle_path" "$archive_dir/OS-1-0.8.0-macOS-beta.zip"
 install -m 0600 "$release_manifest" "$archive_dir/latest-development.json"
 install -m 0600 "$policy_candidate" "$archive_dir/policy-candidate.json"
 
@@ -69,6 +71,7 @@ node -e '
 ' "$archive_dir/manifest.json" "$release_id" "$(git -C "$repository_root" rev-parse HEAD)" \
   "$archive_dir/source-private.tar.gz" \
   "$archive_dir/OS-1-0.8.0-development.pkg" \
+  "$archive_dir/OS-1-0.8.0-macOS-beta.zip" \
   "$archive_dir/latest-development.json" \
   "$archive_dir/policy-candidate.json"
 
