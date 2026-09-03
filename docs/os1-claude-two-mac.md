@@ -16,10 +16,14 @@ distinct connected nodes and creates a `Pipeline`/`MlxRing` instance with a
 minimum node count of two. It deletes that exact temporary instance after the
 draft completes or fails. There is no single-node fallback.
 
-The hook is fail-open for Claude Code availability: if the local EXO service is
-not ready, it supplies no draft and Claude Code continues normally. It does not
-store ZeroTier addresses, EXO peer IDs, model credentials, or Cloudflare
-credentials in Claude Code settings.
+The hook is fail-open for Claude Code availability. It serializes local draft
+inference so concurrent prompts cannot create overlapping EXO instances,
+enforces a short local deadline, and opens a one-minute circuit breaker after a
+cluster failure. If the local EXO service is not ready, it supplies no draft and
+Claude Code continues normally. This changes only optional local context
+generation; Claude Code's hosted model inference is not distributed across the
+Macs. The hook does not store ZeroTier addresses, EXO peer IDs, model
+credentials, or Cloudflare credentials in Claude Code settings.
 
 Use `os1 exo-doctor` to confirm that the local EXO API currently sees the two
 required nodes.
