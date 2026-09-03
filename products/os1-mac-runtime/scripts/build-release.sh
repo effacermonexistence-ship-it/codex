@@ -4,7 +4,7 @@ set -euo pipefail
 readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly runtime_root="$(cd "$script_dir/.." && pwd)"
 readonly repository_root="$(cd "$runtime_root/../.." && pwd)"
-readonly version="${OS1_VERSION:-0.7.11}"
+readonly version="${OS1_VERSION:-0.7.12}"
 readonly output_dir="${OS1_RELEASE_OUTPUT_DIR:-$runtime_root/release}"
 readonly stage_dir="$output_dir/stage"
 readonly component_pkg="$output_dir/OS-1-component.pkg"
@@ -60,6 +60,7 @@ else
   printf '%s  %s\n' \
     '92c54350e9eb6fcba28155db5efbbba4bde29a9936f291a058c319448247ba6a' \
     "$private_core_source/hinton_forward_forward_state.json" | shasum -a 256 -c -
+  python3 "$private_core_source/os1_local_core.py" self-test
 fi
 
 if [[ "$skip_build" == "1" ]]; then
