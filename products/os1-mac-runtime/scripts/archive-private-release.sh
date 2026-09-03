@@ -51,6 +51,7 @@ COPYFILE_DISABLE=1 tar \
   products/os1-auth-service \
   products/os1-device-registry \
   pnpm-lock.yaml pnpm-workspace.yaml package.json
+chmod 0600 "$archive_dir/source-private.tar.gz"
 
 install -m 0600 "$package_path" "$archive_dir/OS-1-0.8.0-development.pkg"
 install -m 0600 "$beta_bundle_path" "$archive_dir/OS-1-0.8.0-macOS-beta.zip"
