@@ -1,5 +1,7 @@
 # SCV Instagram GOLD-2 custody record (2026-09-03)
 
+> Superseded on 2026-09-03 by [GOLD-3](scv-instagram-gold-3-2026-09-03.md) (v148). GOLD-2 stays in R2 as the previous gold.
+
 GOLD-2 is the owner-verified v145 production state, frozen on 2026-09-03 after the owner red-teamed it end to end and accepted it. This record carries the identities and hashes only; every artifact lives in the private R2 bucket and the private archives. It replaces the mid-April 2026 golden reference as the behavioral bar.
 
 ## What is frozen

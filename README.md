@@ -182,8 +182,8 @@ repositories are not affected. A fork push is reported separately from the
 upstream merge that triggers the GitHub Actions upload to R2.
 
 Product-specific release and custody coordinates are deliberately kept out of
-the global Codex and Claude instructions. The active SCV Instagram custody record is `docs/scv-instagram-gold-2026-09-03.md`
-(GOLD-2, the frozen owner-verified v145 state and its anti-drift gate); the v138 to v145
+the global Codex and Claude instructions. The active SCV Instagram custody record is `docs/scv-instagram-gold-3-2026-09-03.md`
+(GOLD-3, the frozen v148 state: owner-verified v145 plus the owner-ordered polish, and its anti-drift gate); GOLD-2 (`docs/scv-instagram-gold-2026-09-03.md`) and the v138 to v148
 release records are retained alongside it; older records are
 retained as timestamped history.
 
