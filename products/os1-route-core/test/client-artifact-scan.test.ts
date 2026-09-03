@@ -32,4 +32,20 @@ describe("client release artifact hygiene gate", () => {
     expect(result.findings).toHaveLength(1);
     expect(JSON.stringify(result.findings)).not.toContain("private routing prompt");
   });
+
+  it("rejects legacy private-core paths even when their contents are empty", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "os1-private-path-"));
+    temporaryDirectories.push(directory);
+    await writeFile(join(directory, "darwin_routed_rcc.py"), "");
+    const result = await scanClientArtifacts([directory]);
+    expect(result.findings.some((finding) => finding.kind === "forbidden_path")).toBe(true);
+  });
+
+  it("rejects a private-core filename embedded in a binary string", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "os1-private-string-"));
+    temporaryDirectories.push(directory);
+    await writeFile(join(directory, "runtime.bin"), "prefix\\0os1_local_core.py\\0suffix");
+    const result = await scanClientArtifacts([directory]);
+    expect(result.findings.some((finding) => finding.kind === "forbidden_content")).toBe(true);
+  });
 });

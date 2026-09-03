@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+
+# 0.7.x installed a product-owned local decision directory. Public releases
+# remove that exact legacy directory during upgrade; no user directory or
+# external path is traversed.
+readonly legacy_core="/Library/Application Support/OS-1/private-core"
+if [[ -d "$legacy_core" && ! -L "$legacy_core" ]]; then
+  /usr/bin/find -x "$legacy_core" -depth -delete
+fi
+
+exit 0

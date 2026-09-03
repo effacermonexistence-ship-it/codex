@@ -1,29 +1,26 @@
-import { parsePolicy, type Policy } from "./policy";
-
 const SHA256 = /^[0-9a-f]{64}$/;
 const POLICY_KEY = /^os1\/policies\/([0-9a-f]{64})\.json$/;
 const CONTRACT_VERSION = /^[A-Za-z0-9._-]{8,96}$/;
+const MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{1,95}$/;
+const EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
-export type RevasPolicy = {
-  version: 1;
-  minimum_output_chars: number;
-  pass_score: number;
-  retry_score: number;
-  transient_patterns: string[];
-  failure_patterns: string[];
-  incomplete_patterns: string[];
-  mutation_terms: string[];
-  exact_reply_terms: string[];
-  evidence_terms: string[];
-  stop_words: string[];
+export type ExecutionProvider = "local" | "codex" | "claude";
+export type ExecutionProfile = { provider: ExecutionProvider; model: string; effort: string };
+export type ExecutionProfiles = Record<string, ExecutionProfile>;
+export type RccPolicyIdentity = {
+  adapter_version: string;
+  policy_sha256: string;
+  engine_sha256: string;
+  authority_sha256: string;
 };
 
 export type PolicyBundle = {
-  schema: 1;
+  schema: 4;
   policy_version: string;
-  executor_contract: { version: string; sha256: string };
-  routing: Policy;
-  revas: RevasPolicy;
+  executor_contracts: Array<{ version: string; sha256: string }>;
+  execution_profiles: ExecutionProfiles;
+  maximum_steps: number;
+  rcc: RccPolicyIdentity;
 };
 
 function exact(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -36,58 +33,88 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function boundedList(value: unknown, maximum: number): value is string[] {
-  return Array.isArray(value) && value.length <= maximum && value.every(
-    (entry) => typeof entry === "string" && entry.length >= 2 && entry.length <= 128,
-  );
+function parseExecutionProfile(value: unknown): ExecutionProfile {
+  if (!record(value) || !exact(value, ["provider", "model", "effort"]) ||
+    !["local", "codex", "claude"].includes(String(value.provider)) ||
+    typeof value.model !== "string" || !MODEL_IDENTIFIER.test(value.model) ||
+    typeof value.effort !== "string" || !EFFORTS.has(value.effort)
+  ) throw new Error("invalid policy bundle");
+  return { provider: value.provider as ExecutionProvider, model: value.model, effort: value.effort };
 }
 
-function parseRevas(value: unknown): RevasPolicy {
-  if (!record(value) || !exact(value, [
-    "version", "minimum_output_chars", "pass_score", "retry_score",
-    "transient_patterns", "failure_patterns", "incomplete_patterns",
-    "mutation_terms", "exact_reply_terms", "evidence_terms", "stop_words",
-  ])) throw new Error("invalid policy bundle");
-  if (
-    value.version !== 1 ||
-    !Number.isSafeInteger(value.minimum_output_chars) ||
-    (value.minimum_output_chars as number) < 1 || (value.minimum_output_chars as number) > 8_192 ||
-    !Number.isSafeInteger(value.pass_score) || (value.pass_score as number) < 1 || (value.pass_score as number) > 100 ||
-    !Number.isSafeInteger(value.retry_score) || (value.retry_score as number) < 0 ||
-    (value.retry_score as number) >= (value.pass_score as number) ||
-    !boundedList(value.transient_patterns, 64) ||
-    !boundedList(value.failure_patterns, 64) ||
-    !boundedList(value.incomplete_patterns, 64) ||
-    !boundedList(value.mutation_terms, 64) ||
-    !boundedList(value.exact_reply_terms, 32) ||
-    !boundedList(value.evidence_terms, 64) ||
-    !boundedList(value.stop_words, 128)
-  ) throw new Error("invalid policy bundle");
-  return value as RevasPolicy;
+export function parseExecutionProfiles(value: unknown): ExecutionProfiles {
+  if (!record(value)) throw new Error("invalid policy bundle");
+  const entries = Object.entries(value);
+  if (entries.length < 5 || entries.length > 64) throw new Error("invalid policy bundle");
+  const output: ExecutionProfiles = {};
+  for (const [action, candidate] of entries) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(action) || !record(candidate) ||
+      !exact(candidate, ["provider", "model", "effort"]) ||
+      !["local", "codex", "claude"].includes(String(candidate.provider))) {
+      throw new Error("invalid policy bundle");
+    }
+    const profile = parseExecutionProfile(candidate);
+    if ((candidate.provider === "local") !== (profile.effort === "none") ||
+      (candidate.provider === "local" && profile.model !== "local-deterministic")) {
+      throw new Error("invalid policy bundle");
+    }
+    output[action] = profile;
+  }
+  return output;
+}
+
+export function executionProfileFor(
+  profiles: ExecutionProfiles,
+  provider: ExecutionProvider,
+  action: string,
+): ExecutionProfile {
+  const profile = profiles[action];
+  if (!profile || profile.provider !== provider) throw new Error("invalid execution profile");
+  return profile;
+}
+
+function parseRccIdentity(value: unknown): RccPolicyIdentity {
+  if (!record(value) || !exact(value, ["adapter_version", "policy_sha256", "engine_sha256", "authority_sha256"]) ||
+    typeof value.adapter_version !== "string" || !CONTRACT_VERSION.test(value.adapter_version) ||
+    typeof value.policy_sha256 !== "string" || !SHA256.test(value.policy_sha256) ||
+    typeof value.engine_sha256 !== "string" || !SHA256.test(value.engine_sha256) ||
+    typeof value.authority_sha256 !== "string" || !SHA256.test(value.authority_sha256)) {
+    throw new Error("invalid policy bundle");
+  }
+  return value as RccPolicyIdentity;
 }
 
 export function parsePolicyBundle(serialized: string): PolicyBundle {
   const value = JSON.parse(serialized) as unknown;
-  if (!record(value) || !exact(value, [
-    "schema", "policy_version", "executor_contract", "routing", "revas",
-  ]) || value.schema !== 1 || typeof value.policy_version !== "string" ||
-    value.policy_version.length < 8 || value.policy_version.length > 96 ||
-    !record(value.executor_contract) ||
-    !exact(value.executor_contract, ["version", "sha256"]) ||
-    typeof value.executor_contract.version !== "string" ||
-    !CONTRACT_VERSION.test(value.executor_contract.version) ||
-    typeof value.executor_contract.sha256 !== "string" ||
-    !SHA256.test(value.executor_contract.sha256)
+  if (!record(value) || value.schema !== 4 ||
+    typeof value.policy_version !== "string" ||
+    value.policy_version.length < 8 || value.policy_version.length > 96
   ) throw new Error("invalid policy bundle");
+  const candidates = exact(value, [
+    "schema", "policy_version", "executor_contracts", "execution_profiles", "maximum_steps", "rcc",
+  ]) && Array.isArray(value.executor_contracts) ? value.executor_contracts : null;
+  if (!candidates || candidates.length < 1 || candidates.length > 4 ||
+    candidates.some((candidate) => !record(candidate) ||
+      !exact(candidate, ["version", "sha256"]) ||
+      typeof candidate.version !== "string" || !CONTRACT_VERSION.test(candidate.version) ||
+      typeof candidate.sha256 !== "string" || !SHA256.test(candidate.sha256))
+  ) throw new Error("invalid policy bundle");
+  const executorContracts = candidates.map((candidate) => ({
+    version: String((candidate as Record<string, unknown>).version),
+    sha256: String((candidate as Record<string, unknown>).sha256),
+  }));
+  if (new Set(executorContracts.map((contract) => contract.version)).size !== executorContracts.length ||
+    new Set(executorContracts.map((contract) => contract.sha256)).size !== executorContracts.length
+  ) throw new Error("invalid policy bundle");
+  if (!Number.isSafeInteger(value.maximum_steps) || (value.maximum_steps as number) < 1 ||
+    (value.maximum_steps as number) > 4) throw new Error("invalid policy bundle");
   return {
-    schema: 1,
+    schema: 4,
     policy_version: value.policy_version,
-    executor_contract: {
-      version: value.executor_contract.version,
-      sha256: value.executor_contract.sha256,
-    },
-    routing: parsePolicy(JSON.stringify(value.routing)),
-    revas: parseRevas(value.revas),
+    executor_contracts: executorContracts,
+    execution_profiles: parseExecutionProfiles(value.execution_profiles),
+    maximum_steps: value.maximum_steps as number,
+    rcc: parseRccIdentity(value.rcc),
   };
 }
 

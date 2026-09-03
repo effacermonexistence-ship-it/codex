@@ -32,7 +32,7 @@ describe("asymmetric ticket signatures", () => {
       execution_id: "3f7c2a82-3b21-4f39-9e3a-8dd9af83c79c",
       sequence: 1,
       provider: "codex",
-      action: "agent_run",
+      action: "cx_56terra_medium",
       permission_profile: "workspace_write",
       expires_at: "2026-09-01T00:00:00.000Z",
       nonce: "Q2hhbmdlTWVOb3RBbmRUaGVuQ2hhbmdlTWVBZ2Fpbg",
@@ -40,7 +40,7 @@ describe("asymmetric ticket signatures", () => {
     const ticket = await signTicket(unsigned, privatePem);
     await expect(verifyTicket(ticket, publicPem)).resolves.toBe(true);
     await expect(
-      verifyTicket({ ...ticket, permission_profile: "full_access" }, publicPem),
+      verifyTicket({ ...ticket, permission_profile: "read_only" }, publicPem),
     ).resolves.toBe(false);
   });
 
@@ -55,7 +55,7 @@ describe("asymmetric ticket signatures", () => {
         execution_id: "3f7c2a82-3b21-4f39-9e3a-8dd9af83c79c",
         sequence: 2,
         provider: "codex",
-        action: "agent_run",
+        action: "cx_56terra_medium",
         permission_profile: "workspace_write",
         expires_at: "2026-09-01T00:00:00.000Z",
         nonce: "Q2hhbmdlTWVOb3RBbmRUaGVuQ2hhbmdlTWVBZ2Fpbg",

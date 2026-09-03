@@ -12,7 +12,11 @@ let package = Package(
         .executableTarget(name: "OS1"),
         .executableTarget(
             name: "OS1App",
-            linkerSettings: [.linkedLibrary("sqlite3")]
+            linkerSettings: [
+                .linkedLibrary("sqlite3"),
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("Speech"),
+            ]
         ),
     ]
 )

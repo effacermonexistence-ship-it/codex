@@ -6,7 +6,7 @@ const ticket: Ticket = {
   execution_id: "3f7c2a82-3b21-4f39-9e3a-8dd9af83c79c",
   sequence: 1,
   provider: "claude",
-  action: "agent_run",
+  action: "cl_sonnet_medium",
   permission_profile: "read_only",
   expires_at: "2026-09-01T00:00:00.000Z",
   nonce: "Q2hhbmdlTWVOb3RBbmRUaGVuQ2hhbmdlTWVBZ2Fpbg",
@@ -38,7 +38,7 @@ describe("public egress", () => {
   it("fails closed when a protected delivery canary collides", () => {
     expect(() => assertTicketDeliveryHygiene(ticket, '["claude-canary"]')).not.toThrow();
     expect(() =>
-      assertTicketDeliveryHygiene(ticket, '["claude\\nagent"]'),
+      assertTicketDeliveryHygiene(ticket, '["claude\\ncl_sonnet"]'),
     ).toThrow();
   });
 });

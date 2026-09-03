@@ -1,19 +1,47 @@
 import { DurableObject } from "cloudflare:workers";
-import { loadPolicyBundle, type RevasPolicy } from "./bundle";
 import {
-  select, type PermissionProfile, type Provider, type ProviderPreference,
-  type CapacityPlan, type Step, type Action, chooseCapacityAware, selectAction,
-  resolveProviderPreference,
-} from "./policy";
+  executionProfileFor, loadPolicyBundle, parseExecutionProfiles,
+  type ExecutionProfiles, type ExecutionProvider, type PolicyBundle,
+} from "./bundle";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ROUTE_ID = /^rcc-local-[0-9a-f]{32}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ARTIFACT_REF = /^r2:\/\/os1-private-results\/[0-9a-f-]{36}\/[1-9][0-9]{0,5}\/[0-9a-f]{64}\.json$/i;
-type RoutedStep = Step & { action: Action; fallback_action: Action };
-type RouteSnapshot = {
-  task: string; provider: Provider; action: Action; permission_profile: PermissionProfile;
-  policy_version: string; policy_sha256: string; executor_contract_version: string;
-  executor_contract_sha256: string; revas: RevasPolicy;
+const EFFORTS = new Set(["none", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const VERIFICATION_PROFILES = new Set(["deterministic_exact", "executed_change", "executed_review", "source_review", "native_record"]);
+
+type BackendProvider = "codex" | "claude";
+type ProviderPreference = "auto" | BackendProvider;
+type PermissionProfile = "read_only" | "workspace_write";
+type CapacityPlan = { codex: number; claude: number };
+type CodexModel = { slug: string; default_effort: string; supported_efforts: string[]; priority: number };
+type RoutedStep = {
+  provider: ExecutionProvider;
+  action: string;
+  permission_profile: PermissionProfile;
+  max_steps: number;
+  provider_pinned: boolean;
+  route_id: string;
+  verification_profile: string;
+};
+type RouteContext = {
+  task: string;
+  provider_preference: ProviderPreference;
+  capacity_plan: CapacityPlan;
+  available_codex_models: CodexModel[];
+  attempt: number;
+};
+type RouteSnapshot = RoutedStep & RouteContext & {
+  expected_model: string;
+  expected_effort: string;
+  policy_version: string;
+  policy_sha256: string;
+  rcc_policy_sha256: string;
+  executor_contract_version: string;
+  executor_contract_sha256: string;
+  sequence: number;
 };
 
 function exact(value: Record<string, unknown>, keys: readonly string[]): boolean {
@@ -24,86 +52,148 @@ function exact(value: Record<string, unknown>, keys: readonly string[]): boolean
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+function validCatalog(value: unknown): value is CodexModel[] {
+  return Array.isArray(value) && value.length >= 1 && value.length <= 32 &&
+    new Set(value.map((item) => record(item) ? item.slug : undefined)).size === value.length &&
+    value.every((item) => record(item) && exact(item, ["default_effort", "priority", "slug", "supported_efforts"]) &&
+      typeof item.slug === "string" && MODEL.test(item.slug) && typeof item.default_effort === "string" &&
+      EFFORTS.has(item.default_effort) && item.default_effort !== "none" &&
+      Array.isArray(item.supported_efforts) && item.supported_efforts.length >= 1 && item.supported_efforts.length <= 6 &&
+      new Set(item.supported_efforts).size === item.supported_efforts.length &&
+      item.supported_efforts.every((effort) => typeof effort === "string" && EFFORTS.has(effort) && effort !== "none") &&
+      item.supported_efforts.includes(item.default_effort) && Number.isSafeInteger(item.priority) &&
+      (item.priority as number) >= 0 && (item.priority as number) <= 10_000);
+}
+
+async function boundedBindingJson(binding: Fetcher, path: string, body: unknown): Promise<unknown> {
+  const response = await binding.fetch(new Request(`https://internal/${path}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }));
+  const bytes = await response.arrayBuffer();
+  if (!response.ok || bytes.byteLength < 2 || bytes.byteLength > 32_768) throw new Error("private service denied");
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes)) as unknown;
+}
+
+function profileAction(profiles: ExecutionProfiles, provider: ExecutionProvider, model: string, effort: string): string {
+  const matches = Object.entries(profiles).filter(([, profile]) =>
+    profile.provider === provider && profile.model === model && profile.effort === effort);
+  if (matches.length !== 1) throw new Error("execution profile unavailable");
+  return matches[0]![0];
+}
+
+async function routeWithRcc(env: Env, bundle: PolicyBundle, context: RouteContext, retryProvider = ""): Promise<RoutedStep> {
+  const value = await boundedBindingJson(env.RCC_V26, "route", {
+    prompt: context.task,
+    provider_preference: context.provider_preference,
+    codex_capacity: context.capacity_plan.codex,
+    claude_capacity: context.capacity_plan.claude,
+    attempt: context.attempt,
+    retry_provider: retryProvider,
+    available_codex_models: context.available_codex_models,
+  });
+  if (!record(value) || !exact(value, ["provider", "provider_pinned", "permission_profile", "model", "effort", "verification_profile", "route_id", "policy_sha256"]) ||
+    !["local", "codex", "claude"].includes(String(value.provider)) || typeof value.provider_pinned !== "boolean" ||
+    !["read_only", "workspace_write"].includes(String(value.permission_profile)) ||
+    typeof value.model !== "string" || !MODEL.test(value.model) || typeof value.effort !== "string" || !EFFORTS.has(value.effort) ||
+    typeof value.verification_profile !== "string" || !VERIFICATION_PROFILES.has(value.verification_profile) ||
+    typeof value.route_id !== "string" || !ROUTE_ID.test(value.route_id) || value.policy_sha256 !== bundle.rcc.policy_sha256) {
+    throw new Error("private route denied");
+  }
+  const provider = value.provider as ExecutionProvider;
+  return {
+    provider,
+    action: profileAction(bundle.execution_profiles, provider, value.model, value.effort),
+    permission_profile: value.permission_profile as PermissionProfile,
+    max_steps: bundle.maximum_steps,
+    provider_pinned: value.provider_pinned,
+    route_id: value.route_id,
+    verification_profile: value.verification_profile,
+  };
+}
 
 export class RouteState extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS route (
-        singleton INTEGER PRIMARY KEY CHECK(singleton=1), provider TEXT NOT NULL,
-        fallback_provider TEXT NOT NULL, permission_profile TEXT NOT NULL,
-        action TEXT NOT NULL DEFAULT 'agent_run', fallback_action TEXT NOT NULL DEFAULT 'agent_run',
-        max_steps INTEGER NOT NULL, sequence INTEGER NOT NULL, complete INTEGER NOT NULL DEFAULT 0,
-        task TEXT NOT NULL DEFAULT '', policy_version TEXT NOT NULL DEFAULT '',
-        policy_sha256 TEXT NOT NULL DEFAULT '', executor_contract_version TEXT NOT NULL DEFAULT '',
-        executor_contract_sha256 TEXT NOT NULL DEFAULT '', revas_json TEXT NOT NULL DEFAULT '{}',
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), provider TEXT NOT NULL, action TEXT NOT NULL,
+        permission_profile TEXT NOT NULL, max_steps INTEGER NOT NULL, provider_pinned INTEGER NOT NULL,
+        route_id TEXT NOT NULL, verification_profile TEXT NOT NULL, task TEXT NOT NULL,
+        provider_preference TEXT NOT NULL, codex_capacity INTEGER NOT NULL, claude_capacity INTEGER NOT NULL,
+        codex_catalog_json TEXT NOT NULL, attempt INTEGER NOT NULL, sequence INTEGER NOT NULL,
+        complete INTEGER NOT NULL DEFAULT 0, policy_version TEXT NOT NULL, policy_sha256 TEXT NOT NULL,
+        rcc_policy_sha256 TEXT NOT NULL, executor_contract_version TEXT NOT NULL,
+        executor_contract_sha256 TEXT NOT NULL, execution_profiles_json TEXT NOT NULL,
         verified_artifact_hash TEXT)`);
-      const columns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(route)").toArray().map((column) => column.name));
-      const additions: Record<string, string> = {
-        action: "TEXT NOT NULL DEFAULT 'agent_run'", fallback_action: "TEXT NOT NULL DEFAULT 'agent_run'",
-        task: "TEXT NOT NULL DEFAULT ''", policy_version: "TEXT NOT NULL DEFAULT ''",
-        policy_sha256: "TEXT NOT NULL DEFAULT ''", executor_contract_version: "TEXT NOT NULL DEFAULT ''",
-        executor_contract_sha256: "TEXT NOT NULL DEFAULT ''", revas_json: "TEXT NOT NULL DEFAULT '{}'",
-        verified_artifact_hash: "TEXT",
-      };
-      for (const [name, definition] of Object.entries(additions)) {
-        if (!columns.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE route ADD COLUMN ${name} ${definition}`);
-      }
     });
   }
 
-  begin(input: RoutedStep & { task: string; policy_version: string; policy_sha256: string;
-    executor_contract_version: string; executor_contract_sha256: string; revas: RevasPolicy }): "created" | "exists" {
+  begin(input: RoutedStep & RouteContext & { policy_version: string; policy_sha256: string; rcc_policy_sha256: string;
+    executor_contract_version: string; executor_contract_sha256: string; execution_profiles: ExecutionProfiles }): "created" | "exists" {
     return this.ctx.storage.transactionSync(() => {
       if (this.ctx.storage.sql.exec<{ present: number }>("SELECT 1 AS present FROM route WHERE singleton=1").toArray()[0]) return "exists";
       this.ctx.storage.sql.exec(
-        `INSERT INTO route(singleton,provider,fallback_provider,permission_profile,action,fallback_action,max_steps,sequence,complete,task,policy_version,policy_sha256,executor_contract_version,executor_contract_sha256,revas_json)
-         VALUES(1,?,?,?,?,?,?,1,0,?,?,?,?,?,?)`,
-        input.provider, input.fallback_provider, input.permission_profile, input.action,
-        input.fallback_action, input.max_steps, input.task, input.policy_version, input.policy_sha256,
-        input.executor_contract_version, input.executor_contract_sha256, JSON.stringify(input.revas),
+        `INSERT INTO route(singleton,provider,action,permission_profile,max_steps,provider_pinned,route_id,verification_profile,
+         task,provider_preference,codex_capacity,claude_capacity,codex_catalog_json,attempt,sequence,complete,
+         policy_version,policy_sha256,rcc_policy_sha256,executor_contract_version,executor_contract_sha256,execution_profiles_json)
+         VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0,?,?,?,?,?,?)`,
+        input.provider, input.action, input.permission_profile, input.max_steps, input.provider_pinned ? 1 : 0,
+        input.route_id, input.verification_profile, input.task, input.provider_preference,
+        input.capacity_plan.codex, input.capacity_plan.claude, JSON.stringify(input.available_codex_models), input.attempt,
+        input.policy_version, input.policy_sha256, input.rcc_policy_sha256,
+        input.executor_contract_version, input.executor_contract_sha256, JSON.stringify(input.execution_profiles),
       );
       return "created";
     });
   }
 
   snapshot(sequence: number): RouteSnapshot {
-    const row = this.ctx.storage.sql.exec<{
-      task: string; provider: Provider; action: Action; permission_profile: PermissionProfile;
-      policy_version: string; policy_sha256: string; executor_contract_version: string;
-      executor_contract_sha256: string; revas_json: string; sequence: number; complete: number;
-    }>(`SELECT task,provider,action,permission_profile,policy_version,policy_sha256,
-      executor_contract_version,executor_contract_sha256,revas_json,sequence,complete FROM route WHERE singleton=1`).toArray()[0];
+    const row = this.ctx.storage.sql.exec<Record<string, string | number>>("SELECT * FROM route WHERE singleton=1").toArray()[0];
     if (!row || row.complete === 1 || row.sequence !== sequence) throw new Error("invalid route state");
-    return { ...row, revas: JSON.parse(row.revas_json) as RevasPolicy };
+    const provider = String(row.provider) as ExecutionProvider;
+    const action = String(row.action);
+    const profiles = parseExecutionProfiles(JSON.parse(String(row.execution_profiles_json)) as unknown);
+    const expected = executionProfileFor(profiles, provider, action);
+    const catalog = JSON.parse(String(row.codex_catalog_json)) as unknown;
+    if (!validCatalog(catalog)) throw new Error("invalid route state");
+    return {
+      provider, action, permission_profile: String(row.permission_profile) as PermissionProfile,
+      max_steps: Number(row.max_steps), provider_pinned: Number(row.provider_pinned) === 1,
+      route_id: String(row.route_id), verification_profile: String(row.verification_profile),
+      task: String(row.task), provider_preference: String(row.provider_preference) as ProviderPreference,
+      capacity_plan: { codex: Number(row.codex_capacity), claude: Number(row.claude_capacity) },
+      available_codex_models: catalog, attempt: Number(row.attempt), sequence: Number(row.sequence),
+      expected_model: expected.model, expected_effort: expected.effort,
+      policy_version: String(row.policy_version), policy_sha256: String(row.policy_sha256),
+      rcc_policy_sha256: String(row.rcc_policy_sha256),
+      executor_contract_version: String(row.executor_contract_version),
+      executor_contract_sha256: String(row.executor_contract_sha256),
+    };
   }
 
-  advance(sequence: number, outcome: "pass" | "fail" | "retry", verifiedHash: string):
-    | { status: "complete" }
-    | { status: "failed" }
-    | { status: "step"; provider: Provider; action: Action; permission_profile: PermissionProfile } {
+  advance(sequence: number, outcome: "pass" | "fail" | "retry", verifiedHash: string, next?: RoutedStep):
+    | { status: "complete" } | { status: "failed" }
+    | { status: "step"; provider: ExecutionProvider; action: string; permission_profile: PermissionProfile } {
     return this.ctx.storage.transactionSync(() => {
-      const row = this.ctx.storage.sql.exec<{
-        provider: Provider; fallback_provider: Provider; permission_profile: PermissionProfile;
-        action: Action; fallback_action: Action; max_steps: number; sequence: number; complete: number;
-      }>("SELECT provider,fallback_provider,permission_profile,action,fallback_action,max_steps,sequence,complete FROM route WHERE singleton=1").toArray()[0];
+      const row = this.ctx.storage.sql.exec<{ max_steps: number; sequence: number; complete: number }>(
+        "SELECT max_steps,sequence,complete FROM route WHERE singleton=1",
+      ).toArray()[0];
       if (!row || row.complete === 1 || row.sequence !== sequence) throw new Error("invalid route state");
       if (outcome === "pass") {
         this.ctx.storage.sql.exec("UPDATE route SET complete=1,verified_artifact_hash=? WHERE singleton=1", verifiedHash);
         return { status: "complete" };
       }
-      if (sequence >= row.max_steps) {
+      if (outcome === "fail" || sequence >= row.max_steps || !next) {
         this.ctx.storage.sql.exec("UPDATE route SET complete=1,verified_artifact_hash=? WHERE singleton=1", verifiedHash);
         return { status: "failed" };
       }
-      const provider = row.fallback_provider;
-      const action = outcome === "retry" ? row.action : row.fallback_action;
-      const nextFallback = outcome === "retry" ? row.fallback_action : row.action;
       this.ctx.storage.sql.exec(
-        "UPDATE route SET provider=?,fallback_provider=?,action=?,fallback_action=?,sequence=?,verified_artifact_hash=? WHERE singleton=1",
-        provider, row.provider, action, nextFallback, sequence + 1, verifiedHash,
+        `UPDATE route SET provider=?,action=?,permission_profile=?,provider_pinned=?,route_id=?,verification_profile=?,
+         attempt=?,sequence=?,verified_artifact_hash=? WHERE singleton=1`,
+        next.provider, next.action, next.permission_profile, next.provider_pinned ? 1 : 0, next.route_id,
+        next.verification_profile, sequence + 1, sequence + 1, verifiedHash,
       );
-      return { status: "step", provider, action, permission_profile: row.permission_profile };
+      return { status: "step", provider: next.provider, action: next.action, permission_profile: next.permission_profile };
     });
   }
 }
@@ -112,28 +202,27 @@ export class RoutingBudgetState extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
-      this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS usage (
-        singleton INTEGER PRIMARY KEY CHECK(singleton=1), week INTEGER NOT NULL,
-        codex INTEGER NOT NULL, claude INTEGER NOT NULL)`);
+      this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS start_budget (window INTEGER PRIMARY KEY, starts INTEGER NOT NULL)");
+      this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS usage (singleton INTEGER PRIMARY KEY CHECK(singleton=1), week INTEGER NOT NULL, codex INTEGER NOT NULL, claude INTEGER NOT NULL)");
     });
   }
-  chooseAndRecord(step: Step, capacity: CapacityPlan): Provider {
+  consumeStart(limit: number): boolean {
     return this.ctx.storage.transactionSync(() => {
-      const week = Math.floor(Date.now() / 604_800_000);
-      let row = this.ctx.storage.sql.exec<{ week: number; codex: number; claude: number }>("SELECT week,codex,claude FROM usage WHERE singleton=1").toArray()[0];
-      if (!row || row.week !== week) {
-        this.ctx.storage.sql.exec("INSERT OR REPLACE INTO usage(singleton,week,codex,claude) VALUES(1,?,0,0)", week);
-        row = { week, codex: 0, claude: 0 };
-      }
-      const provider = chooseCapacityAware(step, capacity, row);
-      this.ctx.storage.sql.exec(`UPDATE usage SET ${provider}=${provider}+1 WHERE singleton=1`);
-      return provider;
+      const window = Math.floor(Date.now() / 3_600_000);
+      this.ctx.storage.sql.exec("DELETE FROM start_budget WHERE window < ?", window - 1);
+      const row = this.ctx.storage.sql.exec<{ starts: number }>("SELECT starts FROM start_budget WHERE window=?", window).toArray()[0];
+      if ((row?.starts ?? 0) >= limit) return false;
+      this.ctx.storage.sql.exec("INSERT INTO start_budget(window,starts) VALUES(?,1) ON CONFLICT(window) DO UPDATE SET starts=starts+1", window);
+      return true;
     });
   }
-  record(provider: Provider): void {
-    this.chooseAndRecord({ provider, fallback_provider: provider === "codex" ? "claude" : "codex",
-      permission_profile: "workspace_write", max_steps: 1, budget_protected: true },
-    provider === "codex" ? { codex: 100, claude: 0 } : { codex: 0, claude: 100 });
+  record(provider: BackendProvider): void {
+    this.ctx.storage.transactionSync(() => {
+      const week = Math.floor(Date.now() / 604_800_000);
+      const row = this.ctx.storage.sql.exec<{ week: number }>("SELECT week FROM usage WHERE singleton=1").toArray()[0];
+      if (!row || row.week !== week) this.ctx.storage.sql.exec("INSERT OR REPLACE INTO usage(singleton,week,codex,claude) VALUES(1,?,0,0)", week);
+      this.ctx.storage.sql.exec(`UPDATE usage SET ${provider}=${provider}+1 WHERE singleton=1`);
+    });
   }
 }
 
@@ -141,20 +230,22 @@ async function subjectKey(subject: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(subject));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
+function positiveInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("invalid private configuration");
+  return parsed;
+}
 function stepResponse(step: Pick<RoutedStep, "provider" | "action" | "permission_profile">): Response {
   return Response.json({ status: "step", provider: step.provider, action: step.action, permission_profile: step.permission_profile });
 }
-async function evaluate(env: Env, body: unknown): Promise<{ outcome: "pass" | "fail" | "retry"; verified_artifact_hash: string }> {
-  const response = await env.RESULT_EVALUATOR.fetch(new Request("https://internal/evaluate", {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-  }));
-  const bytes = await response.arrayBuffer();
-  if (!response.ok || bytes.byteLength > 32_768) throw new Error("evaluation denied");
-  const value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes)) as unknown;
-  if (!record(value) || !exact(value, ["outcome", "verified_artifact_hash"]) ||
+async function evaluate(env: Env, body: unknown): Promise<{ outcome: "pass" | "fail" | "retry"; verified_artifact_hash: string; next_provider: ExecutionProvider }> {
+  const value = await boundedBindingJson(env.RESULT_EVALUATOR, "evaluate", body);
+  if (!record(value) || !exact(value, ["outcome", "verified_artifact_hash", "next_provider"]) ||
     !["pass", "fail", "retry"].includes(String(value.outcome)) || typeof value.verified_artifact_hash !== "string" ||
-    !SHA256.test(value.verified_artifact_hash)) throw new Error("evaluation denied");
-  return value as { outcome: "pass" | "fail" | "retry"; verified_artifact_hash: string };
+    !SHA256.test(value.verified_artifact_hash) || !["local", "codex", "claude"].includes(String(value.next_provider))) {
+    throw new Error("evaluation denied");
+  }
+  return value as { outcome: "pass" | "fail" | "retry"; verified_artifact_hash: string; next_provider: ExecutionProvider };
 }
 
 export default {
@@ -163,35 +254,35 @@ export default {
       if (request.method !== "POST" || new URL(request.url).pathname !== "/decide") throw new Error("denied");
       const body = await request.json<unknown>();
       if (!record(body) || !exact(body, body.task === undefined ? ["execution_id", "previous", "version"] : ["execution_id", "principal", "task", "version"]) ||
-        body.version !== 2 || typeof body.execution_id !== "string" || !UUID.test(body.execution_id)) throw new Error("denied");
+        body.version !== 3 || typeof body.execution_id !== "string" || !UUID.test(body.execution_id)) throw new Error("denied");
       const state = env.ROUTES.getByName(body.execution_id);
       if (record(body.task)) {
         const task = body.task;
-        if (!exact(task, ["capacity_plan", "content", "executor_contract_sha256", "executor_contract_version", "provider_preference", "trust"]) ||
+        if (!exact(task, ["available_codex_models", "capacity_plan", "content", "executor_contract_sha256", "executor_contract_version", "provider_preference", "trust"]) ||
           task.trust !== "untrusted_user_data" || typeof task.content !== "string" || task.content.length < 1 || task.content.length > 48_000 ||
           !["auto", "codex", "claude"].includes(String(task.provider_preference)) || typeof task.executor_contract_version !== "string" ||
           typeof task.executor_contract_sha256 !== "string" || !SHA256.test(task.executor_contract_sha256) ||
           !record(task.capacity_plan) || !exact(task.capacity_plan, ["claude", "codex"]) ||
-          !Number.isSafeInteger(task.capacity_plan.codex) || !Number.isSafeInteger(task.capacity_plan.claude)) throw new Error("denied");
+          !Number.isSafeInteger(task.capacity_plan.codex) || !Number.isSafeInteger(task.capacity_plan.claude) || !validCatalog(task.available_codex_models)) throw new Error("denied");
         const plan = task.capacity_plan as CapacityPlan;
         if (plan.codex < 0 || plan.codex > 100 || plan.claude < 0 || plan.claude > 100 || plan.codex + plan.claude === 0) throw new Error("denied");
         if (!record(body.principal) || !exact(body.principal, ["device_id", "subject"]) ||
           typeof body.principal.subject !== "string" || body.principal.subject.length < 1 || typeof body.principal.device_id !== "string") throw new Error("denied");
-        const bundle = await loadPolicyBundle(env);
-        if (task.executor_contract_version !== bundle.executor_contract.version || task.executor_contract_sha256 !== bundle.executor_contract.sha256) throw new Error("denied");
-        const requestedPreference = task.provider_preference as ProviderPreference;
-        const preference = resolveProviderPreference(task.content, requestedPreference);
-        const base = select(bundle.routing, task.content, preference);
         const budget = env.ROUTING_BUDGETS.getByName(await subjectKey(body.principal.subject));
-        const provider = preference === "auto" ? await budget.chooseAndRecord(base, plan) : preference;
-        if (preference !== "auto") await budget.record(provider);
-        const selected: RoutedStep = { ...base, provider,
-          fallback_provider: preference === "auto" ? (provider === "codex" ? "claude" : "codex") : provider,
-          action: selectAction(base, provider, preference),
-          fallback_action: preference === "auto" && base.budget_protected ? "agent_run_deep" : "agent_run" };
-        if ((await state.begin({ ...selected, task: task.content, policy_version: bundle.policy_version,
-          policy_sha256: env.POLICY_BUNDLE_SHA256, executor_contract_version: bundle.executor_contract.version,
-          executor_contract_sha256: bundle.executor_contract.sha256, revas: bundle.revas })) !== "created") throw new Error("denied");
+        if (!(await budget.consumeStart(positiveInteger(env.MAX_ROUTE_STARTS_PER_HOUR)))) throw new Error("denied");
+        const bundle = await loadPolicyBundle(env);
+        const executorContract = bundle.executor_contracts.find((contract) => contract.version === task.executor_contract_version && contract.sha256 === task.executor_contract_sha256);
+        if (!executorContract) throw new Error("denied");
+        const context: RouteContext = {
+          task: task.content, provider_preference: task.provider_preference as ProviderPreference,
+          capacity_plan: plan, available_codex_models: task.available_codex_models, attempt: 1,
+        };
+        const selected = await routeWithRcc(env, bundle, context);
+        if (selected.provider !== "local") await budget.record(selected.provider);
+        if ((await state.begin({ ...selected, ...context, policy_version: bundle.policy_version,
+          policy_sha256: env.POLICY_BUNDLE_SHA256, rcc_policy_sha256: bundle.rcc.policy_sha256,
+          executor_contract_version: executorContract.version, executor_contract_sha256: executorContract.sha256,
+          execution_profiles: bundle.execution_profiles })) !== "created") throw new Error("denied");
         return stepResponse(selected);
       }
       if (!record(body.previous) || !exact(body.previous, ["artifact_ref", "expected_artifact_hash", "sequence"]) ||
@@ -203,13 +294,25 @@ export default {
         execution_id: body.execution_id, sequence, task: snapshot.task,
         expected_provider: snapshot.provider, expected_action: snapshot.action,
         expected_permission_profile: snapshot.permission_profile,
+        expected_model: snapshot.expected_model, expected_effort: snapshot.expected_effort,
         policy_version: snapshot.policy_version, policy_sha256: snapshot.policy_sha256,
+        rcc_policy_sha256: snapshot.rcc_policy_sha256, route_id: snapshot.route_id,
+        verification_profile: snapshot.verification_profile, provider_pinned: snapshot.provider_pinned,
         executor_contract_version: snapshot.executor_contract_version,
-        executor_contract_sha256: snapshot.executor_contract_sha256, revas: snapshot.revas,
+        executor_contract_sha256: snapshot.executor_contract_sha256,
         artifact_ref: body.previous.artifact_ref, expected_artifact_hash: body.previous.expected_artifact_hash,
       });
       if (evaluated.verified_artifact_hash !== body.previous.expected_artifact_hash) throw new Error("denied");
-      const decision = await state.advance(sequence, evaluated.outcome, evaluated.verified_artifact_hash);
+      let next: RoutedStep | undefined;
+      if (evaluated.outcome === "retry" && sequence < snapshot.max_steps) {
+        const bundle = await loadPolicyBundle(env);
+        if (bundle.rcc.policy_sha256 !== snapshot.rcc_policy_sha256) throw new Error("policy changed during execution");
+        const context: RouteContext = { task: snapshot.task, provider_preference: snapshot.provider_preference,
+          capacity_plan: snapshot.capacity_plan, available_codex_models: snapshot.available_codex_models, attempt: sequence + 1 };
+        const retryProvider = evaluated.next_provider === "local" ? "" : evaluated.next_provider;
+        next = await routeWithRcc(env, bundle, context, retryProvider);
+      }
+      const decision = await state.advance(sequence, evaluated.outcome, evaluated.verified_artifact_hash, next);
       return decision.status === "step" ? stepResponse(decision) : Response.json(decision);
     } catch {
       return Response.json({ error: "denied" }, { status: 400 });

@@ -1,6 +1,14 @@
 {
   "forbiddenPathFragments": [
     ".dev.vars",
+    "private-core",
+    "os1_local_core",
+    "darwin_routed_rcc",
+    "darwin_benchmark_priors",
+    "darwin_prompt_lineage",
+    "darwin_router_state",
+    "hinton_forward_forward_state",
+    "OMAR_LUA_RCC_ENGINE",
     "dataset",
     "debug",
     "prompt",
@@ -9,6 +17,13 @@
   ],
   "forbiddenContentFragments": [
     "RCC/REVAS",
+    "os1_local_core.py",
+    "darwin_routed_rcc.py",
+    "darwin_benchmark_priors.json",
+    "darwin_prompt_lineage.json",
+    "darwin_router_state.json",
+    "hinton_forward_forward_state.json",
+    "OMAR_LUA_RCC_ENGINE_v26_CLEAN_CONSOLIDATED",
     "internal evaluation rubric",
     "private routing prompt",
     "provider selection weights",
