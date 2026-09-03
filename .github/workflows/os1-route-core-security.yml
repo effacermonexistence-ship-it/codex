@@ -138,6 +138,15 @@ jobs:
             bash "$beta_test_dir/OS-1-0.8.0-macOS-beta/Install OS-1 Beta.command"
           (cd products/os1-mac-runtime/release && \
             shasum -a 256 -c OS-1-0.8.0-macOS-beta.zip.sha256)
+          sudo installer \
+            -pkg "$beta_test_dir/OS-1-0.8.0-macOS-beta/OS-1.pkg" \
+            -target /
+          test -x /usr/local/bin/os1
+          test -x "/Applications/Open OS-1 Codex.app/Contents/MacOS/OS1App"
+          codesign --verify --strict /usr/local/bin/os1
+          codesign --verify --deep --strict "/Applications/Open OS-1 Codex.app"
+          /usr/local/bin/os1 self-test
+          "/Applications/Open OS-1 Codex.app/Contents/MacOS/OS1App" --self-test
 
       - name: Reject a beta manifest that disagrees with the package
         run: |
