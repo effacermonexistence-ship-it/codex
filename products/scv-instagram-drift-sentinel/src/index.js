@@ -1,4 +1,8 @@
-const SENTINEL_SCHEMA = 'scv-instagram-drift-sentinel-2026-09-03-v10-v145-revision-outranks-heuristics-pointer'
+const SENTINEL_SCHEMA = 'scv-instagram-drift-sentinel-2026-09-03-v11-gold2-manifest-pin'
+// GOLD-2 (2026-09-03): the owner-verified v145 state frozen as the reference; the pointer and manifest below are pinned by hash.
+const GOLD_LATEST_KEY = 'scv-instagram-automation/gold/LATEST.json'
+const GOLD_MANIFEST_KEY = 'scv-instagram-automation/gold/SCV_GOLD_MANIFEST_v145.json'
+const GOLD_MANIFEST_SHA256 = '372d14702a5e3f98b80c2d3d1f1b3d93ea0ae623fac1cdcfc52649df3e9eb529'
 const RELEASE_ID = 'scv-instagram-single-20260902-v145'
 const CONTENT_FINGERPRINT = 'c17312eca28ae28da3ab2fbd796240426b0bc9c0e8363dfb580bef8a030649a5'
 const RELEASE_MANIFEST = '2df6c5a672d8f0d4f769672c7477f7b5b377ced497bed90b1d3de029ca44cb53'
@@ -253,13 +257,40 @@ async function readState(archive) {
   }
 }
 
+async function checkGold(archive, options = {}) {
+  const hashImpl = options.hashImpl || sha256
+  const reasons = []
+  const check = (condition, reason) => { if (!condition) reasons.push(reason) }
+  try {
+    const latestResult = await readBoundedR2Json(archive, GOLD_LATEST_KEY)
+    if (!latestResult.ok) return { ok: false, reasons: [`gold_latest_${latestResult.reason}`] }
+    const latest = latestResult.value
+    check(latest?.manifest?.key === GOLD_MANIFEST_KEY, 'gold_manifest_key')
+    check(latest?.manifest?.sha256 === GOLD_MANIFEST_SHA256, 'gold_manifest_pointer_hash')
+    const object = await archive.get(GOLD_MANIFEST_KEY)
+    if (!object) return { ok: false, reasons: [...reasons, 'gold_manifest_missing'] }
+    const bytes = new Uint8Array(await object.arrayBuffer())
+    if (bytes.byteLength > MAX_BODY_BYTES) return { ok: false, reasons: [...reasons, 'gold_manifest_object_too_large'] }
+    const actual = await hashImpl(bytes)
+    check(actual === GOLD_MANIFEST_SHA256, 'gold_manifest_object_hash')
+    let manifest = null
+    try { manifest = JSON.parse(new TextDecoder().decode(bytes)) } catch { reasons.push('gold_manifest_invalid_json') }
+    check(manifest?.release?.content_fingerprint_sha256 === CONTENT_FINGERPRINT, 'gold_manifest_release_fingerprint')
+    check(manifest?.release?.release_id === RELEASE_ID, 'gold_manifest_release_id')
+    return { ok: reasons.length === 0, reasons, manifest_sha256: actual, gold_name: String(manifest?.gold_name || '') }
+  } catch (error) {
+    return { ok: false, reasons: [...reasons, `gold_check_error:${String(error && error.message ? error.message : error).slice(0, 80)}`] }
+  }
+}
+
 async function runSentinel(env, options = {}) {
   const checkedAt = new Date(options.now || Date.now()).toISOString()
-  const [checks, snapshotControl] = await Promise.all([
+  const [checks, snapshotControl, gold] = await Promise.all([
     Promise.all(TARGETS.map((target) => checkTarget(target, options.fetchImpl || fetch))),
-    checkSnapshotControl(env.ARCHIVE)
+    checkSnapshotControl(env.ARCHIVE),
+    checkGold(env.ARCHIVE)
   ])
-  const ok = checks.every((check) => check.ok === true) && snapshotControl.ok === true
+  const ok = checks.every((check) => check.ok === true) && snapshotControl.ok === true && gold.ok === true
   const previous = await readState(env.ARCHIVE)
   const consecutiveFailures = ok ? 0 : Number(previous?.consecutive_failures || 0) + 1
   const receipt = {
@@ -282,6 +313,7 @@ async function runSentinel(env, options = {}) {
     },
     checks,
     snapshot_control: snapshotControl,
+    gold: { ...gold, expected_manifest_key: GOLD_MANIFEST_KEY, expected_manifest_sha256: GOLD_MANIFEST_SHA256 },
     consecutive_failures: consecutiveFailures,
     contains_credentials: false,
     contains_customer_message_content: false
@@ -381,6 +413,10 @@ export default {
 }
 
 export {
+  GOLD_LATEST_KEY,
+  GOLD_MANIFEST_KEY,
+  GOLD_MANIFEST_SHA256,
+  checkGold,
   PRE_RESET_AUDIT_REMAINING_COUNT,
   CONTENT_FINGERPRINT,
   CURRENT_SNAPSHOT_ID,

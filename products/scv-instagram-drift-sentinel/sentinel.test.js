@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  GOLD_LATEST_KEY,
+  GOLD_MANIFEST_KEY,
+  GOLD_MANIFEST_SHA256,
+  checkGold,
   CONTENT_FINGERPRINT,
   CURRENT_SNAPSHOT_ID,
   GOLDEN_SNAPSHOT_ID,
@@ -182,4 +186,21 @@ test('rejects critical drift but not an isolated operational quarantine alert', 
   assert.equal(result.ok, false)
   assert.ok(result.reasons.includes('critical_drift'))
   assert.ok(result.reasons.includes('critical_drift_alerts'))
+})
+
+test('accepts the pinned GOLD-2 manifest and rejects a drifted one', async () => {
+  const manifestBytes = new TextEncoder().encode(JSON.stringify({ gold_name: 'GOLD-2', release: { release_id: RELEASE_ID, content_fingerprint_sha256: CONTENT_FINGERPRINT } }))
+  const latest = { manifest: { key: GOLD_MANIFEST_KEY, sha256: GOLD_MANIFEST_SHA256 } }
+  const object = (bytes) => ({ arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) })
+  const archive = { async get(key) { if (key === GOLD_LATEST_KEY) return object(new TextEncoder().encode(JSON.stringify(latest))); if (key === GOLD_MANIFEST_KEY) return object(manifestBytes); return null } }
+  const good = await checkGold(archive, { hashImpl: async () => GOLD_MANIFEST_SHA256 })
+  assert.equal(good.ok, true)
+  assert.deepEqual(good.reasons, [])
+  const drifted = await checkGold(archive, { hashImpl: async () => 'deadbeef' })
+  assert.equal(drifted.ok, false)
+  assert.ok(drifted.reasons.includes('gold_manifest_object_hash'))
+  const wrongRelease = { async get(key) { if (key === GOLD_LATEST_KEY) return object(new TextEncoder().encode(JSON.stringify(latest))); if (key === GOLD_MANIFEST_KEY) return object(new TextEncoder().encode(JSON.stringify({ release: { release_id: 'other', content_fingerprint_sha256: 'x' } }))); return null } }
+  const bad = await checkGold(wrongRelease, { hashImpl: async () => GOLD_MANIFEST_SHA256 })
+  assert.equal(bad.ok, false)
+  assert.ok(bad.reasons.includes('gold_manifest_release_fingerprint'))
 })
