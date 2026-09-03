@@ -1,5 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
-import { loadPolicyBundle, type RevasPolicy } from "./bundle";
+import {
+  executionProfileFor, loadPolicyBundle, parseExecutionProfiles,
+  type ExecutionProfiles, type RevasPolicy,
+} from "./bundle";
 import {
   select, type PermissionProfile, type Provider, type ProviderPreference,
   type CapacityPlan, type Step, type Action, chooseCapacityAware, selectAction,
@@ -12,6 +15,7 @@ const ARTIFACT_REF = /^r2:\/\/os1-private-results\/[0-9a-f-]{36}\/[1-9][0-9]{0,5
 type RoutedStep = Step & { action: Action; fallback_action: Action };
 type RouteSnapshot = {
   task: string; provider: Provider; action: Action; permission_profile: PermissionProfile;
+  expected_model: string; expected_effort: string;
   policy_version: string; policy_sha256: string; executor_contract_version: string;
   executor_contract_sha256: string; revas: RevasPolicy;
 };
@@ -37,6 +41,7 @@ export class RouteState extends DurableObject<Env> {
         task TEXT NOT NULL DEFAULT '', policy_version TEXT NOT NULL DEFAULT '',
         policy_sha256 TEXT NOT NULL DEFAULT '', executor_contract_version TEXT NOT NULL DEFAULT '',
         executor_contract_sha256 TEXT NOT NULL DEFAULT '', revas_json TEXT NOT NULL DEFAULT '{}',
+        execution_profiles_json TEXT NOT NULL DEFAULT '{}',
         verified_artifact_hash TEXT)`);
       const columns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(route)").toArray().map((column) => column.name));
       const additions: Record<string, string> = {
@@ -44,6 +49,7 @@ export class RouteState extends DurableObject<Env> {
         task: "TEXT NOT NULL DEFAULT ''", policy_version: "TEXT NOT NULL DEFAULT ''",
         policy_sha256: "TEXT NOT NULL DEFAULT ''", executor_contract_version: "TEXT NOT NULL DEFAULT ''",
         executor_contract_sha256: "TEXT NOT NULL DEFAULT ''", revas_json: "TEXT NOT NULL DEFAULT '{}'",
+        execution_profiles_json: "TEXT NOT NULL DEFAULT '{}'",
         verified_artifact_hash: "TEXT",
       };
       for (const [name, definition] of Object.entries(additions)) {
@@ -53,15 +59,17 @@ export class RouteState extends DurableObject<Env> {
   }
 
   begin(input: RoutedStep & { task: string; policy_version: string; policy_sha256: string;
-    executor_contract_version: string; executor_contract_sha256: string; revas: RevasPolicy }): "created" | "exists" {
+    executor_contract_version: string; executor_contract_sha256: string; revas: RevasPolicy;
+    execution_profiles: ExecutionProfiles }): "created" | "exists" {
     return this.ctx.storage.transactionSync(() => {
       if (this.ctx.storage.sql.exec<{ present: number }>("SELECT 1 AS present FROM route WHERE singleton=1").toArray()[0]) return "exists";
       this.ctx.storage.sql.exec(
-        `INSERT INTO route(singleton,provider,fallback_provider,permission_profile,action,fallback_action,max_steps,sequence,complete,task,policy_version,policy_sha256,executor_contract_version,executor_contract_sha256,revas_json)
-         VALUES(1,?,?,?,?,?,?,1,0,?,?,?,?,?,?)`,
+        `INSERT INTO route(singleton,provider,fallback_provider,permission_profile,action,fallback_action,max_steps,sequence,complete,task,policy_version,policy_sha256,executor_contract_version,executor_contract_sha256,revas_json,execution_profiles_json)
+         VALUES(1,?,?,?,?,?,?,1,0,?,?,?,?,?,?,?)`,
         input.provider, input.fallback_provider, input.permission_profile, input.action,
         input.fallback_action, input.max_steps, input.task, input.policy_version, input.policy_sha256,
         input.executor_contract_version, input.executor_contract_sha256, JSON.stringify(input.revas),
+        JSON.stringify(input.execution_profiles),
       );
       return "created";
     });
@@ -72,10 +80,14 @@ export class RouteState extends DurableObject<Env> {
       task: string; provider: Provider; action: Action; permission_profile: PermissionProfile;
       policy_version: string; policy_sha256: string; executor_contract_version: string;
       executor_contract_sha256: string; revas_json: string; sequence: number; complete: number;
+      execution_profiles_json: string;
     }>(`SELECT task,provider,action,permission_profile,policy_version,policy_sha256,
-      executor_contract_version,executor_contract_sha256,revas_json,sequence,complete FROM route WHERE singleton=1`).toArray()[0];
+      executor_contract_version,executor_contract_sha256,revas_json,execution_profiles_json,sequence,complete FROM route WHERE singleton=1`).toArray()[0];
     if (!row || row.complete === 1 || row.sequence !== sequence) throw new Error("invalid route state");
-    return { ...row, revas: JSON.parse(row.revas_json) as RevasPolicy };
+    const profiles = parseExecutionProfiles(JSON.parse(row.execution_profiles_json) as unknown);
+    const expected = executionProfileFor(profiles, row.provider, row.action);
+    return { ...row, expected_model: expected.model, expected_effort: expected.effort,
+      revas: JSON.parse(row.revas_json) as RevasPolicy };
   }
 
   advance(sequence: number, outcome: "pass" | "fail" | "retry", verifiedHash: string):
@@ -115,6 +127,24 @@ export class RoutingBudgetState extends DurableObject<Env> {
       this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS usage (
         singleton INTEGER PRIMARY KEY CHECK(singleton=1), week INTEGER NOT NULL,
         codex INTEGER NOT NULL, claude INTEGER NOT NULL)`);
+      this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS start_budget (
+        window INTEGER PRIMARY KEY, starts INTEGER NOT NULL)`);
+    });
+  }
+  consumeStart(limit: number): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const window = Math.floor(Date.now() / 3_600_000);
+      this.ctx.storage.sql.exec("DELETE FROM start_budget WHERE window < ?", window - 1);
+      const row = this.ctx.storage.sql.exec<{ starts: number }>(
+        "SELECT starts FROM start_budget WHERE window = ?", window,
+      ).toArray()[0];
+      if ((row?.starts ?? 0) >= limit) return false;
+      this.ctx.storage.sql.exec(
+        `INSERT INTO start_budget(window,starts) VALUES(?,1)
+         ON CONFLICT(window) DO UPDATE SET starts=starts+1`,
+        window,
+      );
+      return true;
     });
   }
   chooseAndRecord(step: Step, capacity: CapacityPlan): Provider {
@@ -140,6 +170,11 @@ export class RoutingBudgetState extends DurableObject<Env> {
 async function subjectKey(subject: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(subject));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function positiveInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("invalid private configuration");
+  return parsed;
 }
 function stepResponse(step: Pick<RoutedStep, "provider" | "action" | "permission_profile">): Response {
   return Response.json({ status: "step", provider: step.provider, action: step.action, permission_profile: step.permission_profile });
@@ -177,12 +212,17 @@ export default {
         if (plan.codex < 0 || plan.codex > 100 || plan.claude < 0 || plan.claude > 100 || plan.codex + plan.claude === 0) throw new Error("denied");
         if (!record(body.principal) || !exact(body.principal, ["device_id", "subject"]) ||
           typeof body.principal.subject !== "string" || body.principal.subject.length < 1 || typeof body.principal.device_id !== "string") throw new Error("denied");
+        const budget = env.ROUTING_BUDGETS.getByName(await subjectKey(body.principal.subject));
+        if (!(await budget.consumeStart(positiveInteger(env.MAX_ROUTE_STARTS_PER_HOUR)))) throw new Error("denied");
         const bundle = await loadPolicyBundle(env);
-        if (task.executor_contract_version !== bundle.executor_contract.version || task.executor_contract_sha256 !== bundle.executor_contract.sha256) throw new Error("denied");
+        const executorContract = bundle.executor_contracts.find((contract) =>
+          contract.version === task.executor_contract_version &&
+          contract.sha256 === task.executor_contract_sha256
+        );
+        if (!executorContract) throw new Error("denied");
         const requestedPreference = task.provider_preference as ProviderPreference;
         const preference = resolveProviderPreference(task.content, requestedPreference);
         const base = select(bundle.routing, task.content, preference);
-        const budget = env.ROUTING_BUDGETS.getByName(await subjectKey(body.principal.subject));
         const provider = preference === "auto" ? await budget.chooseAndRecord(base, plan) : preference;
         if (preference !== "auto") await budget.record(provider);
         const selected: RoutedStep = { ...base, provider,
@@ -190,8 +230,9 @@ export default {
           action: selectAction(base, provider, preference),
           fallback_action: preference === "auto" && base.budget_protected ? "agent_run_deep" : "agent_run" };
         if ((await state.begin({ ...selected, task: task.content, policy_version: bundle.policy_version,
-          policy_sha256: env.POLICY_BUNDLE_SHA256, executor_contract_version: bundle.executor_contract.version,
-          executor_contract_sha256: bundle.executor_contract.sha256, revas: bundle.revas })) !== "created") throw new Error("denied");
+          policy_sha256: env.POLICY_BUNDLE_SHA256, executor_contract_version: executorContract.version,
+          executor_contract_sha256: executorContract.sha256, revas: bundle.revas,
+          execution_profiles: bundle.execution_profiles })) !== "created") throw new Error("denied");
         return stepResponse(selected);
       }
       if (!record(body.previous) || !exact(body.previous, ["artifact_ref", "expected_artifact_hash", "sequence"]) ||
@@ -203,6 +244,7 @@ export default {
         execution_id: body.execution_id, sequence, task: snapshot.task,
         expected_provider: snapshot.provider, expected_action: snapshot.action,
         expected_permission_profile: snapshot.permission_profile,
+        expected_model: snapshot.expected_model, expected_effort: snapshot.expected_effort,
         policy_version: snapshot.policy_version, policy_sha256: snapshot.policy_sha256,
         executor_contract_version: snapshot.executor_contract_version,
         executor_contract_sha256: snapshot.executor_contract_sha256, revas: snapshot.revas,

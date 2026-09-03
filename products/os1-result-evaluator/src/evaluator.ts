@@ -5,11 +5,25 @@ export type RevasPolicy = {
 };
 export type Artifact = {
   provider: "codex" | "claude"; action: "agent_run" | "agent_run_efficient" | "agent_run_deep";
-  permission_profile: "read_only" | "workspace_write" | "full_access"; effort: string;
+  permission_profile: "read_only" | "workspace_write"; model: string; effort: string;
   executor_contract_version: string; executor_contract_sha256: string;
   exit_code: number; output: string; stderr: string; workspace_diff_hash: string;
 };
 export type Evaluation = { outcome: "pass" | "fail" | "retry"; score: number; flags: string[] };
+export type ExpectedExecution = Pick<Artifact,
+  "provider" | "action" | "permission_profile" | "model" | "effort" |
+  "executor_contract_version" | "executor_contract_sha256"
+>;
+
+export function executionBindingMatches(artifact: Artifact, expected: ExpectedExecution): boolean {
+  return artifact.provider === expected.provider &&
+    artifact.action === expected.action &&
+    artifact.permission_profile === expected.permission_profile &&
+    artifact.model === expected.model &&
+    artifact.effort === expected.effort &&
+    artifact.executor_contract_version === expected.executor_contract_version &&
+    artifact.executor_contract_sha256 === expected.executor_contract_sha256;
+}
 
 const EMPTY_DIFF = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 function includesAny(text: string, patterns: string[]): boolean {

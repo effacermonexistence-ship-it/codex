@@ -2,7 +2,7 @@ export type Provider = "codex" | "claude";
 export type ProviderPreference = "auto" | Provider;
 export type CapacityPlan = { codex: number; claude: number };
 export type UsageCounts = { codex: number; claude: number };
-export type PermissionProfile = "read_only" | "workspace_write" | "full_access";
+export type PermissionProfile = "read_only" | "workspace_write";
 export type Action = "agent_run" | "agent_run_efficient" | "agent_run_deep";
 export type Step = {
   provider: Provider;
@@ -65,7 +65,6 @@ const providers = new Set<Provider>(["codex", "claude"]);
 const permissions = new Set<PermissionProfile>([
   "read_only",
   "workspace_write",
-  "full_access",
 ]);
 
 function isProvider(value: unknown): value is Provider {

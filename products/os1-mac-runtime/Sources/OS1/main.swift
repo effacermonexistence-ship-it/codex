@@ -108,9 +108,6 @@ struct RuntimeConfig: Codable {
     let ticketVerifyingKeyRaw: String
     let maximumSteps: Int
     let executionTimeoutSeconds: Int
-    let routingMode: String?
-    let localPrivateCorePath: String?
-    let localPrivateStatePath: String?
     let modelProfiles: ModelProfiles?
     let effortProfiles: EffortProfiles?
     let executorContract: ExecutorContract
@@ -120,9 +117,6 @@ struct RuntimeConfig: Codable {
         case ticketVerifyingKeyRaw = "ticket_verifying_key_raw"
         case maximumSteps = "maximum_steps"
         case executionTimeoutSeconds = "execution_timeout_seconds"
-        case routingMode = "routing_mode"
-        case localPrivateCorePath = "local_private_core_path"
-        case localPrivateStatePath = "local_private_state_path"
         case modelProfiles = "model_profiles"
         case effortProfiles = "effort_profiles"
         case executorContract = "executor_contract"
@@ -137,21 +131,6 @@ struct RuntimeConfig: Codable {
         }
         let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
         return URL(fileURLWithPath: String(decoding: bytes, as: UTF8.self)).resolvingSymlinksInPath()
-    }
-
-    static func resolvedLocalPrivateCorePath(configuredPath: String?) -> String? {
-        let executableDirectory = executableURL().deletingLastPathComponent()
-        let userSupport = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/OS-1/private-core/os1_local_core.py")
-        let candidates = [
-            configuredPath,
-            executableDirectory.appendingPathComponent("private-core/os1_local_core.py").path,
-            userSupport.path,
-            "/Library/Application Support/OS-1/private-core/os1_local_core.py",
-        ].compactMap { $0 }
-        return candidates.first { path in
-            path.hasPrefix("/") && FileManager.default.isReadableFile(atPath: path)
-        }
     }
 
     static func load() throws -> RuntimeConfig {
@@ -170,11 +149,7 @@ struct RuntimeConfig: Codable {
         ].compactMap { $0 }
         for path in paths where FileManager.default.fileExists(atPath: path) {
             let value = try JSONDecoder().decode(RuntimeConfig.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
-            let routingMode = value.routingMode ?? "remote"
-            let remoteConfigurationValid = routingMode == "remote" && URL(string: value.apiURL)?.scheme == "https"
-            let localConfigurationValid = routingMode == "local_private" &&
-                resolvedLocalPrivateCorePath(configuredPath: value.localPrivateCorePath) != nil
-            guard (remoteConfigurationValid || localConfigurationValid),
+            guard URL(string: value.apiURL)?.scheme == "https",
                   value.maximumSteps >= 1, value.maximumSteps <= 4,
                   value.executionTimeoutSeconds >= 60,
                   value.modelProfiles.map({ profiles in
@@ -203,140 +178,6 @@ struct RuntimeConfig: Codable {
             return value
         }
         throw OS1Error.message("OS-1 configuration is missing; reinstall OS-1")
-    }
-}
-
-struct LocalRouteRequest: Codable {
-    let prompt: String
-    let providerPreference: String
-    let codexCapacity: Int
-    let claudeCapacity: Int
-    let attempt: Int
-    let retryProvider: String?
-    let stateDirectory: String?
-    let availableCodexModels: [CodexModelCapability]
-
-    enum CodingKeys: String, CodingKey {
-        case prompt, attempt
-        case providerPreference = "provider_preference"
-        case codexCapacity = "codex_capacity"
-        case claudeCapacity = "claude_capacity"
-        case retryProvider = "retry_provider"
-        case stateDirectory = "state_dir"
-        case availableCodexModels = "available_codex_models"
-    }
-}
-
-struct LocalRouteDecision: Codable {
-    let schema: Int
-    let routeID: String
-    let provider: String
-    let providerPinned: Bool
-    let action: String
-    let permissionProfile: String
-    let model: String
-    let effort: String
-    let tier: String
-    let verificationProfile: String
-    let policySHA256: String
-    let engineSHA256: String
-    let authoritySHA256: String
-
-    enum CodingKeys: String, CodingKey {
-        case schema, provider, action, model, effort, tier
-        case routeID = "route_id"
-        case providerPinned = "provider_pinned"
-        case permissionProfile = "permission_profile"
-        case verificationProfile = "verification_profile"
-        case policySHA256 = "policy_sha256"
-        case engineSHA256 = "engine_sha256"
-        case authoritySHA256 = "authority_sha256"
-    }
-}
-
-struct LocalVerifyRequest: Codable {
-    let routeID: String
-    let prompt: String
-    let output: String
-    let stderr: String
-    let verificationProfile: String
-    let nativePersistence: String
-    let exitCode: Int32
-    let attempt: Int
-    let beforeWorkspaceHash: String
-    let afterWorkspaceHash: String
-    let providerPinned: Bool
-    let provider: String
-    let stateDirectory: String?
-
-    enum CodingKeys: String, CodingKey {
-        case prompt, output, stderr, attempt, provider
-        case routeID = "route_id"
-        case verificationProfile = "verification_profile"
-        case nativePersistence = "native_persistence"
-        case exitCode = "exit_code"
-        case beforeWorkspaceHash = "before_workspace_hash"
-        case afterWorkspaceHash = "after_workspace_hash"
-        case providerPinned = "provider_pinned"
-        case stateDirectory = "state_dir"
-    }
-}
-
-struct LocalVerification: Codable {
-    let schema: Int
-    let outcome: String
-    let reasonCode: String
-    let nextProvider: String
-    let policySHA256: String
-
-    enum CodingKeys: String, CodingKey {
-        case schema, outcome
-        case reasonCode = "reason_code"
-        case nextProvider = "next_provider"
-        case policySHA256 = "policy_sha256"
-    }
-}
-
-struct LocalExecuteRequest: Codable {
-    let routeID: String
-    let prompt: String
-    let stateDirectory: String?
-
-    enum CodingKeys: String, CodingKey {
-        case prompt
-        case routeID = "route_id"
-        case stateDirectory = "state_dir"
-    }
-}
-
-struct LocalExecuteResponse: Codable {
-    let schema: Int
-    let routeID: String
-    let output: String
-    let resultSHA256: String
-    let receiptPath: String
-    let policySHA256: String
-
-    enum CodingKeys: String, CodingKey {
-        case schema, output
-        case routeID = "route_id"
-        case resultSHA256 = "result_sha256"
-        case receiptPath = "receipt_path"
-        case policySHA256 = "policy_sha256"
-    }
-}
-
-private struct LocalDeterministicReceipt: Decodable {
-    let schema: Int
-    let routeID: String
-    let resultSHA256: String
-    let policySHA256: String
-
-    enum CodingKeys: String, CodingKey {
-        case schema
-        case routeID = "route_id"
-        case resultSHA256 = "result_sha256"
-        case policySHA256 = "policy_sha256"
     }
 }
 
@@ -428,10 +269,11 @@ struct ResultSubmission: Codable {
 }
 
 struct Artifact: Codable {
-    let schema = 2
+    let schema = 3
     let provider: String
     let action: String
     let permissionProfile: String
+    let model: String
     let effort: String
     let executorContractVersion: String
     let executorContractSHA256: String
@@ -442,7 +284,7 @@ struct Artifact: Codable {
     let workspaceDiffHash: String
 
     enum CodingKeys: String, CodingKey {
-        case schema, provider, action, effort, output, stderr
+        case schema, provider, action, model, effort, output, stderr
         case permissionProfile = "permission_profile"
         case executorContractVersion = "executor_contract_version"
         case executorContractSHA256 = "executor_contract_sha256"
@@ -722,8 +564,6 @@ func claudePermissionArguments(_ permissionProfile: String) throws -> [String] {
         // its hard/soft safety boundaries. OS-1 separately rejects any denied
         // tool call before the server can record the step as verified.
         return ["--permission-mode", "auto"]
-    case "full_access":
-        return ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"]
     default:
         throw OS1Error.message("Server ticket permission profile rejected")
     }
@@ -934,7 +774,7 @@ func resultBytes(_ result: ResultSubmission) -> Data {
 func verifyTicket(_ ticket: Ticket, config: RuntimeConfig) throws {
     guard ["agent_run", "agent_run_efficient", "agent_run_deep"].contains(ticket.action),
           ["codex", "claude"].contains(ticket.provider),
-          ["read_only", "workspace_write", "full_access"].contains(ticket.permissionProfile) else {
+          ["read_only", "workspace_write"].contains(ticket.permissionProfile) else {
         throw OS1Error.message("Server ticket contract rejected")
     }
     let formatter = ISO8601DateFormatter()
@@ -1124,81 +964,6 @@ private func fallbackPriority(_ slug: String) -> Int {
     case "gpt-5.6-luna": return 3
     default: return 100
     }
-}
-
-func privateCoreCall<Request: Encodable, Response: Decodable>(
-    _ mode: String,
-    request: Request,
-    config: RuntimeConfig,
-    as responseType: Response.Type
-) throws -> Response {
-    guard (config.routingMode ?? "remote") == "local_private",
-          let corePath = RuntimeConfig.resolvedLocalPrivateCorePath(configuredPath: config.localPrivateCorePath),
-          ["route", "execute", "verify"].contains(mode) else {
-        throw OS1Error.message("OS-1 local private core is unavailable; reinstall OS-1")
-    }
-    let python = try findExecutable("python3")
-    let input = try JSONEncoder().encode(request)
-    let result = try commandOutput(python, [corePath, mode, "-"], input: input, timeout: 30)
-    guard result.0 == 0 else {
-        throw OS1Error.message("OS-1 local private core rejected the request")
-    }
-    do {
-        return try JSONDecoder().decode(Response.self, from: result.1)
-    } catch {
-        throw OS1Error.message("OS-1 local private core returned an invalid receipt")
-    }
-}
-
-func validateLocalRoute(_ decision: LocalRouteDecision, codexModels: [CodexModelCapability]) throws {
-    let sha = /^[0-9a-f]{64}$/
-    guard decision.schema == 1,
-          decision.routeID.wholeMatch(of: /^rcc-local-[0-9a-f]{32}$/) != nil,
-          ["local", "codex", "claude"].contains(decision.provider),
-          ["deterministic_compute", "agent_run", "agent_run_efficient", "agent_run_deep"].contains(decision.action),
-          ["read_only", "workspace_write", "full_access"].contains(decision.permissionProfile),
-          isSafeModelIdentifier(decision.model),
-          isSupportedEffort(decision.effort) || decision.effort == "none",
-          ["efficient", "standard", "frontier", "maximum"].contains(decision.tier),
-          ["deterministic_exact", "executed_change", "executed_review", "source_review", "native_record"].contains(decision.verificationProfile),
-          decision.policySHA256.wholeMatch(of: sha) != nil,
-          decision.engineSHA256.wholeMatch(of: sha) != nil,
-          decision.authoritySHA256.wholeMatch(of: sha) != nil else {
-        throw OS1Error.message("OS-1 local RCC route contract rejected")
-    }
-    if decision.provider == "local" {
-        guard !decision.providerPinned,
-              decision.action == "deterministic_compute",
-              decision.model == "local-deterministic",
-              decision.effort == "none",
-              decision.permissionProfile == "read_only",
-              decision.verificationProfile == "deterministic_exact" else {
-            throw OS1Error.message("OS-1 local deterministic route contract rejected")
-        }
-    } else {
-        guard decision.action != "deterministic_compute", decision.effort != "none" else {
-            throw OS1Error.message("OS-1 provider route contract rejected")
-        }
-    }
-    if decision.provider == "codex" {
-        guard let capability = codexModels.first(where: { $0.slug == decision.model }),
-              capability.supportedEfforts.contains(decision.effort) else {
-            throw OS1Error.message("OS-1 rejected a Codex model or effort not exposed by this Codex installation")
-        }
-    }
-}
-
-func localTicket(_ decision: LocalRouteDecision, sequence: Int) -> Ticket {
-    Ticket(
-        executionID: decision.routeID,
-        sequence: sequence,
-        provider: decision.provider,
-        action: decision.action,
-        permissionProfile: decision.permissionProfile,
-        expiresAt: ISO8601DateFormatter().string(from: Date().addingTimeInterval(3_600)),
-        nonce: UUID().uuidString.lowercased(),
-        signature: "local-private-core"
-    )
 }
 
 func githubToken() throws -> String {
@@ -1405,7 +1170,6 @@ final class CodexAppServerClient: @unchecked Sendable {
         switch permissionProfile {
         case "read_only": sandbox = "read-only"
         case "workspace_write": sandbox = "workspace-write"
-        case "full_access": sandbox = "danger-full-access"
         default: throw OS1Error.message("Server ticket permission profile rejected")
         }
 
@@ -2131,6 +1895,7 @@ func execute(
             provider: ticket.provider,
             action: ticket.action,
             permissionProfile: ticket.permissionProfile,
+            model: model ?? "provider-default",
             effort: effort,
             executorContractVersion: executorContract.version,
             executorContractSHA256: executorContract.sha256,
@@ -2145,6 +1910,7 @@ func execute(
     )
 }
 
+#if OS1_INTERNAL_PRIVATE_CORE
 func executeLocalDeterministic(
     decision: LocalRouteDecision,
     prompt: String,
@@ -2202,6 +1968,7 @@ func executeLocalDeterministic(
             provider: decision.provider,
             action: decision.action,
             permissionProfile: decision.permissionProfile,
+            model: decision.model,
             effort: decision.effort,
             executorContractVersion: config.executorContract.version,
             executorContractSHA256: config.executorContract.sha256,
@@ -2362,6 +2129,7 @@ func runLocalTask(
     }
     throw OS1Error.message("OS-1 local RCC maximum step limit reached")
 }
+#endif
 
 func runTask(
     prompt: String,
@@ -2380,21 +2148,6 @@ func runTask(
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: canonicalWorkspace, isDirectory: &isDirectory), isDirectory.boolValue else {
         throw OS1Error.message("Workspace directory does not exist")
-    }
-    if (config.routingMode ?? "remote") == "local_private" {
-        return try runLocalTask(
-            prompt: prompt,
-            workspace: canonicalWorkspace,
-            providerPreference: providerPreference,
-            context: context,
-            codexSessionID: codexSessionID,
-            claudeSessionID: claudeSessionID,
-            codexCapacity: codexCapacity,
-            claudeCapacity: claudeCapacity,
-            progress: progress,
-            desktopReveal: desktopReveal,
-            config: config
-        )
     }
     let key = try SigningKey.loadOrCreate()
     let id = try deviceID()
@@ -2512,34 +2265,6 @@ func doctor() throws {
         throw OS1Error.message("OS-1 model or effort profiles are missing; reinstall OS-1")
     }
     for command in ["codex", "claude"] { _ = try findExecutable(command) }
-    if (config.routingMode ?? "remote") == "local_private" {
-        let catalog = try activeCodexCatalog(config: config)
-        let decision: LocalRouteDecision = try privateCoreCall(
-            "route",
-            request: LocalRouteRequest(
-                prompt: "원플러스 원이 뭐야?",
-                providerPreference: "auto",
-                codexCapacity: 30,
-                claudeCapacity: 100,
-                attempt: 1,
-                retryProvider: nil,
-                stateDirectory: config.localPrivateStatePath,
-                availableCodexModels: catalog.models
-            ),
-            config: config,
-            as: LocalRouteDecision.self
-        )
-        try validateLocalRoute(decision, codexModels: catalog.models)
-        guard decision.provider == "local", decision.model == "local-deterministic",
-              decision.effort == "none", decision.action == "deterministic_compute" else {
-            throw OS1Error.message("OS-1 local RCC route probe failed")
-        }
-        print("OS-1 configuration: OK (local private RCC)")
-        print("RCC source lock: \(decision.engineSHA256)")
-        print("Codex catalog: \(catalog.models.count) active models from \(catalog.source)")
-        print("Local exact executor, Codex, and Claude: available")
-        return
-    }
     let key = try SigningKey.loadOrCreate()
     _ = try deviceID()
     _ = try findExecutable("gh")
@@ -2721,7 +2446,7 @@ func selfTest() throws {
               "--tools", "Read,Glob,Grep,WebSearch,WebFetch",
           ],
           try claudePermissionArguments("workspace_write") == ["--permission-mode", "auto"],
-          try claudePermissionArguments("full_access") == ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"],
+          (try? claudePermissionArguments("full_access")) == nil,
           (try? claudePermissionArguments("unknown")) == nil else {
         throw OS1Error.message("Claude OS-1 permission orchestration validation failed")
     }
@@ -2793,9 +2518,6 @@ func selfTest() throws {
         ticketVerifyingKeyRaw: String(repeating: "A", count: 43),
         maximumSteps: 4,
         executionTimeoutSeconds: 60,
-        routingMode: "remote",
-        localPrivateCorePath: nil,
-        localPrivateStatePath: nil,
         modelProfiles: ModelProfiles(
             codex: ProviderModelProfile(standard: "codex-standard", efficient: "codex-fast", deep: "codex-deep"),
             claude: ProviderModelProfile(standard: "claude-standard", efficient: "claude-fast", deep: "claude-deep")
@@ -2872,16 +2594,11 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.7.15")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.8.0")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":
                 let config = try RuntimeConfig.load()
-                if (config.routingMode ?? "remote") == "local_private" {
-                    try doctor()
-                    print("OS-1 local private RCC requires no remote device registration")
-                    return
-                }
                 let client = APIClient(config: config, token: try githubToken(), deviceID: try deviceID())
                 let key = try SigningKey.loadOrCreate()
                 try await register(client: client, key: key)

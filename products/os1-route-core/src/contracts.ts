@@ -9,7 +9,6 @@ export const ACTIONS = [
 export const PERMISSION_PROFILES = [
   "read_only",
   "workspace_write",
-  "full_access",
 ] as const;
 
 export type Provider = (typeof PROVIDERS)[number];

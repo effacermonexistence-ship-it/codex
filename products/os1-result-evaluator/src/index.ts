@@ -1,7 +1,9 @@
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ARTIFACT_REF = /^r2:\/\/os1-private-results\/([0-9a-f-]{36})\/([1-9][0-9]{0,5})\/([0-9a-f]{64})\.json$/i;
-import { evaluateArtifact, type Artifact, type RevasPolicy } from "./evaluator";
+const MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{1,95}$/;
+const EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+import { executionBindingMatches, evaluateArtifact, type Artifact, type RevasPolicy } from "./evaluator";
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -27,11 +29,12 @@ async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 function parseArtifact(value: unknown): Artifact {
-  if (!record(value) || !exact(value, ["schema", "provider", "action", "permission_profile", "effort", "executor_contract_version", "executor_contract_sha256", "exit_code", "output", "stderr", "duration_ms", "workspace_diff_hash"]) ||
-    value.schema !== 2 || !["codex", "claude"].includes(String(value.provider)) ||
+  if (!record(value) || !exact(value, ["schema", "provider", "action", "permission_profile", "model", "effort", "executor_contract_version", "executor_contract_sha256", "exit_code", "output", "stderr", "duration_ms", "workspace_diff_hash"]) ||
+    value.schema !== 3 || !["codex", "claude"].includes(String(value.provider)) ||
     !["agent_run", "agent_run_efficient", "agent_run_deep"].includes(String(value.action)) ||
-    !["read_only", "workspace_write", "full_access"].includes(String(value.permission_profile)) ||
-    typeof value.effort !== "string" || value.effort.length < 3 || value.effort.length > 16 ||
+    !["read_only", "workspace_write"].includes(String(value.permission_profile)) ||
+    typeof value.model !== "string" || !MODEL_IDENTIFIER.test(value.model) ||
+    typeof value.effort !== "string" || !EFFORTS.has(value.effort) ||
     typeof value.executor_contract_version !== "string" || value.executor_contract_version.length < 8 || value.executor_contract_version.length > 96 ||
     typeof value.executor_contract_sha256 !== "string" || !SHA256.test(value.executor_contract_sha256) ||
     !Number.isSafeInteger(value.exit_code) || typeof value.output !== "string" || value.output.length > 800_000 ||
@@ -45,12 +48,14 @@ export default {
     try {
       if (request.method !== "POST" || new URL(request.url).pathname !== "/evaluate") throw new Error("denied");
       const body = await request.json<unknown>();
-      if (!record(body) || !exact(body, ["execution_id", "sequence", "task", "expected_provider", "expected_action", "expected_permission_profile", "policy_version", "policy_sha256", "executor_contract_version", "executor_contract_sha256", "revas", "artifact_ref", "expected_artifact_hash"]) ||
+      if (!record(body) || !exact(body, ["execution_id", "sequence", "task", "expected_provider", "expected_action", "expected_permission_profile", "expected_model", "expected_effort", "policy_version", "policy_sha256", "executor_contract_version", "executor_contract_sha256", "revas", "artifact_ref", "expected_artifact_hash"]) ||
         typeof body.execution_id !== "string" || !UUID.test(body.execution_id) || !Number.isSafeInteger(body.sequence) ||
         typeof body.task !== "string" || body.task.length < 1 || body.task.length > 48_000 ||
         !["codex", "claude"].includes(String(body.expected_provider)) ||
         !["agent_run", "agent_run_efficient", "agent_run_deep"].includes(String(body.expected_action)) ||
-        !["read_only", "workspace_write", "full_access"].includes(String(body.expected_permission_profile)) ||
+        !["read_only", "workspace_write"].includes(String(body.expected_permission_profile)) ||
+        typeof body.expected_model !== "string" || !MODEL_IDENTIFIER.test(body.expected_model) ||
+        typeof body.expected_effort !== "string" || !EFFORTS.has(body.expected_effort) ||
         typeof body.policy_version !== "string" || body.policy_version.length < 8 || body.policy_version.length > 96 ||
         typeof body.policy_sha256 !== "string" || !SHA256.test(body.policy_sha256) ||
         typeof body.executor_contract_version !== "string" || body.executor_contract_version.length < 8 || body.executor_contract_version.length > 96 ||
@@ -67,9 +72,15 @@ export default {
       const verifiedHash = await sha256Hex(bytes);
       if (verifiedHash !== body.expected_artifact_hash) throw new Error("denied");
       const artifact = parseArtifact(JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes)));
-      if (artifact.provider !== body.expected_provider || artifact.action !== body.expected_action ||
-        artifact.permission_profile !== body.expected_permission_profile ||
-        artifact.executor_contract_version !== body.executor_contract_version || artifact.executor_contract_sha256 !== body.executor_contract_sha256) throw new Error("denied");
+      if (!executionBindingMatches(artifact, {
+        provider: body.expected_provider as Artifact["provider"],
+        action: body.expected_action as Artifact["action"],
+        permission_profile: body.expected_permission_profile as Artifact["permission_profile"],
+        model: body.expected_model,
+        effort: body.expected_effort,
+        executor_contract_version: body.executor_contract_version,
+        executor_contract_sha256: body.executor_contract_sha256,
+      })) throw new Error("denied");
       const evaluation = evaluateArtifact(body.task, artifact, parseRevas(body.revas));
       const executionBytes = new TextEncoder().encode(body.execution_id);
       const executionHash = await sha256Hex(executionBytes.buffer.slice(executionBytes.byteOffset, executionBytes.byteOffset + executionBytes.byteLength) as ArrayBuffer);

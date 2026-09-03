@@ -72,7 +72,7 @@ jobs:
         run: pnpm --dir "products/${{ matrix.worker }}" check
 
       - name: Run adversarial contract tests
-        if: matrix.worker == 'os1-route-core' || matrix.worker == 'os1-private-route-core'
+        if: matrix.worker == 'os1-route-core' || matrix.worker == 'os1-private-route-core' || matrix.worker == 'os1-result-evaluator'
         run: pnpm --dir "products/${{ matrix.worker }}" test
 
       - name: Build Cloudflare dry-run bundle
@@ -107,9 +107,17 @@ jobs:
         run: |
           bash -n products/os1-mac-runtime/scripts/build-release.sh
           bash -n products/os1-mac-runtime/scripts/install-os1.sh
+          bash -n products/os1-mac-runtime/scripts/archive-private-release.sh
+          bash -n products/os1-mac-runtime/InstallerScripts/postinstall
 
-      - name: Build, sign, package, and scan universal release
+      - name: Assert Apple distribution credentials are mandatory
+        run: |
+          if OS1_RELEASE_MODE=distribution products/os1-mac-runtime/scripts/build-release.sh; then
+            echo "Distribution build unexpectedly accepted missing Apple credentials." >&2
+            exit 1
+          fi
+
+      - name: Build, package, unpack, and scan universal public release
         env:
-          OS1_PRIVATE_CORE_SOURCE: ${{ github.workspace }}/products/os1-mac-runtime/Fixtures/ci-private-core
-          OS1_ALLOW_CI_PRIVATE_CORE_FIXTURE: "1"
+          OS1_RELEASE_MODE: development
         run: products/os1-mac-runtime/scripts/build-release.sh

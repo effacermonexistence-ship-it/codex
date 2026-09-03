@@ -64,6 +64,14 @@ curl -fL --retry 3 --proto '=https' --tlsv1.2 \
   -o "$os1_tmp/OS-1.pkg" "$gateway/v1/releases/download"
 [[ "$(stat -f '%z' "$os1_tmp/OS-1.pkg")" == "$os1_size" ]]
 printf '%s  %s\n' "$os1_sha256" "$os1_tmp/OS-1.pkg" | shasum -a 256 -c -
+if ! pkgutil --check-signature "$os1_tmp/OS-1.pkg" >/dev/null 2>&1; then
+  echo "OS-1 refused an unsigned or invalid installer package." >&2
+  exit 1
+fi
+if ! spctl --assess --type install "$os1_tmp/OS-1.pkg" >/dev/null 2>&1; then
+  echo "OS-1 refused a package that did not pass Apple distribution assessment." >&2
+  exit 1
+fi
 sudo installer -pkg "$os1_tmp/OS-1.pkg" -target /
 
 if [[ "${OS1_SKIP_LOGIN:-0}" != "1" && -t 0 ]]; then

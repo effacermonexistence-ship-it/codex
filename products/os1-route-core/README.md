@@ -20,11 +20,11 @@ weights, rule matches, and rationale never cross the private service boundary;
 the client still receives only the signed eight-field ticket.
 
 The same private decision assigns an execution tier through the ticket's
-existing `action` field. A current Mac runtime maps that tier to the configured
-Codex or Claude model locally: normal turns preserve the account default,
-capacity-relieved turns use an efficient profile, and protected specialist
-rules use a deep profile. Concrete model aliases are deployment configuration;
-rule terms, weights, match state, and reasoning remain private.
+existing `action` field. The Mac runtime maps that tier to the configured Codex
+or Claude model, but the private route state independently stores the expected
+model and effort. REVAS rejects an artifact if a modified client substitutes a
+different model, effort, action, permission, or executor contract. Rule terms,
+weights, match state, scores, and future routes remain private.
 
 ## Required private service bindings
 
@@ -50,7 +50,26 @@ that generic contract through its developer-instruction channel; Claude Code
 receives it through its appended system-prompt channel. The contract contains
 execution hygiene only—not routing rules, scoring policy, thresholds, or future
 steps. REVAS independently binds the artifact's backend, action, permission
-profile, reasoning effort, and contract provenance to the server-side route.
+profile, exact model, reasoning effort, and contract provenance to the
+server-side route. New executions are also subject to a per-principal hourly
+start budget; this raises automated extraction cost but does not eliminate
+black-box behavioral approximation.
+
+## Public package boundary
+
+The public Mac package is built from an explicit file allowlist. It contains
+only the universal GUI/CLI executables, public images, the ticket verification
+key, public endpoint and executor configuration, and the upgrade cleanup
+script. It does not contain a local routing core, RCC/REVAS source, policy
+bundle, benchmark priors, prompt lineage, router state, scoring rules, or
+fallback routing graph. The post-install migration removes the exact legacy
+product-owned private-core directory left by older packages.
+
+This construction protects source and policy contents because those bytes are
+absent from the client. It cannot make the service "unhackable": a device owner
+can observe inputs and the returned provider/action labels and may approximate
+behavior through repeated queries. Server-side budgets and monitoring mitigate
+that residual oracle risk.
 
 ## Local verification
 
@@ -66,9 +85,10 @@ Real keys and protected canary fragments belong in Cloudflare secrets. Copy
 `.dev.vars.example` to an ignored `.dev.vars` only for local development; never
 commit it.
 
-The deployed functional release candidate includes a universal Mac Runtime,
-Secure Enclave device signing, private services, R2 artifact storage, a public
-SHA-256-pinned package, and deployed red-team smoke tests. Developer ID package
-signing and Apple notarization remain release-distribution work; the shell
-installer is currently the supported installation path. See
+The local hardened release candidate includes a universal Mac Runtime, Secure
+Enclave device signing, private services, R2 artifact storage, a SHA-256-pinned
+package format, and red-team contract tests. Distribution mode deliberately
+fails unless Developer ID application/package identities and a notarization
+profile are supplied. The network installer also refuses unsigned or
+unnotarized packages. See
 [`docs/os1-route-core-security-handoff.md`](../../docs/os1-route-core-security-handoff.md).

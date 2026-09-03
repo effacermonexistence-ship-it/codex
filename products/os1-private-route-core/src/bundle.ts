@@ -1,8 +1,17 @@
-import { parsePolicy, type Policy } from "./policy";
+import { parsePolicy, type Action, type Policy, type Provider } from "./policy";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const POLICY_KEY = /^os1\/policies\/([0-9a-f]{64})\.json$/;
 const CONTRACT_VERSION = /^[A-Za-z0-9._-]{8,96}$/;
+const MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{1,95}$/;
+const EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+
+export type ExecutionProfile = { model: string; effort: string };
+export type ExecutionProfiles = Record<Provider, {
+  standard: ExecutionProfile;
+  efficient: ExecutionProfile;
+  deep: ExecutionProfile;
+}>;
 
 export type RevasPolicy = {
   version: 1;
@@ -19,9 +28,10 @@ export type RevasPolicy = {
 };
 
 export type PolicyBundle = {
-  schema: 1;
+  schema: 2;
   policy_version: string;
-  executor_contract: { version: string; sha256: string };
+  executor_contracts: Array<{ version: string; sha256: string }>;
+  execution_profiles: ExecutionProfiles;
   routing: Policy;
   revas: RevasPolicy;
 };
@@ -40,6 +50,38 @@ function boundedList(value: unknown, maximum: number): value is string[] {
   return Array.isArray(value) && value.length <= maximum && value.every(
     (entry) => typeof entry === "string" && entry.length >= 2 && entry.length <= 128,
   );
+}
+
+function parseExecutionProfile(value: unknown): ExecutionProfile {
+  if (!record(value) || !exact(value, ["model", "effort"]) ||
+    typeof value.model !== "string" || !MODEL_IDENTIFIER.test(value.model) ||
+    typeof value.effort !== "string" || !EFFORTS.has(value.effort)
+  ) throw new Error("invalid policy bundle");
+  return { model: value.model, effort: value.effort };
+}
+
+export function parseExecutionProfiles(value: unknown): ExecutionProfiles {
+  if (!record(value) || !exact(value, ["codex", "claude"])) throw new Error("invalid policy bundle");
+  const parseProvider = (candidate: unknown): ExecutionProfiles[Provider] => {
+    if (!record(candidate) || !exact(candidate, ["standard", "efficient", "deep"])) {
+      throw new Error("invalid policy bundle");
+    }
+    return {
+      standard: parseExecutionProfile(candidate.standard),
+      efficient: parseExecutionProfile(candidate.efficient),
+      deep: parseExecutionProfile(candidate.deep),
+    };
+  };
+  return { codex: parseProvider(value.codex), claude: parseProvider(value.claude) };
+}
+
+export function executionProfileFor(
+  profiles: ExecutionProfiles,
+  provider: Provider,
+  action: Action,
+): ExecutionProfile {
+  const tier = action === "agent_run_efficient" ? "efficient" : action === "agent_run_deep" ? "deep" : "standard";
+  return profiles[provider][tier];
 }
 
 function parseRevas(value: unknown): RevasPolicy {
@@ -68,24 +110,31 @@ function parseRevas(value: unknown): RevasPolicy {
 
 export function parsePolicyBundle(serialized: string): PolicyBundle {
   const value = JSON.parse(serialized) as unknown;
-  if (!record(value) || !exact(value, [
-    "schema", "policy_version", "executor_contract", "routing", "revas",
-  ]) || value.schema !== 1 || typeof value.policy_version !== "string" ||
-    value.policy_version.length < 8 || value.policy_version.length > 96 ||
-    !record(value.executor_contract) ||
-    !exact(value.executor_contract, ["version", "sha256"]) ||
-    typeof value.executor_contract.version !== "string" ||
-    !CONTRACT_VERSION.test(value.executor_contract.version) ||
-    typeof value.executor_contract.sha256 !== "string" ||
-    !SHA256.test(value.executor_contract.sha256)
+  if (!record(value) || value.schema !== 2 ||
+    typeof value.policy_version !== "string" ||
+    value.policy_version.length < 8 || value.policy_version.length > 96
+  ) throw new Error("invalid policy bundle");
+  const candidates = exact(value, [
+    "schema", "policy_version", "executor_contracts", "execution_profiles", "routing", "revas",
+  ]) && Array.isArray(value.executor_contracts) ? value.executor_contracts : null;
+  if (!candidates || candidates.length < 1 || candidates.length > 4 ||
+    candidates.some((candidate) => !record(candidate) ||
+      !exact(candidate, ["version", "sha256"]) ||
+      typeof candidate.version !== "string" || !CONTRACT_VERSION.test(candidate.version) ||
+      typeof candidate.sha256 !== "string" || !SHA256.test(candidate.sha256))
+  ) throw new Error("invalid policy bundle");
+  const executorContracts = candidates.map((candidate) => ({
+    version: String((candidate as Record<string, unknown>).version),
+    sha256: String((candidate as Record<string, unknown>).sha256),
+  }));
+  if (new Set(executorContracts.map((contract) => contract.version)).size !== executorContracts.length ||
+    new Set(executorContracts.map((contract) => contract.sha256)).size !== executorContracts.length
   ) throw new Error("invalid policy bundle");
   return {
-    schema: 1,
+    schema: 2,
     policy_version: value.policy_version,
-    executor_contract: {
-      version: value.executor_contract.version,
-      sha256: value.executor_contract.sha256,
-    },
+    executor_contracts: executorContracts,
+    execution_profiles: parseExecutionProfiles(value.execution_profiles),
     routing: parsePolicy(JSON.stringify(value.routing)),
     revas: parseRevas(value.revas),
   };

@@ -40,7 +40,7 @@ describe("asymmetric ticket signatures", () => {
     const ticket = await signTicket(unsigned, privatePem);
     await expect(verifyTicket(ticket, publicPem)).resolves.toBe(true);
     await expect(
-      verifyTicket({ ...ticket, permission_profile: "full_access" }, publicPem),
+      verifyTicket({ ...ticket, permission_profile: "read_only" }, publicPem),
     ).resolves.toBe(false);
   });
 

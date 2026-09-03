@@ -2,11 +2,12 @@
 
 ## Status
 
-**FUNCTIONAL RELEASE CANDIDATE — deployed end to end; Developer ID signing and Apple notarization remain pending.**
+**LOCAL HARDENED RELEASE CANDIDATE — deployment and Apple distribution signing are intentionally pending.**
 
-This branch implements and deploys the public gateway, four private services,
+This branch implements the public gateway, four private services,
 private R2 result storage, universal Mac Runtime, GUI application, package
-builder, public release download, and one-command installer. It does not claim
+builder, public release download, and one-command installer. The 0.8.0 changes
+described here have not been deployed. It does not claim
 that OS-1 is unhackable or that black-box behavioral extraction is eliminated.
 
 ## Implemented architecture
@@ -59,7 +60,7 @@ or failed marker.
 4. Ask `PRIVATE_ROUTE_CORE` to resolve the stored route and send its private,
    version-pinned REVAS contract to `RESULT_EVALUATOR` over a service binding.
 5. Have the evaluator fetch the original R2 artifact and bind its hash,
-   metadata, provider, action, permission, effort, and executor-contract
+   metadata, provider, action, permission, exact model, effort, and executor-contract
    provenance to the stored route.
 6. Return only the evaluator's bounded outcome to the owning private core.
 7. Persist the next ticket or completion response before returning it. An
@@ -70,15 +71,15 @@ or failed marker.
 
 | Requirement | Implemented evidence | Remaining release blocker |
 | --- | --- | --- |
-| P1-1 delivery hygiene / T1 | Runtime delivers the user task plus a generic SHA-pinned executor contract; the gateway emits only the eight ticket fields; policy/scoring content stays server-side. | Retain packet/process-capture evidence per production release. |
+| P1-1 delivery hygiene / T1 | The public builder no longer copies a local private core and rejects legacy core filenames before and after packaging; runtime delivery remains user task plus generic SHA-pinned contract. | Retain packet/process-capture evidence per production release. |
 | P1-2 injection isolation / T4 | Codex uses a developer-instruction channel and Claude uses an appended system-prompt channel; user/session text remains untrusted data. A deployed exfiltration probe returned only the ticket schema, and a live provider probe refused disclosure. | Continue the injection corpus as policies evolve. |
 | P1-3 opaque egress / T3 | One 197-byte fixed-shape error; bounded exact JSON; eleven deployed malformed/auth cases passed. | Success response size and latency normalization remain P2 work. |
-| P1-4 result integrity / T5 | Secure Enclave P-256 signing, Ed25519 tickets, private R2 artifacts, independent evaluator, timing-safe hashes, and atomic nonce/sequence state are deployed. | A rooted owner can still fabricate client-observed output; cryptographic possession is not proof of honest execution. This is a documented structural residual risk. |
-| P1-5 build hygiene / T7 | Universal app/CLI and package build passed exact-content and Mach-O cstring entropy scanning with zero findings. CI rebuilds both architectures and repeats the gate. | Developer ID signing/notarization awaits an Apple distribution identity. |
+| P1-4 result integrity / T5 | Secure Enclave P-256 signing, Ed25519 tickets, private R2 artifacts, independent evaluator, atomic nonce/sequence state, and exact model/effort binding are implemented locally. | A rooted owner can still fabricate client-observed output; cryptographic possession is not proof of honest execution. This is a documented structural residual risk. |
+| P1-5 build hygiene / T7 | Universal app/CLI and package build use an explicit allowlist and scan the expanded package. CI rebuilds both architectures and repeats the gate. | Developer ID signing/notarization awaits Apple distribution identities. |
 | P2-1 device binding | Secure Enclave non-extractable P-256 key on supported Macs; Keychain fallback on older Intel hardware; immutable device registry. | Apple attestation validation, user-visible device revocation, and DPoP/mTLS. |
 | P2-2 asymmetric tickets | Deployed Ed25519 PKCS#8/SPKI split; only the raw public key is in the client config. | Rotation with overlapping public keys. |
 | P2-3 atomic result submission | Deployed SQLite Durable Objects enforce sequence, nonce, result hash, and one stored response; live E2E passed. | Add sustained concurrency/load evidence. |
-| P2-4 extraction resistance | None claimed. | Account/global budgets, distributed/Sybil detection, cost-bound identity and measured extraction-query threshold. |
+| P2-4 extraction resistance | A subject-scoped, atomic hourly execution-start budget is implemented. | Distributed/Sybil detection, cost-bound identity and a measured extraction-query threshold. |
 | P2-5 side-channel normalization | Fixed error status/body and no diagnostic headers. | Success payload bucketing and measured response-time/size normalization. |
 
 ## Automated and live evidence in this branch
@@ -100,7 +101,9 @@ CI regenerates bindings and type-checks/dry-bundles all five Workers. A macOS
 job builds both architectures, creates the application and package, validates
 code signatures and payloads, and runs the artifact scanner.
 
-The live acceptance run completed this sequence on 2026-09-01:
+The historical live acceptance run for the earlier deployment completed this
+sequence on 2026-09-01; it is not evidence that the undeployed 0.8.0 candidate
+is production-ready:
 
 1. generated and registered a Secure Enclave P-256 device key;
 2. received and verified an Ed25519 server ticket;
@@ -175,9 +178,24 @@ commit that private policy to this repository.
 
 ## Release decision
 
-The shell installation path is functional now. Finder double-click distribution
-must not be described as production-signed until a Developer ID Installer and
-Developer ID Application identity are used and the package is notarized and
-stapled. Behavioral surrogate routing, client-output fabrication on an
+Neither the shell path nor Finder distribution may publish the development
+package: the installer refuses any package that fails Apple signature and
+Gatekeeper assessment. Distribution mode requires a Developer ID Installer and
+Developer ID Application identity, then notarizes, staples, and assesses the
+package. Behavioral surrogate routing, client-output fabrication on an
 owner-controlled Mac, and decision-boundary approximation remain structural
 residual risks and must be measured and documented rather than marked resolved.
+
+After both Developer ID identities are installed in the login keychain and a
+notarytool keychain profile has been created, the release builder is invoked as:
+
+```bash
+OS1_RELEASE_MODE=distribution \
+OS1_CODESIGN_IDENTITY="Developer ID Application: …" \
+OS1_INSTALLER_IDENTITY="Developer ID Installer: …" \
+OS1_NOTARY_PROFILE="os1-notary" \
+products/os1-mac-runtime/scripts/build-release.sh
+```
+
+The build fails before staging if any value is absent. It does not print or
+archive notarization credentials.
