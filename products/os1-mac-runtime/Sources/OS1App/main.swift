@@ -1274,6 +1274,8 @@ private func nativeRecordReceipt(_ step: AppRunStep) -> String {
     case "local_only": parts.append("local exact receipt persisted")
     case "revealed": parts.append("Codex Desktop: synced and opened")
     case "claude_revealed": parts.append("Claude Desktop: synced and opened")
+    case "registered_in_background": parts.append("Codex Desktop: synced in background")
+    case "claude_registered_in_background": parts.append("Claude Desktop: synced in background")
     case "not_revealed": parts.append("\(step.provider == "claude" ? "Claude" : "Codex") Desktop: kept in background")
     case "desktop_not_running": parts.append("Codex Desktop: lists on launch")
     case let value where value.hasPrefix("reveal_failed"): parts.append("Codex Desktop: open failed")
@@ -1407,10 +1409,9 @@ private enum OS1Runner {
         arguments += [
             "--codex-capacity", String(codexCapacity),
             "--claude-capacity", String(claudeCapacity),
-            // Codex and Claude are execution backends. Keep OS-1 in front;
-            // users can explicitly open a linked native session from the
-            // routing menu when they actually want to inspect that app.
-            "--desktop-reveal", "never",
+            // Codex and Claude stay behind OS-1, while their native session
+            // indexes are still updated for explicit backend inspection.
+            "--desktop-reveal", "background",
         ]
 
         let process = Process()

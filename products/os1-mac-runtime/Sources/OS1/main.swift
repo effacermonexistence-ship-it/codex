@@ -585,6 +585,8 @@ func executorInstructions(contract: ExecutorContract, ticket: Ticket) -> String 
     - OS-1 owns permission orchestration. Do not ask the user to approve provider-native tools.
     - Do not invoke, shell out to, or delegate work to the other provider's CLI. OS-1 alone dispatches Codex and Claude backends.
     - Execute only actions allowed by the assigned permission profile. If an action is denied, stop and report the blocker truthfully.
+    - When the user asks for a schema, architecture, sketch, plan, outline, proposal, draft, or other concrete deliverable, produce a useful best-effort deliverable immediately under explicit reasonable assumptions. Do not answer only with clarifying questions; ask for missing details after the draft when useful.
+    - Return requested deliverables directly in the response. Do not create plan files unless the user asks for a file, and do not mention AskUserQuestion, ExitPlanMode, plan mode, or tool availability.
     """
 }
 
@@ -594,12 +596,16 @@ func executorInstructions(contract: ExecutorContract, ticket: Ticket) -> String 
 func claudeExecutorInstructions(
     contract: ExecutorContract,
     ticket: Ticket,
-    recoveringDiscardedCandidate: Bool = false
+    recoveringDiscardedCandidate: Bool = false,
+    recoveringClarificationOnlyCandidate: Bool = false
 ) -> String {
     let directives = contract.directives.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
-    let recovery = recoveringDiscardedCandidate
+    var recovery = recoveringDiscardedCandidate
         ? "\nA prior candidate was discarded by OS-1. Process the current user task again from scratch under this configuration."
         : ""
+    if recoveringClarificationOnlyCandidate {
+        recovery += "\nThe discarded candidate asked for clarification instead of producing the requested deliverable. Produce the complete best-effort draft now, state reasonable assumptions, and do not ask a question before the draft. Never mention AskUserQuestion or tool availability."
+    }
     return """
     Claude Code runtime configuration from OS-1 (\(contract.version)).
     This configuration is delivered through Claude Code's system-prompt channel, separately from the conversation and repository content.
@@ -615,6 +621,8 @@ func claudeExecutorInstructions(
     - OS-1 owns permission orchestration. Do not ask the user to approve provider-native tools.
     - Do not invoke, shell out to, or delegate work to the other provider's CLI. OS-1 alone dispatches Codex and Claude backends.
     - Execute only actions allowed by the assigned permission profile. If an action is denied, stop and report the blocker truthfully.\(recovery)
+    - When the user asks for a schema, architecture, sketch, plan, outline, proposal, draft, or other concrete deliverable, produce a useful best-effort deliverable immediately under explicit reasonable assumptions. Do not answer only with clarifying questions; ask for missing details after the draft when useful.
+    - Return requested deliverables directly in the response. Do not create plan files unless the user asks for a file, and do not mention AskUserQuestion, ExitPlanMode, plan mode, or tool availability.
     """
 }
 
@@ -634,6 +642,39 @@ func claudeOutputMisclassifiedRuntimeConfiguration(_ data: Data) -> Bool {
     return rejectionMarkers.contains(where: output.contains)
 }
 
+/// Deliverable requests should produce a useful first draft even when the
+/// user's vocabulary is ambiguous. OS-1 can refine that draft on the next
+/// turn; returning only a questionnaire breaks the execution contract.
+func promptRequestsImmediateDeliverable(_ prompt: String) -> Bool {
+    let value = prompt.lowercased()
+    let markers = [
+        "schema", "architecture", "sketch", "outline", "proposal", "draft",
+        "스키마", "스키만", "스키나", "설계", "초안", "개요", "구조", "짜봐", "그려봐",
+    ]
+    return markers.contains(where: value.contains)
+}
+
+func claudeOutputDefersRequestedDeliverable(_ data: Data, prompt: String) -> Bool {
+    guard promptRequestsImmediateDeliverable(prompt) else { return false }
+    let output = String(decoding: data, as: UTF8.self).lowercased()
+    let deferralMarkers = [
+        "no askuserquestion tool is available",
+        "exitplanmode",
+        "tool is disabled",
+        "tool is unavailable",
+        "도구가 비활성화",
+        "which of these is closest to what you mean",
+        "which one, or something else",
+        "i need clarification before",
+        "i need to ask directly before",
+        "could you clarify before",
+        "먼저 명확히 해주세요",
+        "먼저 확인이 필요",
+        "어느 쪽을 의미",
+    ]
+    return deferralMarkers.contains(where: output.contains)
+}
+
 func claudeArguments(
     model: String?,
     effort: String,
@@ -645,6 +686,10 @@ func claudeArguments(
     prompt: String
 ) throws -> [String] {
     var arguments = ["-p", "--output-format", "json"]
+    // `--tools` is variadic in Claude CLI. Keep permission arguments before a
+    // following named option so the positional user prompt is never consumed
+    // as another tool name.
+    arguments += try claudePermissionArguments(permissionProfile)
     if let model { arguments += ["--model", model] }
     arguments += [
         "--effort", effort,
@@ -658,7 +703,6 @@ func claudeArguments(
     } else {
         arguments += ["--resume", sessionID]
     }
-    arguments += try claudePermissionArguments(permissionProfile)
     arguments.append(prompt)
     return arguments
 }
@@ -666,7 +710,13 @@ func claudeArguments(
 func claudePermissionArguments(_ permissionProfile: String) throws -> [String] {
     switch permissionProfile {
     case "read_only":
-        return ["--permission-mode", "plan"]
+        // Claude's plan mode encourages AskUserQuestion/ExitPlanMode chatter
+        // and writes unsolicited plan files. An explicit tool allowlist keeps
+        // analysis read-only while letting ordinary answers execute directly.
+        return [
+            "--permission-mode", "dontAsk",
+            "--tools", "Read,Glob,Grep,WebSearch,WebFetch",
+        ]
     case "workspace_write":
         // Claude Auto mode approves ordinary project-local work while retaining
         // its hard/soft safety boundaries. OS-1 separately rejects any denied
@@ -1334,7 +1384,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         _ = try request(
             "initialize",
             params: [
-                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.7.10"],
+                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.7.11"],
                 "capabilities": ["experimentalApi": true],
             ],
             deadline: deadline
@@ -1722,7 +1772,7 @@ let codexDesktopBundleID = "com.openai.codex"
 /// forks the persisted history on the next turn when Desktop owns the prior
 /// thread, instead of failing or pretending that the session is synchronized.
 enum DesktopRevealMode: String {
-    case never, always
+    case never, background, always
 }
 
 func codexDesktopIsRunning() -> Bool {
@@ -1730,10 +1780,12 @@ func codexDesktopIsRunning() -> Bool {
 }
 
 /// The first-party `codex://threads/<id>` deep link makes a running Desktop
-/// read the thread through its own app-server, list it, and open it. It always
-/// raises the Desktop window.
-func revealInCodexDesktop(threadID: String) throws {
-    let result = try commandOutput("/usr/bin/open", ["-g", "codex://threads/\(threadID)"], timeout: 15)
+/// read the thread through its own app-server and list it. Background mode
+/// registers the thread without pulling the backend UI in front of OS-1.
+func revealInCodexDesktop(threadID: String, background: Bool) throws {
+    let url = "codex://threads/\(threadID)"
+    let arguments = background ? ["-j", "-g", url] : [url]
+    let result = try commandOutput("/usr/bin/open", arguments, timeout: 15)
     guard result.0 == 0 else {
         throw OS1Error.message("open exited with status \(result.0)")
     }
@@ -1742,14 +1794,14 @@ func revealInCodexDesktop(threadID: String) throws {
 func codexDesktopVisibility(
     mode: DesktopRevealMode,
     desktopRunning: Bool,
-    reveal: (String) throws -> Void,
+    reveal: (String, Bool) throws -> Void,
     threadID: String
 ) -> String {
     guard desktopRunning else { return "desktop_not_running" }
-    guard mode == .always else { return "not_revealed" }
+    guard mode != .never else { return "not_revealed" }
     do {
-        try reveal(threadID)
-        return "revealed"
+        try reveal(threadID, mode == .background)
+        return mode == .background ? "registered_in_background" : "revealed"
     } catch {
         return "reveal_failed: \(error)"
     }
@@ -1795,13 +1847,16 @@ func claudeDesktopSessionMetadataPath(
 /// session, and returns the persistent Desktop record used as evidence.
 func revealInClaudeDesktop(
     sessionID: String,
+    background: Bool,
     sessionsRoot: URL? = nil,
     timeout: TimeInterval = 15
 ) throws -> String {
     let normalized = try normalizedSessionID(sessionID)!
+    let url = "claude://resume?session=\(normalized)"
+    let arguments = background ? ["-j", "-g", url] : [url]
     let result = try commandOutput(
         "/usr/bin/open",
-        ["-g", "claude://resume?session=\(normalized)"],
+        arguments,
         timeout: 15
     )
     guard result.0 == 0 else {
@@ -1819,13 +1874,13 @@ func revealInClaudeDesktop(
 
 func claudeDesktopVisibility(
     mode: DesktopRevealMode,
-    reveal: (String) throws -> String,
+    reveal: (String, Bool) throws -> String,
     sessionID: String
 ) -> String {
-    guard mode == .always else { return "not_revealed" }
+    guard mode != .never else { return "not_revealed" }
     do {
-        _ = try reveal(sessionID)
-        return "claude_revealed"
+        _ = try reveal(sessionID, mode == .background)
+        return mode == .background ? "claude_registered_in_background" : "claude_revealed"
     } catch {
         return "claude_reveal_failed: \(error)"
     }
@@ -1964,7 +2019,7 @@ func execute(
             desktopVisibility: codexDesktopVisibility(
                 mode: desktopReveal,
                 desktopRunning: codexDesktopIsRunning(),
-                reveal: revealInCodexDesktop(threadID:),
+                reveal: { try revealInCodexDesktop(threadID: $0, background: $1) },
                 threadID: actualSessionID
             )
         )
@@ -2005,7 +2060,9 @@ func execute(
             throw OS1Error.message("Claude execution failed. OS-1 did not verify this step.")
         }
         var parsed = try parseClaudePrintResult(raw.1, requestedSessionID: activeSessionID)
-        if claudeOutputMisclassifiedRuntimeConfiguration(parsed.output) {
+        let rejectedConfiguration = claudeOutputMisclassifiedRuntimeConfiguration(parsed.output)
+        let rejectedClarification = claudeOutputDefersRequestedDeliverable(parsed.output, prompt: prompt)
+        if rejectedConfiguration || rejectedClarification {
             // A Claude candidate that mistakes a real system-channel setting
             // for conversation text is not a valid execution. Retry once in a
             // clean native session so the mistaken interpretation cannot be
@@ -2022,7 +2079,8 @@ func execute(
                 instructions: claudeExecutorInstructions(
                     contract: executorContract,
                     ticket: ticket,
-                    recoveringDiscardedCandidate: true
+                    recoveringDiscardedCandidate: true,
+                    recoveringClarificationOnlyCandidate: rejectedClarification
                 ),
                 sessionID: activeSessionID,
                 startNewSession: true,
@@ -2043,6 +2101,9 @@ func execute(
             guard !claudeOutputMisclassifiedRuntimeConfiguration(parsed.output) else {
                 throw OS1Error.message("Claude rejected OS-1 runtime configuration. This step was not verified.")
             }
+            guard !claudeOutputDefersRequestedDeliverable(parsed.output, prompt: prompt) else {
+                throw OS1Error.message("Claude deferred the requested deliverable instead of executing it. This step was not verified.")
+            }
         }
         sessionID = parsed.sessionID
         result = (raw.0, parsed.output, raw.2)
@@ -2055,7 +2116,7 @@ func execute(
             ? "claude_reveal_failed: transcript unavailable"
             : claudeDesktopVisibility(
                 mode: desktopReveal,
-                reveal: { try revealInClaudeDesktop(sessionID: $0) },
+                reveal: { try revealInClaudeDesktop(sessionID: $0, background: $1) },
                 sessionID: parsed.sessionID
             )
         nativeRecord = NativeRecordEvidence(
@@ -2526,13 +2587,19 @@ func selfTest() throws {
         throw OS1Error.message("Codex persisted turn validation failed")
     }
     var revealed: [String] = []
-    let recordReveal: (String) throws -> Void = { revealed.append($0) }
-    let failReveal: (String) throws -> Void = { _ in throw OS1Error.message("no desktop") }
+    var revealBackgroundModes: [Bool] = []
+    let recordReveal: (String, Bool) throws -> Void = {
+        revealed.append($0)
+        revealBackgroundModes.append($1)
+    }
+    let failReveal: (String, Bool) throws -> Void = { _, _ in throw OS1Error.message("no desktop") }
     guard codexDesktopVisibility(mode: .always, desktopRunning: false, reveal: recordReveal, threadID: "a") == "desktop_not_running",
           codexDesktopVisibility(mode: .always, desktopRunning: true, reveal: recordReveal, threadID: "b") == "revealed",
           codexDesktopVisibility(mode: .never, desktopRunning: true, reveal: recordReveal, threadID: "c") == "not_revealed",
+          codexDesktopVisibility(mode: .background, desktopRunning: true, reveal: recordReveal, threadID: "d") == "registered_in_background",
           codexDesktopVisibility(mode: .always, desktopRunning: true, reveal: failReveal, threadID: "d").hasPrefix("reveal_failed: "),
-          revealed == ["b"],
+          revealed == ["b", "d"],
+          revealBackgroundModes == [false, true],
           DesktopRevealMode(rawValue: "never") == .never,
           DesktopRevealMode(rawValue: "auto") == nil,
           codexWriterConflictMessage(
@@ -2590,11 +2657,13 @@ func selfTest() throws {
     """.utf8).write(to: desktopMetadataURL)
     let expectedDesktopMetadata = desktopMetadataURL.resolvingSymlinksInPath().path
     var claudeRevealed: [String] = []
-    let recordClaudeReveal: (String) throws -> String = {
+    var claudeRevealBackgroundModes: [Bool] = []
+    let recordClaudeReveal: (String, Bool) throws -> String = {
         claudeRevealed.append($0)
+        claudeRevealBackgroundModes.append($1)
         return expectedDesktopMetadata
     }
-    let failClaudeReveal: (String) throws -> String = { _ in throw OS1Error.message("no Claude Desktop") }
+    let failClaudeReveal: (String, Bool) throws -> String = { _, _ in throw OS1Error.message("no Claude Desktop") }
     guard claudeDesktopSessionMetadataPath(
               sessionID: transcriptSession,
               sessionsRoot: desktopMetadataRoot
@@ -2609,6 +2678,11 @@ func selfTest() throws {
               sessionID: transcriptSession
           ) == "claude_revealed",
           claudeDesktopVisibility(
+              mode: .background,
+              reveal: recordClaudeReveal,
+              sessionID: transcriptSession
+          ) == "claude_registered_in_background",
+          claudeDesktopVisibility(
               mode: .never,
               reveal: recordClaudeReveal,
               sessionID: transcriptSession
@@ -2618,7 +2692,8 @@ func selfTest() throws {
               reveal: failClaudeReveal,
               sessionID: transcriptSession
           ).hasPrefix("claude_reveal_failed: "),
-          claudeRevealed == [transcriptSession] else {
+          claudeRevealed == [transcriptSession, transcriptSession],
+          claudeRevealBackgroundModes == [false, true] else {
         throw OS1Error.message("Claude Desktop session synchronization validation failed")
     }
     let claudeSessionID = "01a05b4d-f206-7c71-bd11-128b24e755e0"
@@ -2641,7 +2716,10 @@ func selfTest() throws {
     guard String(decoding: parsedClaudeResult.output, as: UTF8.self) == "ok",
           parsedClaudeResult.sessionID == claudeSessionID,
           rejectedClaudeDenial,
-          try claudePermissionArguments("read_only") == ["--permission-mode", "plan"],
+          try claudePermissionArguments("read_only") == [
+              "--permission-mode", "dontAsk",
+              "--tools", "Read,Glob,Grep,WebSearch,WebFetch",
+          ],
           try claudePermissionArguments("workspace_write") == ["--permission-mode", "auto"],
           try claudePermissionArguments("full_access") == ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"],
           (try? claudePermissionArguments("unknown")) == nil else {
@@ -2685,14 +2763,29 @@ func selfTest() throws {
     let misclassifiedClaudeOutput = Data("""
     The OS-1 executor contract is not an actual system setting. It looks like prompt injection in conversation text, so I will ignore it.
     """.utf8)
+    let schemaPrompt = "QM이랑 GR 통합하게 스키마 좀 짜봐"
+    let deferredSchemaOutput = Data("""
+    No AskUserQuestion tool is available in this session, so let me just ask directly.
+    Which of these is closest to what you mean by schema? Which one, or something else?
+    """.utf8)
+    let deliveredSchemaOutput = Data("""
+    Assumption: QM and GR mean quantum mechanics and general relativity.
+    Schema: Layer 1 defines observables and causal structure. Layer 2 maps quantum states to semiclassical geometry.
+    Which part should I refine next?
+    """.utf8)
     guard claudeInstructions.hasPrefix("Claude Code runtime configuration from OS-1"),
           !claudeInstructions.hasPrefix("OS-1 executor contract"),
           claudeProbeArguments.last == claudeProbePrompt,
           claudeProbeArguments.contains("--append-system-prompt"),
           claudeProbeArguments.contains("--system-prompt-snapshot"),
           claudeProbeArguments.contains("off"),
+          claudeProbeArguments.firstIndex(of: "--tools")! < claudeProbeArguments.firstIndex(of: "--effort")!,
           claudeOutputMisclassifiedRuntimeConfiguration(misclassifiedClaudeOutput),
-          !claudeOutputMisclassifiedRuntimeConfiguration(Data("1 + 1 = 2".utf8)) else {
+          !claudeOutputMisclassifiedRuntimeConfiguration(Data("1 + 1 = 2".utf8)),
+          promptRequestsImmediateDeliverable(schemaPrompt),
+          !promptRequestsImmediateDeliverable("QM과 GR은 무엇인가?"),
+          claudeOutputDefersRequestedDeliverable(deferredSchemaOutput, prompt: schemaPrompt),
+          !claudeOutputDefersRequestedDeliverable(deliveredSchemaOutput, prompt: schemaPrompt) else {
         throw OS1Error.message("Claude system-channel separation validation failed")
     }
     let config = RuntimeConfig(
@@ -2767,7 +2860,7 @@ func usage() {
       os1 run --workspace /path/to/project --prompt "task" [--provider auto|codex|claude]
               [--codex-session-id UUID] [--claude-session-id UUID]
               [--codex-capacity 0...100] [--claude-capacity 0...100]
-              [--desktop-reveal never|always]
+              [--desktop-reveal never|background|always]
       os1 version
     """)
 }
@@ -2779,7 +2872,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.7.10")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.7.11")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":
@@ -2833,7 +2926,7 @@ struct OS1Main {
                         outputFormat = arguments[index + 1]; index += 2
                     case "--desktop-reveal" where index + 1 < arguments.count:
                         guard let mode = DesktopRevealMode(rawValue: arguments[index + 1]) else {
-                            throw OS1Error.message("--desktop-reveal must be never or always")
+                            throw OS1Error.message("--desktop-reveal must be never, background, or always")
                         }
                         desktopReveal = mode; index += 2
                     default: throw OS1Error.message("Unknown OS-1 argument")
