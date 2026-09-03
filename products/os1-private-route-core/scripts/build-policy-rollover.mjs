@@ -2,23 +2,45 @@
 
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 function fail(message) {
   throw new Error(message);
 }
 
-const [sourcePath, configPath, outputPath, policyVersion, ...previousSpecs] = process.argv.slice(2);
-if (!sourcePath || !configPath || !outputPath || !policyVersion) {
-  fail("usage: build-policy-rollover.mjs SOURCE CONFIG OUTPUT POLICY_VERSION [VERSION:SHA256 ...]");
+const [configPath, outputPath, policyVersion, ...previousSpecs] = process.argv.slice(2);
+if (!configPath || !outputPath || !policyVersion) {
+  fail("usage: build-policy-rollover.mjs CONFIG OUTPUT POLICY_VERSION [VERSION:SHA256 ...]");
 }
 
-const source = JSON.parse(await readFile(sourcePath, "utf8"));
 const config = JSON.parse(await readFile(configPath, "utf8"));
-if (source?.schema !== 1 || !source.executor_contract || !source.routing || !source.revas) {
-  fail("source policy must be a schema-1 policy bundle");
-}
-if (!config?.executor_contract || !config.model_profiles || !config.effort_profiles) {
+if (!config?.executor_contract || !config.execution_profiles ||
+  !Number.isSafeInteger(config.maximum_steps) || config.maximum_steps < 1 || config.maximum_steps > 4) {
   fail("runtime config is missing execution profiles or executor contract");
+}
+const privateCore = process.env.OS1_PRIVATE_CORE_DIR;
+if (!privateCore) fail("OS1_PRIVATE_CORE_DIR must point to the source-locked private core");
+const adapterPath = join(privateCore, "os1_local_core.py");
+const adapterSource = await readFile(adapterPath, "utf8");
+const adapterVersion = adapterSource.match(/^ADAPTER_VERSION\s*=\s*"([A-Za-z0-9._-]{8,96})"/m)?.[1];
+if (!adapterVersion) fail("private RCC adapter version is unavailable");
+const python = process.env.PYTHON || "/usr/bin/python3";
+const selfTest = spawnSync(python, [adapterPath, "self-test"], { encoding: "utf8", maxBuffer: 1_048_576 });
+if (selfTest.status !== 0 || JSON.parse(selfTest.stdout || "null")?.status !== "ok") {
+  fail("private RCC self-test failed");
+}
+const probe = spawnSync(python, [adapterPath, "route", "-"], {
+  encoding: "utf8",
+  input: JSON.stringify({ prompt: "1 plus 1", provider_preference: "auto", codex_capacity: 30,
+    claude_capacity: 100, attempt: 1, state_dir: join(tmpdir(), "os1-policy-rollover-probe") }),
+  maxBuffer: 1_048_576,
+});
+const identity = probe.status === 0 ? JSON.parse(probe.stdout || "null") : null;
+if (!identity || ![identity.policy_sha256, identity.engine_sha256, identity.authority_sha256]
+  .every((value) => typeof value === "string" && /^[0-9a-f]{64}$/.test(value))) {
+  fail("private RCC identity probe failed");
 }
 
 const parsePrevious = (spec) => {
@@ -46,24 +68,20 @@ if (executorContracts.length > 4 ||
   fail("executor contract rollover must contain 1-4 unique contracts");
 }
 
-const executionProfiles = Object.fromEntries(["codex", "claude"].map((provider) => [
-  provider,
-  Object.fromEntries(["standard", "efficient", "deep"].map((tier) => [
-    tier,
-    {
-      model: config.model_profiles[provider]?.[tier],
-      effort: config.effort_profiles[provider]?.[tier],
-    },
-  ])),
-]));
+const executionProfiles = config.execution_profiles;
 
 const output = {
-  schema: 2,
+  schema: 4,
   policy_version: policyVersion,
   executor_contracts: executorContracts,
   execution_profiles: executionProfiles,
-  routing: source.routing,
-  revas: source.revas,
+  maximum_steps: config.maximum_steps,
+  rcc: {
+    adapter_version: adapterVersion,
+    policy_sha256: identity.policy_sha256,
+    engine_sha256: identity.engine_sha256,
+    authority_sha256: identity.authority_sha256,
+  },
 };
 const serialized = `${JSON.stringify(output)}\n`;
 await writeFile(outputPath, serialized, { mode: 0o600 });

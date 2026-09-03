@@ -34,6 +34,12 @@ struct EffortProfiles: Codable {
     let claude: ProviderEffortProfile
 }
 
+struct RoutedExecutionProfile: Codable {
+    let provider: String
+    let model: String
+    let effort: String
+}
+
 struct ExecutorContract: Codable {
     let version: String
     let sha256: String
@@ -52,6 +58,20 @@ func isSafeModelIdentifier(_ value: String) -> Bool {
 
 func isSupportedEffort(_ value: String) -> Bool {
     ["low", "medium", "high", "xhigh", "max", "ultra"].contains(value)
+}
+
+func isSupportedProfileEffort(_ value: String) -> Bool {
+    value == "none" || isSupportedEffort(value)
+}
+
+func isSafeActionIdentifier(_ value: String) -> Bool {
+    guard !value.isEmpty, value.count <= 64 else { return false }
+    return value.unicodeScalars.allSatisfy { scalar in
+        switch scalar.value {
+        case 48...57, 65...90, 97...122, 45, 95: return true
+        default: return false
+        }
+    }
 }
 
 struct CodexModelCapability: Codable, Equatable {
@@ -110,6 +130,7 @@ struct RuntimeConfig: Codable {
     let executionTimeoutSeconds: Int
     let modelProfiles: ModelProfiles?
     let effortProfiles: EffortProfiles?
+    let executionProfiles: [String: RoutedExecutionProfile]?
     let executorContract: ExecutorContract
 
     enum CodingKeys: String, CodingKey {
@@ -119,6 +140,7 @@ struct RuntimeConfig: Codable {
         case executionTimeoutSeconds = "execution_timeout_seconds"
         case modelProfiles = "model_profiles"
         case effortProfiles = "effort_profiles"
+        case executionProfiles = "execution_profiles"
         case executorContract = "executor_contract"
     }
 
@@ -144,11 +166,20 @@ struct RuntimeConfig: Codable {
         let paths = [
             environment["OS1_CONFIG"],
             bundledConfig,
-            userConfig,
             "/Library/Application Support/OS-1/config.json",
+            userConfig,
         ].compactMap { $0 }
         for path in paths where FileManager.default.fileExists(atPath: path) {
-            let value = try JSONDecoder().decode(RuntimeConfig.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            let value: RuntimeConfig
+            do {
+                value = try JSONDecoder().decode(
+                    RuntimeConfig.self,
+                    from: Data(contentsOf: URL(fileURLWithPath: path))
+                )
+            } catch {
+                if path == environment["OS1_CONFIG"] { throw error }
+                continue
+            }
             guard URL(string: value.apiURL)?.scheme == "https",
                   value.maximumSteps >= 1, value.maximumSteps <= 4,
                   value.executionTimeoutSeconds >= 60,
@@ -172,8 +203,22 @@ struct RuntimeConfig: Codable {
                           profiles.claude.deep,
                       ].allSatisfy(isSupportedEffort)
                   }) ?? true,
+                  value.executionProfiles != nil,
+                  value.executionProfiles.map({ profiles in
+                      !profiles.isEmpty && profiles.count <= 64 && profiles.allSatisfy { action, profile in
+                          isSafeActionIdentifier(action) &&
+                          ["local", "codex", "claude"].contains(profile.provider) &&
+                          isSafeModelIdentifier(profile.model) &&
+                          isSupportedProfileEffort(profile.effort) &&
+                          (profile.provider != "local" || (profile.model == "local-deterministic" && profile.effort == "none")) &&
+                          (profile.provider == "local" || profile.effort != "none")
+                      }
+                  }) ?? true,
                   try validateExecutorContract(value.executorContract) else {
-                throw OS1Error.message("OS-1 configuration is invalid")
+                if path == environment["OS1_CONFIG"] {
+                    throw OS1Error.message("OS-1 configuration is invalid")
+                }
+                continue
             }
             return value
         }
@@ -269,7 +314,7 @@ struct ResultSubmission: Codable {
 }
 
 struct Artifact: Codable {
-    let schema = 3
+    let schema = 4
     let provider: String
     let action: String
     let permissionProfile: String
@@ -281,7 +326,9 @@ struct Artifact: Codable {
     let output: String
     let stderr: String
     let durationMS: Int64
-    let workspaceDiffHash: String
+    let workspaceBeforeHash: String
+    let workspaceAfterHash: String
+    let nativeRecord: NativeRecordEvidence
 
     enum CodingKeys: String, CodingKey {
         case schema, provider, action, model, effort, output, stderr
@@ -290,7 +337,9 @@ struct Artifact: Codable {
         case executorContractSHA256 = "executor_contract_sha256"
         case exitCode = "exit_code"
         case durationMS = "duration_ms"
-        case workspaceDiffHash = "workspace_diff_hash"
+        case workspaceBeforeHash = "workspace_before_hash"
+        case workspaceAfterHash = "workspace_after_hash"
+        case nativeRecord = "native_record"
     }
 }
 
@@ -300,6 +349,7 @@ struct StartExecutionRequest: Codable {
     let capacityPlan: CapacityPlan
     let executorContractVersion: String
     let executorContractSHA256: String
+    let availableCodexModels: [CodexModelCapability]
 
     enum CodingKeys: String, CodingKey {
         case task
@@ -307,6 +357,7 @@ struct StartExecutionRequest: Codable {
         case capacityPlan = "capacity_plan"
         case executorContractVersion = "executor_contract_version"
         case executorContractSHA256 = "executor_contract_sha256"
+        case availableCodexModels = "available_codex_models"
     }
 }
 
@@ -330,6 +381,22 @@ struct NativeRecordEvidence: Codable {
         case recordPath = "record_path"
         case persistence
         case desktopVisibility = "desktop_visibility"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let turnID {
+            try container.encode(turnID, forKey: .turnID)
+        } else {
+            try container.encodeNil(forKey: .turnID)
+        }
+        if let recordPath {
+            try container.encode(recordPath, forKey: .recordPath)
+        } else {
+            try container.encodeNil(forKey: .recordPath)
+        }
+        try container.encode(persistence, forKey: .persistence)
+        try container.encode(desktopVisibility, forKey: .desktopVisibility)
     }
 
     var isVerified: Bool { persistence == "verified" }
@@ -446,7 +513,7 @@ func claudeExecutorInstructions(
         ? "\nA prior candidate was discarded by OS-1. Process the current user task again from scratch under this configuration."
         : ""
     if recoveringClarificationOnlyCandidate {
-        recovery += "\nThe discarded candidate asked for clarification instead of producing the requested deliverable. Produce the complete best-effort draft now, state reasonable assumptions, and do not ask a question before the draft. Never mention AskUserQuestion or tool availability."
+        recovery += "\nThe discarded candidate refused or asked for clarification instead of producing the requested deliverable. Produce the complete best-effort draft now, state reasonable assumptions, and do not ask a question before the draft. If the user's terms have a standard meaning, use that meaning. An open or unsettled problem is not a reason to refuse a requested conceptual schema; label speculative elements accurately. Never mention AskUserQuestion or tool availability."
     }
     return """
     Claude Code runtime configuration from OS-1 (\(contract.version)).
@@ -507,6 +574,10 @@ func claudeOutputDefersRequestedDeliverable(_ data: Data, prompt: String) -> Boo
         "도구가 비활성화",
         "which of these is closest to what you mean",
         "which one, or something else",
+        "which of these is it",
+        "i'm not going to",
+        "i am not going to",
+        "tell me what you mean concretely",
         "i need clarification before",
         "i need to ask directly before",
         "could you clarify before",
@@ -772,8 +843,13 @@ func resultBytes(_ result: ResultSubmission) -> Data {
 }
 
 func verifyTicket(_ ticket: Ticket, config: RuntimeConfig) throws {
-    guard ["agent_run", "agent_run_efficient", "agent_run_deep"].contains(ticket.action),
-          ["codex", "claude"].contains(ticket.provider),
+    let routedProfile = config.executionProfiles?[ticket.action]
+    let validRoutedProfile = routedProfile.map { $0.provider == ticket.provider } ?? false
+    let validLegacyProfile = config.executionProfiles == nil &&
+        ["agent_run", "agent_run_efficient", "agent_run_deep"].contains(ticket.action) &&
+        ["codex", "claude"].contains(ticket.provider)
+    guard (validRoutedProfile || validLegacyProfile),
+          ["local", "codex", "claude"].contains(ticket.provider),
           ["read_only", "workspace_write"].contains(ticket.permissionProfile) else {
         throw OS1Error.message("Server ticket contract rejected")
     }
@@ -789,6 +865,12 @@ func verifyTicket(_ ticket: Ticket, config: RuntimeConfig) throws {
 }
 
 func configuredModel(provider: String, action: String, config: RuntimeConfig) throws -> String {
+    if let profile = config.executionProfiles?[action] {
+        guard profile.provider == provider, isSafeModelIdentifier(profile.model) else {
+            throw OS1Error.message("Server ticket contract rejected")
+        }
+        return profile.model
+    }
     guard let profiles = config.modelProfiles else {
         throw OS1Error.message("OS-1 model profiles are missing; reinstall OS-1")
     }
@@ -807,6 +889,13 @@ func configuredModel(provider: String, action: String, config: RuntimeConfig) th
 }
 
 func configuredEffort(provider: String, action: String, config: RuntimeConfig) throws -> String {
+    if let profile = config.executionProfiles?[action] {
+        guard profile.provider == provider, isSupportedProfileEffort(profile.effort),
+              (provider == "local") == (profile.effort == "none") else {
+            throw OS1Error.message("Server ticket contract rejected")
+        }
+        return profile.effort
+    }
     guard let profiles = config.effortProfiles else {
         throw OS1Error.message("OS-1 effort profiles are missing; reinstall OS-1")
     }
@@ -1149,7 +1238,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         _ = try request(
             "initialize",
             params: [
-                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.7.15"],
+                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.9.0"],
                 "capabilities": ["experimentalApi": true],
             ],
             deadline: deadline
@@ -1729,7 +1818,8 @@ func execute(
     model: String?,
     effort: String,
     executorContract: ExecutorContract,
-    desktopReveal: DesktopRevealMode
+    desktopReveal: DesktopRevealMode,
+    workspaceBeforeHash: String
 ) throws -> ProviderExecution {
     let started = Date()
     let result: (Int32, Data, Data)
@@ -1903,9 +1993,156 @@ func execute(
             output: boundedString(result.1, maximum: 800_000),
             stderr: boundedString(result.2, maximum: 180_000),
             durationMS: Int64(Date().timeIntervalSince(started) * 1_000),
-            workspaceDiffHash: workspaceHash(workspace)
+            workspaceBeforeHash: workspaceBeforeHash,
+            workspaceAfterHash: workspaceHash(workspace),
+            nativeRecord: nativeRecord
         ),
         sessionID: sessionID,
+        nativeRecord: nativeRecord
+    )
+}
+
+private let publicArithmeticWords: [String: String] = [
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+    "영": "0", "공": "0", "원": "1", "일": "1", "하나": "1", "이": "2", "둘": "2",
+    "삼": "3", "셋": "3", "사": "4", "넷": "4", "오": "5", "육": "6", "칠": "7",
+    "팔": "8", "구": "9", "십": "10",
+]
+
+private func regexReplacing(_ pattern: String, in input: String, with replacement: String) -> String {
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return input }
+    return regex.stringByReplacingMatches(
+        in: input,
+        range: NSRange(input.startIndex..<input.endIndex, in: input),
+        withTemplate: replacement
+    )
+}
+
+/// Executes only an arithmetic expression already authorized by the remote
+/// RCC ticket. This parser is intentionally public and policy-free: it cannot
+/// decide which requests use the exact lane.
+func publicDeterministicExpression(_ prompt: String) -> String? {
+    var normalized = prompt.precomposedStringWithCanonicalMapping.lowercased()
+    let operators: [(String, String)] = [
+        (#"\bdivided\s+by\b"#, "/"), (#"\bmultiplied\s+by\b"#, "*"),
+        (#"\bplus\b"#, "+"), (#"\bminus\b"#, "-"), (#"\btimes\b"#, "*"),
+        (#"플\s*러\s*스|플\s*래\s*스|플\s*레\s*스|플\s*렉\s*스|(?:더|도|덧)\s*하\s*기|덕\s*이|더\s*기"#, "+"),
+        (#"마\s*이\s*너\s*스|빼\s*기"#, "-"), (#"곱\s*하\s*기|곱\s*해"#, "*"),
+        (#"나\s*누\s*기|나\s*눠"#, "/"), (#"×"#, "*"), (#"÷"#, "/"),
+    ]
+    for (pattern, replacement) in operators {
+        normalized = regexReplacing(pattern, in: normalized, with: replacement)
+    }
+    normalized = regexReplacing(#"\+{2,}"#, in: normalized, with: "+")
+    normalized = regexReplacing(#"\+\s*([*/])"#, in: normalized, with: "$1")
+
+    let words = publicArithmeticWords.keys.sorted { $0.count > $1.count }
+        .map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|")
+    let operand = "(?:-?[0-9]+(?:\\.[0-9]+)?|\(words))"
+    let pattern = "(?<![0-9A-Za-z가-힣.])\(operand)(?:\\s*[+\\-*/]\\s*\(operand))+(?![0-9A-Za-z])"
+    guard let expressionRegex = try? NSRegularExpression(pattern: pattern),
+          !normalized.isEmpty else { return nil }
+    let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+    let matches = expressionRegex.matches(in: normalized, range: range)
+    guard let selected = matches.max(by: { lhs, rhs in
+        let left = (normalized as NSString).substring(with: lhs.range)
+        let right = (normalized as NSString).substring(with: rhs.range)
+        let leftCount = left.filter { "+-*/".contains($0) }.count
+        let rightCount = right.filter { "+-*/".contains($0) }.count
+        return leftCount == rightCount ? lhs.range.location < rhs.range.location : leftCount < rightCount
+    }) else { return nil }
+    var expression = (normalized as NSString).substring(with: selected.range)
+    for word in publicArithmeticWords.keys.sorted(by: { $0.count > $1.count }) {
+        let escaped = NSRegularExpression.escapedPattern(for: word)
+        expression = regexReplacing(
+            "(?<![0-9A-Za-z가-힣])\(escaped)(?![0-9A-Za-z가-힣])",
+            in: expression,
+            with: publicArithmeticWords[word]!
+        )
+    }
+    let compact = expression.replacingOccurrences(of: " ", with: "")
+    guard !compact.isEmpty,
+          compact.unicodeScalars.allSatisfy({ "0123456789.+-*/".unicodeScalars.contains($0) }) else { return nil }
+    return compact
+}
+
+func publicDeterministicResult(_ prompt: String) throws -> String {
+    guard let expression = publicDeterministicExpression(prompt) else {
+        throw OS1Error.message("OS-1 exact executor rejected a non-arithmetic request")
+    }
+    let bc = try findExecutable("bc")
+    let result = try commandOutput(bc, ["-l"], input: Data("scale=28\n\(expression)\n".utf8), timeout: 10)
+    guard result.0 == 0,
+          var output = String(data: result.1, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !output.isEmpty else {
+        throw OS1Error.message("OS-1 exact executor could not compute the expression")
+    }
+    if output.hasPrefix("-.") { output.insert("0", at: output.index(after: output.startIndex)) }
+    if output.hasPrefix(".") { output.insert("0", at: output.startIndex) }
+    if output.contains(".") {
+        while output.last == "0" { output.removeLast() }
+        if output.last == "." { output.removeLast() }
+    }
+    return output == "-0" ? "0" : output
+}
+
+func executePublicDeterministic(
+    ticket: Ticket,
+    prompt: String,
+    workspace: String,
+    model: String,
+    effort: String,
+    executorContract: ExecutorContract,
+    workspaceBeforeHash: String
+) throws -> ProviderExecution {
+    guard ticket.provider == "local", ticket.action == "os1_exact",
+          model == "local-deterministic", effort == "none" else {
+        throw OS1Error.message("OS-1 exact executor contract rejected")
+    }
+    let started = Date()
+    let output = try publicDeterministicResult(prompt)
+    let receiptRoot = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/OS-1/deterministic-receipts", isDirectory: true)
+    try FileManager.default.createDirectory(at: receiptRoot, withIntermediateDirectories: true)
+    let receiptURL = receiptRoot.appendingPathComponent("\(ticket.executionID)-\(ticket.sequence).json")
+    let receipt: [String: Any] = [
+        "schema": 1,
+        "execution_id": ticket.executionID,
+        "sequence": ticket.sequence,
+        "result_sha256": sha256Hex(Data(output.utf8)),
+    ]
+    let receiptData = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
+    try receiptData.write(to: receiptURL, options: [.atomic])
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receiptURL.path)
+    let persisted = try Data(contentsOf: receiptURL)
+    guard sha256Hex(persisted) == sha256Hex(receiptData) else {
+        throw OS1Error.message("OS-1 exact execution receipt read-back failed")
+    }
+    let nativeRecord = NativeRecordEvidence(
+        turnID: "\(ticket.executionID):\(ticket.sequence)",
+        recordPath: receiptURL.path,
+        persistence: "verified",
+        desktopVisibility: "local_only"
+    )
+    return ProviderExecution(
+        artifact: Artifact(
+            provider: ticket.provider,
+            action: ticket.action,
+            permissionProfile: ticket.permissionProfile,
+            model: model,
+            effort: effort,
+            executorContractVersion: executorContract.version,
+            executorContractSHA256: executorContract.sha256,
+            exitCode: 0,
+            output: output,
+            stderr: "",
+            durationMS: Int64(Date().timeIntervalSince(started) * 1_000),
+            workspaceBeforeHash: workspaceBeforeHash,
+            workspaceAfterHash: workspaceHash(workspace),
+            nativeRecord: nativeRecord
+        ),
+        sessionID: ticket.executionID,
         nativeRecord: nativeRecord
     )
 }
@@ -1915,7 +2152,8 @@ func executeLocalDeterministic(
     decision: LocalRouteDecision,
     prompt: String,
     workspace: String,
-    config: RuntimeConfig
+    config: RuntimeConfig,
+    workspaceBeforeHash: String
 ) throws -> ProviderExecution {
     let started = Date()
     let response: LocalExecuteResponse = try privateCoreCall(
@@ -1976,7 +2214,14 @@ func executeLocalDeterministic(
             output: response.output,
             stderr: "",
             durationMS: Int64(Date().timeIntervalSince(started) * 1_000),
-            workspaceDiffHash: workspaceHash(workspace)
+            workspaceBeforeHash: workspaceBeforeHash,
+            workspaceAfterHash: workspaceHash(workspace),
+            nativeRecord: NativeRecordEvidence(
+                turnID: decision.routeID,
+                recordPath: receiptURL.path,
+                persistence: "verified",
+                desktopVisibility: "local_only"
+            )
         ),
         sessionID: sessionID,
         nativeRecord: NativeRecordEvidence(
@@ -2046,7 +2291,8 @@ func runLocalTask(
                     decision: decision,
                     prompt: prompt,
                     workspace: workspace,
-                    config: config
+                    config: config,
+                    workspaceBeforeHash: beforeHash
                 )
             } else {
                 execution = try execute(
@@ -2058,7 +2304,8 @@ func runLocalTask(
                     model: decision.model,
                     effort: decision.effort,
                     executorContract: config.executorContract,
-                    desktopReveal: desktopReveal
+                    desktopReveal: desktopReveal,
+                    workspaceBeforeHash: beforeHash
                 )
             }
         } catch {
@@ -2153,12 +2400,14 @@ func runTask(
     let id = try deviceID()
     let client = APIClient(config: config, token: try githubToken(), deviceID: id)
     try await register(client: client, key: key)
+    let codexCatalog = try activeCodexCatalog(config: config)
     let request = StartExecutionRequest(
         task: prompt,
         providerPreference: providerPreference,
         capacityPlan: CapacityPlan(codex: codexCapacity, claude: claudeCapacity),
         executorContractVersion: config.executorContract.version,
-        executorContractSHA256: config.executorContract.sha256
+        executorContractSHA256: config.executorContract.sha256,
+        availableCodexModels: codexCatalog.models
     )
     var route: RouteResponse = try await client.post(
         "/v1/executions",
@@ -2186,18 +2435,33 @@ func runTask(
         if progress {
             print("OS-1 step \(step): \(ticket.provider) / \(ticket.action) / \(effort) / \(ticket.permissionProfile)")
         }
-        let execution = try execute(
-            ticket: ticket,
-            prompt: localPrompt,
-            workspace: canonicalWorkspace,
-            timeout: config.executionTimeoutSeconds,
-            providerSessionID: nativeSessions[ticket.provider] ?? nil,
-            model: model,
-            effort: effort,
-            executorContract: config.executorContract,
-            desktopReveal: desktopReveal
-        )
-        nativeSessions[ticket.provider] = execution.sessionID
+        let beforeHash = workspaceHash(canonicalWorkspace)
+        let execution: ProviderExecution
+        if ticket.provider == "local" {
+            execution = try executePublicDeterministic(
+                ticket: ticket,
+                prompt: prompt,
+                workspace: canonicalWorkspace,
+                model: model,
+                effort: effort,
+                executorContract: config.executorContract,
+                workspaceBeforeHash: beforeHash
+            )
+        } else {
+            execution = try execute(
+                ticket: ticket,
+                prompt: localPrompt,
+                workspace: canonicalWorkspace,
+                timeout: config.executionTimeoutSeconds,
+                providerSessionID: nativeSessions[ticket.provider] ?? nil,
+                model: model,
+                effort: effort,
+                executorContract: config.executorContract,
+                desktopReveal: desktopReveal,
+                workspaceBeforeHash: beforeHash
+            )
+            nativeSessions[ticket.provider] = execution.sessionID
+        }
         let artifact = execution.artifact
         let artifactData = try JSONEncoder().encode(artifact)
         let resultHash = sha256Hex(artifactData)
@@ -2261,6 +2525,7 @@ func printRunSummary(_ summary: RunSummary) {
 func doctor() throws {
     let config = try RuntimeConfig.load()
     guard config.modelProfiles != nil, config.effortProfiles != nil,
+          config.executionProfiles?.isEmpty == false,
           try validateExecutorContract(config.executorContract) else {
         throw OS1Error.message("OS-1 model or effort profiles are missing; reinstall OS-1")
     }
@@ -2438,9 +2703,19 @@ func selfTest() throws {
     } catch {
         rejectedClaudeDenial = true
     }
+    let nilNativeRecordData = try JSONEncoder().encode(NativeRecordEvidence(
+        turnID: nil,
+        recordPath: nil,
+        persistence: "unverified: self-test",
+        desktopVisibility: "not_revealed"
+    ))
+    let nilNativeRecord = try JSONSerialization.jsonObject(with: nilNativeRecordData) as? [String: Any]
     guard String(decoding: parsedClaudeResult.output, as: UTF8.self) == "ok",
           parsedClaudeResult.sessionID == claudeSessionID,
           rejectedClaudeDenial,
+          Set(nilNativeRecord?.keys.map { $0 } ?? []) == Set(["turn_id", "record_path", "persistence", "desktop_visibility"]),
+          nilNativeRecord?["turn_id"] is NSNull,
+          nilNativeRecord?["record_path"] is NSNull,
           try claudePermissionArguments("read_only") == [
               "--permission-mode", "dontAsk",
               "--tools", "Read,Glob,Grep,WebSearch,WebFetch",
@@ -2498,6 +2773,9 @@ func selfTest() throws {
     Schema: Layer 1 defines observables and causal structure. Layer 2 maps quantum states to semiclassical geometry.
     Which part should I refine next?
     """.utf8)
+    let refusedSchemaOutput = Data("""
+    I'm not going to build this out. Tell me what you mean concretely. Which of these is it?
+    """.utf8)
     guard claudeInstructions.hasPrefix("Claude Code runtime configuration from OS-1"),
           !claudeInstructions.hasPrefix("OS-1 executor contract"),
           claudeProbeArguments.last == claudeProbePrompt,
@@ -2510,6 +2788,7 @@ func selfTest() throws {
           promptRequestsImmediateDeliverable(schemaPrompt),
           !promptRequestsImmediateDeliverable("QM과 GR은 무엇인가?"),
           claudeOutputDefersRequestedDeliverable(deferredSchemaOutput, prompt: schemaPrompt),
+          claudeOutputDefersRequestedDeliverable(refusedSchemaOutput, prompt: schemaPrompt),
           !claudeOutputDefersRequestedDeliverable(deliveredSchemaOutput, prompt: schemaPrompt) else {
         throw OS1Error.message("Claude system-channel separation validation failed")
     }
@@ -2526,6 +2805,7 @@ func selfTest() throws {
             codex: ProviderEffortProfile(standard: "medium", efficient: "low", deep: "xhigh"),
             claude: ProviderEffortProfile(standard: "medium", efficient: "low", deep: "xhigh")
         ),
+        executionProfiles: nil,
         executorContract: ExecutorContract(
             version: "os1-executor-2026-09-01-v1",
             sha256: "000462e252e961a4920ad75e6651dfb4b1263d09c647813240b59cf28c4837e5",
@@ -2549,6 +2829,28 @@ func selfTest() throws {
           try validateExecutorContract(config.executorContract),
           try tomlStringLiteral("line one\n\"line two\"").hasPrefix("\"") else {
         throw OS1Error.message("Model or effort profile resolution failed")
+    }
+    let routedConfig = RuntimeConfig(
+        apiURL: config.apiURL,
+        ticketVerifyingKeyRaw: config.ticketVerifyingKeyRaw,
+        maximumSteps: config.maximumSteps,
+        executionTimeoutSeconds: config.executionTimeoutSeconds,
+        modelProfiles: config.modelProfiles,
+        effortProfiles: config.effortProfiles,
+        executionProfiles: [
+            "os1_exact": RoutedExecutionProfile(provider: "local", model: "local-deterministic", effort: "none"),
+            "cx_test": RoutedExecutionProfile(provider: "codex", model: "gpt-current", effort: "high"),
+        ],
+        executorContract: config.executorContract
+    )
+    guard try configuredModel(provider: "local", action: "os1_exact", config: routedConfig) == "local-deterministic",
+          try configuredEffort(provider: "local", action: "os1_exact", config: routedConfig) == "none",
+          try configuredModel(provider: "codex", action: "cx_test", config: routedConfig) == "gpt-current",
+          try configuredEffort(provider: "codex", action: "cx_test", config: routedConfig) == "high",
+          try publicDeterministicResult("1 플러스 1이 뭐야") == "2",
+          try publicDeterministicResult("1 플러스 6 나누기 3이 뭐야") == "3",
+          try publicDeterministicResult("1도 하기 1도 하기 2도 하기 1도 하기 나누기 3이 뭔데?") == "4.3333333333333333333333333333" else {
+        throw OS1Error.message("Routed execution profile or public exact executor validation failed")
     }
     let modelCacheURL = transcriptRoot.appendingPathComponent("models-cache.json")
     try Data("""
@@ -2594,7 +2896,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.8.0")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.9.0")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":

@@ -158,7 +158,7 @@ private func providerIntentSelfTest() throws {
             desktopVisibility: "local_only"
         )
     )
-    guard backendTierLabel(action: localStep.action, provider: localStep.provider) == "Exact local RCC executor",
+    guard backendTierLabel(action: localStep.action, provider: localStep.provider) == "OS-1",
           nativeRecordReceipt(localStep).contains("local exact receipt persisted") else {
         throw RunnerError.message("OS-1 local exact execution UI self-test failed.")
     }
@@ -1299,8 +1299,8 @@ private enum RunnerError: LocalizedError {
 }
 
 private func backendTierLabel(action: String, provider: String) -> String {
-    if provider == "local" || action == "deterministic_compute" {
-        return "Exact local RCC executor"
+    if provider == "local" || action == "deterministic_compute" || action == "os1_exact" {
+        return "OS-1"
     }
     let engine = provider == "codex" ? "Codex" : "Claude"
     switch action {

@@ -24,7 +24,7 @@ OS1_RELEASE_MODE=development products/os1-mac-runtime/scripts/build-release.sh
 products/os1-mac-runtime/scripts/make-beta-bundle.sh
 ```
 
-Send the resulting `OS-1-0.8.0-macOS-beta.zip` to the other Mac. After
+Send the resulting `OS-1-0.9.0-macOS-beta.zip` to the other Mac. After
 unzipping it, open Terminal, type `bash `, drag **Install OS-1 Beta.command**
 into Terminal, and press Return. The command verifies the manifest SHA-256,
 package identifier and version, exact file/directory allowlist, app and CLI
@@ -69,11 +69,11 @@ The equivalent CLI choices are `--provider auto`, `--provider codex`, and
 `--provider claude`. Machine-readable desktop integration uses
 `--output-format json`. Native sessions are resumed with
 `--codex-session-id UUID` and `--claude-session-id UUID`; each JSON step returns
-the actual provider `session_id` plus an abstract standard, efficient, or deep
-execution action. In Auto, RCC chooses the backend, model tier, and reasoning
-effort; manual provider selection preserves the provider account's default
-model while still selecting medium reasoning. Efficient routes use low effort,
-standard routes use medium, and deep routes use xhigh. A bounded completed-turn handoff can be
+the actual provider `session_id` plus the allowlisted model/effort execution
+action selected by the server. In Auto, the source-locked RCC v26 service
+chooses the backend, an available Codex or Claude model, and its reasoning
+effort. A manual provider choice pins only the backend; RCC still selects that
+backend's model and effort. A bounded completed-turn handoff can be
 supplied with `--context-file` without sending that transcript to the routing
 request.
 

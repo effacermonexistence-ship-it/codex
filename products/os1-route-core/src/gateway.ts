@@ -31,6 +31,8 @@ import { assertTicketDeliveryHygiene, publicJson } from "./egress";
 import { reject } from "./errors";
 import { bindingJson, readBoundedJson } from "./io";
 
+export const PRIVATE_CORE_PROTOCOL_VERSION = 3;
+
 function positiveInteger(value: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) reject();
@@ -114,12 +116,12 @@ async function issueTicket(
 
 export async function startExecution(request: Request, env: Env): Promise<Response> {
   const identity = await authenticate(request, env);
-  const { task, provider_preference, capacity_plan, executor_contract_version, executor_contract_sha256 } = parseStartRequest(
+  const { task, provider_preference, capacity_plan, executor_contract_version, executor_contract_sha256, available_codex_models } = parseStartRequest(
     await readBoundedJson(request, positiveInteger(env.MAX_REQUEST_BYTES)),
   );
   const executionId = crypto.randomUUID();
   const decision = await privateDecision(env, {
-    version: 2,
+    version: PRIVATE_CORE_PROTOCOL_VERSION,
     execution_id: executionId,
     principal: { subject: identity.subject, device_id: identity.device_id },
     task: {
@@ -127,6 +129,7 @@ export async function startExecution(request: Request, env: Env): Promise<Respon
       content: task,
       provider_preference,
       capacity_plan,
+      available_codex_models,
       executor_contract_version,
       executor_contract_sha256,
     },
@@ -222,7 +225,7 @@ export async function submitResult(request: Request, env: Env): Promise<Response
   }
 
   const decision = await privateDecision(env, {
-    version: 2,
+    version: PRIVATE_CORE_PROTOCOL_VERSION,
     execution_id: result.ticket.execution_id,
     previous: {
       sequence: result.ticket.sequence,

@@ -11,12 +11,14 @@ describe("strict trust-boundary contracts", () => {
       task: "build the requested feature",
       provider_preference: "auto",
       capacity_plan: { codex: 25, claude: 100 },
+      available_codex_models: [{ slug: "gpt-5.6-terra", default_effort: "medium", supported_efforts: ["low", "medium", "high"], priority: 1 }],
       executor_contract_version: "os1-executor-2026-09-01-v1",
       executor_contract_sha256: "0".repeat(64),
     })).toEqual({
       task: "build the requested feature",
       provider_preference: "auto",
       capacity_plan: { codex: 25, claude: 100 },
+      available_codex_models: [{ slug: "gpt-5.6-terra", default_effort: "medium", supported_efforts: ["low", "medium", "high"], priority: 1 }],
       executor_contract_version: "os1-executor-2026-09-01-v1",
       executor_contract_sha256: "0".repeat(64),
     });
@@ -42,20 +44,20 @@ describe("strict trust-boundary contracts", () => {
       parsePrivateDecision({
         status: "step",
         provider: "codex",
-        action: "agent_run",
+        action: "cx_56terra_medium",
         permission_profile: "workspace_write",
       }),
     ).toEqual({
       status: "step",
       provider: "codex",
-      action: "agent_run",
+      action: "cx_56terra_medium",
       permission_profile: "workspace_write",
     });
     expect(() =>
       parsePrivateDecision({
         status: "step",
         provider: "codex",
-        action: "agent_run",
+        action: "cx_56terra_medium",
         permission_profile: "workspace_write",
         rationale: "private reasoning",
       }),
@@ -66,12 +68,12 @@ describe("strict trust-boundary contracts", () => {
     expect(parsePrivateDecision({
       status: "step",
       provider: "claude",
-      action: "agent_run_deep",
+      action: "cl_opus_xhigh",
       permission_profile: "read_only",
     })).toEqual({
       status: "step",
       provider: "claude",
-      action: "agent_run_deep",
+      action: "cl_opus_xhigh",
       permission_profile: "read_only",
     });
     expect(() => parsePrivateDecision({
@@ -95,7 +97,7 @@ describe("strict trust-boundary contracts", () => {
           execution_id: "3f7c2a82-3b21-4f39-9e3a-8dd9af83c79c",
           sequence: 1,
           provider: "codex",
-          action: "agent_run",
+          action: "cx_56terra_medium",
           permission_profile: "read_only",
           expires_at: "2026-09-01T00:00:00.000Z",
           nonce: "Q2hhbmdlTWVOb3RBbmRUaGVuQ2hhbmdlTWVBZ2Fpbg",

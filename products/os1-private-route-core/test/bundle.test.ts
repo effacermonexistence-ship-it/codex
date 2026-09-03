@@ -3,26 +3,22 @@ import { readFileSync } from "node:fs";
 import { parsePolicyBundle } from "../src/bundle";
 
 const bundle = {
-  schema: 2,
+  schema: 4,
   policy_version: "policy-test-v1",
   executor_contracts: [{ version: "executor-test-v1", sha256: "0".repeat(64) }],
   execution_profiles: {
-    codex: {
-      standard: { model: "gpt-standard", effort: "medium" },
-      efficient: { model: "gpt-efficient", effort: "low" },
-      deep: { model: "gpt-deep", effort: "xhigh" },
-    },
-    claude: {
-      standard: { model: "sonnet", effort: "medium" },
-      efficient: { model: "haiku", effort: "low" },
-      deep: { model: "opus", effort: "xhigh" },
-    },
+    os1_exact: { provider: "local", model: "local-deterministic", effort: "none" },
+    cx_fast: { provider: "codex", model: "gpt-efficient", effort: "low" },
+    cx_standard: { provider: "codex", model: "gpt-standard", effort: "medium" },
+    cl_standard: { provider: "claude", model: "sonnet", effort: "medium" },
+    cl_deep: { provider: "claude", model: "opus", effort: "xhigh" },
   },
-  routing: { version: 1, default_provider: "codex", default_permission_profile: "workspace_write", max_steps: 2, rules: [] },
-  revas: {
-    version: 1, minimum_output_chars: 10, pass_score: 85, retry_score: 55,
-    transient_patterns: [], failure_patterns: [], incomplete_patterns: [],
-    mutation_terms: [], exact_reply_terms: [], evidence_terms: [], stop_words: [],
+  maximum_steps: 4,
+  rcc: {
+    adapter_version: "os1-rcc-adapter-v1",
+    policy_sha256: "1".repeat(64),
+    engine_sha256: "2".repeat(64),
+    authority_sha256: "3".repeat(64),
   },
 };
 
@@ -31,10 +27,10 @@ describe("private policy bundle", () => {
   if (candidatePath) {
     it("validates the generated private rollout candidate", () => {
       const candidate = parsePolicyBundle(readFileSync(candidatePath, "utf8"));
-      expect(candidate.schema).toBe(2);
+      expect(candidate.schema).toBe(4);
       expect(candidate.executor_contracts).toHaveLength(1);
-      expect(candidate.execution_profiles.codex.deep.effort).toBe("xhigh");
-      expect(candidate.execution_profiles.claude.efficient.model).toBe("haiku");
+      expect(candidate.execution_profiles.cl_opus_xhigh.effort).toBe("xhigh");
+      expect(candidate.execution_profiles.cx_56luna_low.model).toBe("gpt-5.6-luna");
     });
   }
   it("accepts the exact version-pinned policy schema", () => {
@@ -61,13 +57,13 @@ describe("private policy bundle", () => {
       ...current,
       execution_profiles: {
         ...(current.execution_profiles as Record<string, unknown>),
-        codex: { standard: { model: "../../escape", effort: "medium" } },
+        cx_bad: { provider: "codex", model: "../../escape", effort: "medium" },
       },
     }))).toThrow();
   });
   it("rejects unknown fields and invalid contract hashes", () => {
     expect(() => parsePolicyBundle(JSON.stringify({ ...bundle, rationale: "leak" }))).toThrow();
-    expect(() => parsePolicyBundle(JSON.stringify({ ...bundle, schema: 1 }))).toThrow();
+    expect(() => parsePolicyBundle(JSON.stringify({ ...bundle, schema: 3 }))).toThrow();
     expect(() => parsePolicyBundle(JSON.stringify({
       ...bundle,
       executor_contracts: [{ version: "executor-test-v1", sha256: "bad" }],

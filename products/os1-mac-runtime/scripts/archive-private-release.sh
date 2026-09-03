@@ -7,9 +7,13 @@ readonly repository_root="$(cd "$runtime_root/../.." && pwd)"
 readonly policy_candidate="${1:?policy candidate path required}"
 readonly release_id="${2:?release id required}"
 readonly archive_dir="/tmp/os1-private-archive.${release_id}"
-readonly package_path="$runtime_root/release/OS-1-0.8.0.pkg"
-readonly beta_bundle_path="$runtime_root/release/OS-1-0.8.0-macOS-beta.zip"
 readonly release_manifest="$runtime_root/release/latest.json"
+
+[[ -f "$release_manifest" && ! -L "$release_manifest" ]]
+readonly version="$(plutil -extract version raw -o - "$release_manifest")"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+readonly package_path="$runtime_root/release/OS-1-${version}.pkg"
+readonly beta_bundle_path="$runtime_root/release/OS-1-${version}-macOS-beta.zip"
 
 [[ "$release_id" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
 [[ -f "$policy_candidate" && -f "$package_path" && -f "$beta_bundle_path" && -f "$release_manifest" ]]
@@ -39,6 +43,7 @@ fi
 mkdir -m 0700 "$archive_dir"
 COPYFILE_DISABLE=1 tar \
   --exclude='node_modules' --exclude='dist' --exclude='.wrangler' \
+  --exclude='.venv' --exclude='.venv-workers' --exclude='python_modules' \
   --exclude='.build' --exclude='.build-*' --exclude='release' --exclude='.DS_Store' \
   -czf "$archive_dir/source-private.tar.gz" \
   -C "$repository_root" \
@@ -53,8 +58,8 @@ COPYFILE_DISABLE=1 tar \
   pnpm-lock.yaml pnpm-workspace.yaml package.json
 chmod 0600 "$archive_dir/source-private.tar.gz"
 
-install -m 0600 "$package_path" "$archive_dir/OS-1-0.8.0-development.pkg"
-install -m 0600 "$beta_bundle_path" "$archive_dir/OS-1-0.8.0-macOS-beta.zip"
+install -m 0600 "$package_path" "$archive_dir/OS-1-${version}-development.pkg"
+install -m 0600 "$beta_bundle_path" "$archive_dir/OS-1-${version}-macOS-beta.zip"
 install -m 0600 "$release_manifest" "$archive_dir/latest-development.json"
 install -m 0600 "$policy_candidate" "$archive_dir/policy-candidate.json"
 
@@ -71,8 +76,8 @@ node -e '
     git_revision: gitRevision, artifacts }, null, 2) + "\n", { mode: 0o600 });
 ' "$archive_dir/manifest.json" "$release_id" "$(git -C "$repository_root" rev-parse HEAD)" \
   "$archive_dir/source-private.tar.gz" \
-  "$archive_dir/OS-1-0.8.0-development.pkg" \
-  "$archive_dir/OS-1-0.8.0-macOS-beta.zip" \
+  "$archive_dir/OS-1-${version}-development.pkg" \
+  "$archive_dir/OS-1-${version}-macOS-beta.zip" \
   "$archive_dir/latest-development.json" \
   "$archive_dir/policy-candidate.json"
 
