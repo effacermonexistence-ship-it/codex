@@ -178,13 +178,18 @@ commit that private policy to this repository.
 
 ## Release decision
 
-Neither the shell path nor Finder distribution may publish the development
-package: the installer refuses any package that fails Apple signature and
-Gatekeeper assessment. Distribution mode requires a Developer ID Installer and
-Developer ID Application identity, then notarizes, staples, and assesses the
-package. Behavioral surrogate routing, client-output fabrication on an
-owner-controlled Mac, and decision-boundary approximation remain structural
-residual risks and must be measured and documented rather than marked resolved.
+Neither the public gateway shell path nor Finder distribution may publish the
+development package: the default installer refuses any package that fails
+Apple signature and Gatekeeper assessment. A separate offline beta bundle is
+available only through an explicit opt-in terminal command. Before invoking
+the system installer, that beta path checks the manifest SHA-256, package
+identifier/version, exact payload allowlist, executable code integrity, and
+universal architectures; it does not disable Gatekeeper globally. Distribution
+mode still requires a Developer ID Installer and Developer ID Application
+identity, then notarizes, staples, and assesses the package. Behavioral
+surrogate routing, client-output fabrication on an owner-controlled Mac, and
+decision-boundary approximation remain structural residual risks and must be
+measured and documented rather than marked resolved.
 
 After both Developer ID identities are installed in the login keychain and a
 notarytool keychain profile has been created, the release builder is invoked as:

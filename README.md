@@ -2,8 +2,8 @@
 
 ## OS-1 Claudex
 
-On any Apple Silicon or Intel Mac running macOS 13 or newer, install the public
-OS-1 release with:
+After an Apple-notarized release is activated, any Apple Silicon or Intel Mac
+running macOS 13 or newer can install the public OS-1 release with:
 
 ```bash
 curl -fsSL https://os1-route-gateway.omar-git-r2-backup.workers.dev/install.sh | bash
@@ -14,6 +14,26 @@ The installer downloads a SHA-256-pinned universal package, installs the
 Codex CLI, Claude Code, and GitHub CLI when absent. Each person completes the
 three providers' OAuth browser approvals on their own Mac; credentials are
 never copied between computers.
+
+### Explicit local beta without Apple notarization
+
+For private testing before Apple signing, build a separate offline beta bundle:
+
+```bash
+OS1_RELEASE_MODE=development products/os1-mac-runtime/scripts/build-release.sh
+products/os1-mac-runtime/scripts/make-beta-bundle.sh
+```
+
+Send the resulting `OS-1-0.8.0-macOS-beta.zip` to the other Mac. After
+unzipping it, open Terminal, type `bash `, drag **Install OS-1 Beta.command**
+into Terminal, and press Return. The command verifies the manifest SHA-256,
+package identifier and version, exact file/directory allowlist, app and CLI
+code integrity, and both `arm64` and `x86_64` slices before asking for the Mac
+administrator password. It never disables Gatekeeper globally.
+
+This is an explicit terminal beta path, not a seamless Finder installation.
+The public curl/Finder path remains fail-closed until the package has Developer
+ID signatures and Apple notarization.
 
 After installation:
 
