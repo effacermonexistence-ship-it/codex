@@ -21,6 +21,10 @@ concurrency:
 jobs:
   backup:
     name: Create and upload verified Git bundle
+    # The backup Worker only accepts OIDC claims whose repository_owner matches its
+    # ALLOWED_OWNER, so a run from a fork can never succeed. Skip it there instead of
+    # failing every fork push.
+    if: github.repository_owner == 'effacermonexistence'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
