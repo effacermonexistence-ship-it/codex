@@ -2039,12 +2039,6 @@ private enum Theme {
     static let radiusControl: CGFloat = 13
     static let radiusMessage: CGFloat = 16
     static let radiusComposer: CGFloat = 22
-    @MainActor static let constellationImage: NSImage? = {
-        guard let url = Bundle.main.url(forResource: "Constellation", withExtension: "png") else {
-            return nil
-        }
-        return NSImage(contentsOf: url)
-    }()
 }
 
 private struct OmarAGILogo: View {
@@ -2151,65 +2145,22 @@ private struct OS1DesktopApp: App {
 
 private struct RootView: View {
     @ObservedObject var store: SessionStore
-    @State private var backdropOffset = CGSize.zero
 
     var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                CosmicBackdrop(offset: backdropOffset)
-                VStack(spacing: 0) {
-                    HStack {
-                        Text("INTERACTIVE PRODUCT VIEW")
-                        Spacer()
-                        HStack(spacing: 8) {
-                            Circle().fill(Theme.green).frame(width: 7, height: 7)
-                                .shadow(color: Theme.green.opacity(0.82), radius: 6)
-                            Text("GOVERNANCE ACTIVE")
-                        }
-                    }
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
-                    .tracking(1.7)
-                    .foregroundStyle(Theme.muted)
-                    .padding(.horizontal, 3)
-                    .frame(height: 28, alignment: .top)
-
-                    HStack(spacing: 0) {
-                        ProviderRail(store: store)
-                        Rectangle().fill(Theme.border).frame(width: 1)
-                        if store.surface == .auto {
-                            SessionSidebar(store: store)
-                            Rectangle().fill(Theme.border).frame(width: 1)
-                            ConversationView(store: store)
-                        } else {
-                            NativeSessionBrowser(store: store, provider: store.surface)
-                        }
-                    }
-                    .background(Theme.background.opacity(0.97))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: Theme.radiusShell, style: .continuous)
-                            .stroke(Theme.borderStrong, lineWidth: 1)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusShell, style: .continuous))
-                    .shadow(color: Color.black.opacity(0.42), radius: 22, y: 12)
-                }
-                .padding(12)
-            }
-            .onContinuousHover { phase in
-                switch phase {
-                case .active(let location):
-                    let width = max(geometry.size.width, 1)
-                    let height = max(geometry.size.height, 1)
-                    backdropOffset = CGSize(
-                        width: ((location.x / width) - 0.5) * -12,
-                        height: ((location.y / height) - 0.5) * -9
-                    )
-                case .ended:
-                    backdropOffset = .zero
-                }
+        HStack(spacing: 0) {
+            ProviderRail(store: store)
+            Rectangle().fill(Theme.border).frame(width: 1)
+            if store.surface == .auto {
+                SessionSidebar(store: store)
+                Rectangle().fill(Theme.border).frame(width: 1)
+                ConversationView(store: store)
+            } else {
+                NativeSessionBrowser(store: store, provider: store.surface)
             }
         }
-        .frame(minWidth: 1_100, minHeight: 680)
+        .frame(minWidth: 1_100, maxWidth: .infinity, minHeight: 680, maxHeight: .infinity)
         .background(Theme.background)
+        .ignoresSafeArea()
         .alert("OS-1 Claudex", isPresented: Binding(
             get: { store.alertMessage != nil },
             set: { if !$0 { store.alertMessage = nil } }
@@ -2218,40 +2169,6 @@ private struct RootView: View {
         } message: {
             Text(store.alertMessage ?? "")
         }
-    }
-}
-
-private struct CosmicBackdrop: View {
-    let offset: CGSize
-
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                Color.black
-                if let image = Theme.constellationImage {
-                    Image(nsImage: image)
-                        .resizable()
-                        .interpolation(.high)
-                        .scaledToFill()
-                        .frame(
-                            width: geometry.size.width * 1.07,
-                            height: geometry.size.height * 1.07
-                        )
-                        .offset(offset)
-                        .opacity(0.72)
-                }
-                RadialGradient(
-                    colors: [Color.black.opacity(0.10), Color.black.opacity(0.72)],
-                    center: UnitPoint(x: 0.52, y: 0.42),
-                    startRadius: 20,
-                    endRadius: max(geometry.size.width, geometry.size.height) * 0.72
-                )
-            }
-            .frame(width: geometry.size.width, height: geometry.size.height)
-            .clipped()
-        }
-        .allowsHitTesting(false)
-        .animation(.linear(duration: 0.11), value: offset)
     }
 }
 
