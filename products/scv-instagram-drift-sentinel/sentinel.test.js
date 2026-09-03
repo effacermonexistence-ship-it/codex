@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  GOLD_LATEST_KEY,
+  GOLD_MANIFEST_KEY,
+  GOLD_MANIFEST_SHA256,
+  checkGold,
   CONTENT_FINGERPRINT,
   CURRENT_SNAPSHOT_ID,
   GOLDEN_SNAPSHOT_ID,
   POST_RESTORE_RECEIPT_SHA256,
+  PRE_RESET_AUDIT_REMAINING_COUNT,
   PRE_RESET_SNAPSHOT_ID,
   PRE_RESTORE_RECEIPT_SHA256,
   RELEASE_ID,
@@ -56,13 +61,13 @@ function healthyBody() {
   }
 }
 
-test('accepts the exact healthy v137 release while preserving operational alerts', () => {
+test('accepts the exact healthy v138 release while preserving operational alerts', () => {
   const result = evaluateEndpoint(target, 200, healthyBody())
   assert.equal(result.ok, true)
   assert.equal(result.operational_alert_count, 1)
 })
 
-test('accepts the exact separated golden and post-reset v137 snapshot control', async () => {
+test('accepts the exact separated golden and post-reset v138 snapshot control', async () => {
   const catalog = {
     snapshot_count: SNAPSHOT_COUNT,
     named_pointers: {
@@ -73,7 +78,7 @@ test('accepts the exact separated golden and post-reset v137 snapshot control', 
       {
         snapshot_id: PRE_RESET_SNAPSHOT_ID,
         release_id: RELEASE_ID,
-        omar_system_audit_remaining_count: 0
+        omar_system_audit_remaining_count: PRE_RESET_AUDIT_REMAINING_COUNT
       },
       {
         snapshot_id: CURRENT_SNAPSHOT_ID,
@@ -93,15 +98,15 @@ test('accepts the exact separated golden and post-reset v137 snapshot control', 
     golden_snapshot_id: GOLDEN_SNAPSHOT_ID,
     current_snapshot_id: CURRENT_SNAPSHOT_ID,
     catalog: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG.json`, sha256: SNAPSHOT_CATALOG_SHA256 },
-    seal: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG_SEAL.json`, sha256: '7f0c1fbffa5f0b23db58f08a86281d72a871d4c349ca095212a21aa3e0a564c4' },
+    seal: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG_SEAL.json`, sha256: '3f81f54181d2d1fbd7c60c6e85daf900f31875e28776a553b6c67650c875f572' },
     restore_tool: { key: `${prefix}/scv-timestamped-restore.js`, sha256: '4044f96616a504c9049657fbe628b63246b56a626fa57cdb5f67dc1307d3f206' },
     restore_receipts: {
-      pre_v137_omar_reset: {
-        key: `${prefix}/receipts/pre-v137-omar-reset-20260902T020530Z.json`,
+      pre_v148_omar_reset: {
+        key: `${prefix}/receipts/pre-v148-omar-reset-20260903T205142Z.json`,
         sha256: PRE_RESTORE_RECEIPT_SHA256
       },
-      current_post_v137_omar_reset: {
-        key: `${prefix}/receipts/current-post-v137-omar-reset-20260902T020532Z.json`,
+      current_post_v148_omar_reset: {
+        key: `${prefix}/receipts/current-post-v148-omar-reset-20260903T205146Z.json`,
         sha256: POST_RESTORE_RECEIPT_SHA256
       }
     },
@@ -132,15 +137,15 @@ test('rejects a current snapshot pointer that overlays the golden snapshot', asy
     golden_snapshot_id: GOLDEN_SNAPSHOT_ID,
     current_snapshot_id: GOLDEN_SNAPSHOT_ID,
     catalog: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG.json`, sha256: SNAPSHOT_CATALOG_SHA256 },
-    seal: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG_SEAL.json`, sha256: '7f0c1fbffa5f0b23db58f08a86281d72a871d4c349ca095212a21aa3e0a564c4' },
+    seal: { key: `${prefix}/SCV_TIMESTAMPED_SNAPSHOT_CATALOG_SEAL.json`, sha256: '3f81f54181d2d1fbd7c60c6e85daf900f31875e28776a553b6c67650c875f572' },
     restore_tool: { key: `${prefix}/scv-timestamped-restore.js`, sha256: '4044f96616a504c9049657fbe628b63246b56a626fa57cdb5f67dc1307d3f206' },
     restore_receipts: {
-      pre_v137_omar_reset: {
-        key: `${prefix}/receipts/pre-v137-omar-reset-20260902T020530Z.json`,
+      pre_v148_omar_reset: {
+        key: `${prefix}/receipts/pre-v148-omar-reset-20260903T205142Z.json`,
         sha256: PRE_RESTORE_RECEIPT_SHA256
       },
-      current_post_v137_omar_reset: {
-        key: `${prefix}/receipts/current-post-v137-omar-reset-20260902T020532Z.json`,
+      current_post_v148_omar_reset: {
+        key: `${prefix}/receipts/current-post-v148-omar-reset-20260903T205146Z.json`,
         sha256: POST_RESTORE_RECEIPT_SHA256
       }
     },
@@ -181,4 +186,21 @@ test('rejects critical drift but not an isolated operational quarantine alert', 
   assert.equal(result.ok, false)
   assert.ok(result.reasons.includes('critical_drift'))
   assert.ok(result.reasons.includes('critical_drift_alerts'))
+})
+
+test('accepts the pinned GOLD-3 manifest and rejects a drifted one', async () => {
+  const manifestBytes = new TextEncoder().encode(JSON.stringify({ gold_name: 'GOLD-3', release: { release_id: RELEASE_ID, content_fingerprint_sha256: CONTENT_FINGERPRINT } }))
+  const latest = { manifest: { key: GOLD_MANIFEST_KEY, sha256: GOLD_MANIFEST_SHA256 } }
+  const object = (bytes) => ({ arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) })
+  const archive = { async get(key) { if (key === GOLD_LATEST_KEY) return object(new TextEncoder().encode(JSON.stringify(latest))); if (key === GOLD_MANIFEST_KEY) return object(manifestBytes); return null } }
+  const good = await checkGold(archive, { hashImpl: async () => GOLD_MANIFEST_SHA256 })
+  assert.equal(good.ok, true)
+  assert.deepEqual(good.reasons, [])
+  const drifted = await checkGold(archive, { hashImpl: async () => 'deadbeef' })
+  assert.equal(drifted.ok, false)
+  assert.ok(drifted.reasons.includes('gold_manifest_object_hash'))
+  const wrongRelease = { async get(key) { if (key === GOLD_LATEST_KEY) return object(new TextEncoder().encode(JSON.stringify(latest))); if (key === GOLD_MANIFEST_KEY) return object(new TextEncoder().encode(JSON.stringify({ release: { release_id: 'other', content_fingerprint_sha256: 'x' } }))); return null } }
+  const bad = await checkGold(wrongRelease, { hashImpl: async () => GOLD_MANIFEST_SHA256 })
+  assert.equal(bad.ok, false)
+  assert.ok(bad.reasons.includes('gold_manifest_release_fingerprint'))
 })

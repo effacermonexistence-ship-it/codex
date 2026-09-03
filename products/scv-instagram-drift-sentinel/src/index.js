@@ -1,23 +1,33 @@
-const SENTINEL_SCHEMA = 'scv-instagram-drift-sentinel-2026-09-01-v2-v137-business-lane'
-const RELEASE_ID = 'scv-instagram-single-20260901-v137'
-const CONTENT_FINGERPRINT = '3138693d3cd33dc2dc58169e8f8f0b429b110946ee2ca817d9d71c7d1f2e8e17'
-const RELEASE_MANIFEST = '4589e691360dbe78fb8d22a5d5298d38db2b1769df52859f65c59393df73cb4f'
+const SENTINEL_SCHEMA = 'scv-instagram-drift-sentinel-2026-09-03-v12-v148-ordinal-dates-pointer'
+// GOLD-3 (2026-09-03): v148 (owner-verified v145 plus the owner-ordered polish, live red-team verified) frozen as the reference; the pointer and manifest below are pinned by hash.
+const GOLD_LATEST_KEY = 'scv-instagram-automation/gold/LATEST.json'
+const GOLD_MANIFEST_KEY = 'scv-instagram-automation/gold/SCV_GOLD_MANIFEST_v148.json'
+const GOLD_MANIFEST_SHA256 = '31ea4507381e6ec2c3ce4458d70af4a311f331a4a26651f5d9234a01312766cc'
+const RELEASE_ID = 'scv-instagram-single-20260902-v148'
+const CONTENT_FINGERPRINT = '3a9a18631443f4738d13dd803f080979ff4d21ab0d9de1f5054b2f26e2ea3609'
+const RELEASE_MANIFEST = 'b3e9d7ba794fa9c6cb33a32727cf1870c9af2a2c54a1e191c0321cab9ff0f0ec'
 const VISIBLE_MODEL = 'gpt-5.4-mini-2026-03-17'
-const SNAPSHOT_CONTROL_VERSION = '20260902T020820Z'
-const SNAPSHOT_COUNT = 27
+const SNAPSHOT_CONTROL_VERSION = '20260903T205303Z'
+const SNAPSHOT_COUNT = 65
 const GOLDEN_SNAPSHOT_ID = 'scv-instagram-20260420T152810-local-origin'
-const PRE_RESET_SNAPSHOT_ID = 'scv-instagram-20260902T020530Z-v137-pre-omar-reset'
-const CURRENT_SNAPSHOT_ID = 'scv-instagram-20260902T020532Z-v137-post-omar-reset-current'
-const SNAPSHOT_CATALOG_SHA256 = 'a9417af1e899fb57694305c5b34887ea7587264072b2aabc87d6480de2789c69'
-const SNAPSHOT_SEAL_SHA256 = '7f0c1fbffa5f0b23db58f08a86281d72a871d4c349ca095212a21aa3e0a564c4'
+const PRE_RESET_SNAPSHOT_ID = 'scv-instagram-20260903T205142Z-v148-pre-omar-reset'
+const CURRENT_SNAPSHOT_ID = 'scv-instagram-20260903T205146Z-v148-post-omar-reset-current'
+const SNAPSHOT_CATALOG_SHA256 = '04088e180fc5b99e9aee78a0775f0b2ea13b47208e5f9bbd3002fe01c729fbde'
+const SNAPSHOT_SEAL_SHA256 = '3f81f54181d2d1fbd7c60c6e85daf900f31875e28776a553b6c67650c875f572'
 const SNAPSHOT_RESTORE_TOOL_SHA256 = '4044f96616a504c9049657fbe628b63246b56a626fa57cdb5f67dc1307d3f206'
-const RESET_RECEIPT_SHA256 = '1a5ecd99fcf328de399e7a08685dc27b443aecfd8ce2c0229c8f6fe2808ff7aa'
-const PRE_RESTORE_RECEIPT_SHA256 = '6caebfe98c054c0d907bbeafd2380b6de144f8c38c61d93ce108c604e10f60fe'
-const POST_RESTORE_RECEIPT_SHA256 = 'edb712a4a15bf51bc9712e6446a081eabab78366348e9121899a25adb696aeed'
+const RESET_RECEIPT_SHA256 = '29e45bf551b4762f1c8a4320483327a6219f81da66b19b8e0430868cf4d75d81'
+// v148 hand-over reset after the ordinal-word-days / date-answer-before-form-match polish: the pre-reset
+// audit count is pinned per release from the receipt; the post-reset point must be zero.
+const PRE_RESET_AUDIT_REMAINING_COUNT = 36
+const PRE_RESTORE_RECEIPT_SHA256 = 'dcb89737a74a19ba4de11dda21af987d50eebc1244a0f9f3935982ef8b55bb63'
+const POST_RESTORE_RECEIPT_SHA256 = 'e8bc8391cbb0e2c73d5cc2bc685841cb86e8e81ce5cc1a739a03b349b1f6aa70'
 const MAX_CANARY_AGE_MS = 90 * 60 * 1000
 const MAX_DRIFT_AGE_MS = 3 * 60 * 1000
 const FETCH_TIMEOUT_MS = 20_000
-const MAX_BODY_BYTES = 64 * 1024
+// 2026-09-02: the timestamped catalog passed 64 KiB at 37 snapshots and the
+// v5 sentinel reported snapshot_catalog_object_too_large; the bound is a guard
+// against runaway bodies, not a size budget for the catalog.
+const MAX_BODY_BYTES = 1024 * 1024
 const PREFIX = 'scv-instagram-automation/drift-attestations'
 const SNAPSHOT_LATEST_KEY = 'scv-instagram-automation/timestamped-snapshots/LATEST.json'
 
@@ -175,15 +185,15 @@ async function checkSnapshotControl(archive, options = {}) {
     check(latest?.seal?.sha256 === SNAPSHOT_SEAL_SHA256, 'snapshot_seal_pointer_hash')
     check(latest?.restore_tool?.key === `${expectedPrefix}/scv-timestamped-restore.js`, 'snapshot_restore_tool_key')
     check(latest?.restore_tool?.sha256 === SNAPSHOT_RESTORE_TOOL_SHA256, 'snapshot_restore_tool_pointer_hash')
-    check(latest?.restore_receipts?.pre_v137_omar_reset?.key ===
-      `${expectedPrefix}/receipts/pre-v137-omar-reset-20260902T020530Z.json`,
+    check(latest?.restore_receipts?.pre_v148_omar_reset?.key ===
+      `${expectedPrefix}/receipts/pre-v148-omar-reset-20260903T205142Z.json`,
     'snapshot_pre_restore_receipt_key')
-    check(latest?.restore_receipts?.pre_v137_omar_reset?.sha256 === PRE_RESTORE_RECEIPT_SHA256,
+    check(latest?.restore_receipts?.pre_v148_omar_reset?.sha256 === PRE_RESTORE_RECEIPT_SHA256,
       'snapshot_pre_restore_receipt_hash')
-    check(latest?.restore_receipts?.current_post_v137_omar_reset?.key ===
-      `${expectedPrefix}/receipts/current-post-v137-omar-reset-20260902T020532Z.json`,
+    check(latest?.restore_receipts?.current_post_v148_omar_reset?.key ===
+      `${expectedPrefix}/receipts/current-post-v148-omar-reset-20260903T205146Z.json`,
     'snapshot_post_restore_receipt_key')
-    check(latest?.restore_receipts?.current_post_v137_omar_reset?.sha256 ===
+    check(latest?.restore_receipts?.current_post_v148_omar_reset?.sha256 ===
       POST_RESTORE_RECEIPT_SHA256, 'snapshot_post_restore_receipt_hash')
     check(latest?.restore_requires_exact_snapshot_id === true, 'snapshot_exact_id_required')
     check(latest?.production_cutover_automatic === false, 'snapshot_automatic_cutover')
@@ -207,7 +217,7 @@ async function checkSnapshotControl(archive, options = {}) {
           ? catalog.snapshots.find((snapshot) => snapshot?.snapshot_id === CURRENT_SNAPSHOT_ID)
           : null
         check(preReset?.release_id === RELEASE_ID, 'snapshot_pre_reset_release')
-        check(Number(preReset?.omar_system_audit_remaining_count) === 0,
+        check(Number(preReset?.omar_system_audit_remaining_count) === PRE_RESET_AUDIT_REMAINING_COUNT,
           'snapshot_pre_reset_audit_count')
         check(current?.release_id === RELEASE_ID, 'snapshot_current_release')
         check(current?.previous_snapshot_id === PRE_RESET_SNAPSHOT_ID,
@@ -247,13 +257,40 @@ async function readState(archive) {
   }
 }
 
+async function checkGold(archive, options = {}) {
+  const hashImpl = options.hashImpl || sha256
+  const reasons = []
+  const check = (condition, reason) => { if (!condition) reasons.push(reason) }
+  try {
+    const latestResult = await readBoundedR2Json(archive, GOLD_LATEST_KEY)
+    if (!latestResult.ok) return { ok: false, reasons: [`gold_latest_${latestResult.reason}`] }
+    const latest = latestResult.value
+    check(latest?.manifest?.key === GOLD_MANIFEST_KEY, 'gold_manifest_key')
+    check(latest?.manifest?.sha256 === GOLD_MANIFEST_SHA256, 'gold_manifest_pointer_hash')
+    const object = await archive.get(GOLD_MANIFEST_KEY)
+    if (!object) return { ok: false, reasons: [...reasons, 'gold_manifest_missing'] }
+    const bytes = new Uint8Array(await object.arrayBuffer())
+    if (bytes.byteLength > MAX_BODY_BYTES) return { ok: false, reasons: [...reasons, 'gold_manifest_object_too_large'] }
+    const actual = await hashImpl(bytes)
+    check(actual === GOLD_MANIFEST_SHA256, 'gold_manifest_object_hash')
+    let manifest = null
+    try { manifest = JSON.parse(new TextDecoder().decode(bytes)) } catch { reasons.push('gold_manifest_invalid_json') }
+    check(manifest?.release?.content_fingerprint_sha256 === CONTENT_FINGERPRINT, 'gold_manifest_release_fingerprint')
+    check(manifest?.release?.release_id === RELEASE_ID, 'gold_manifest_release_id')
+    return { ok: reasons.length === 0, reasons, manifest_sha256: actual, gold_name: String(manifest?.gold_name || '') }
+  } catch (error) {
+    return { ok: false, reasons: [...reasons, `gold_check_error:${String(error && error.message ? error.message : error).slice(0, 80)}`] }
+  }
+}
+
 async function runSentinel(env, options = {}) {
   const checkedAt = new Date(options.now || Date.now()).toISOString()
-  const [checks, snapshotControl] = await Promise.all([
+  const [checks, snapshotControl, gold] = await Promise.all([
     Promise.all(TARGETS.map((target) => checkTarget(target, options.fetchImpl || fetch))),
-    checkSnapshotControl(env.ARCHIVE)
+    checkSnapshotControl(env.ARCHIVE),
+    checkGold(env.ARCHIVE)
   ])
-  const ok = checks.every((check) => check.ok === true) && snapshotControl.ok === true
+  const ok = checks.every((check) => check.ok === true) && snapshotControl.ok === true && gold.ok === true
   const previous = await readState(env.ARCHIVE)
   const consecutiveFailures = ok ? 0 : Number(previous?.consecutive_failures || 0) + 1
   const receipt = {
@@ -276,6 +313,7 @@ async function runSentinel(env, options = {}) {
     },
     checks,
     snapshot_control: snapshotControl,
+    gold: { ...gold, expected_manifest_key: GOLD_MANIFEST_KEY, expected_manifest_sha256: GOLD_MANIFEST_SHA256 },
     consecutive_failures: consecutiveFailures,
     contains_credentials: false,
     contains_customer_message_content: false
@@ -375,6 +413,11 @@ export default {
 }
 
 export {
+  GOLD_LATEST_KEY,
+  GOLD_MANIFEST_KEY,
+  GOLD_MANIFEST_SHA256,
+  checkGold,
+  PRE_RESET_AUDIT_REMAINING_COUNT,
   CONTENT_FINGERPRINT,
   CURRENT_SNAPSHOT_ID,
   GOLDEN_SNAPSHOT_ID,
