@@ -24,10 +24,11 @@
     { "tag": "v2", "new_sqlite_classes": ["RoutingBudgetState"] }
   ],
   "vars": {
-    "POLICY_BUNDLE_KEY": "os1/policies/6e3b11a056d0e1080e33f150afdd1985241c6e09a4e06d5720627c425b5eba06.json",
-    "POLICY_BUNDLE_SHA256": "6e3b11a056d0e1080e33f150afdd1985241c6e09a4e06d5720627c425b5eba06",
+    "POLICY_BUNDLE_KEY": "os1/policies/375579d2e1d5843d78b3037ccaf529e1a8e81c5dd4651b5e5501abe4cd80014a.json",
+    "POLICY_BUNDLE_SHA256": "375579d2e1d5843d78b3037ccaf529e1a8e81c5dd4651b5e5501abe4cd80014a",
     "MAX_POLICY_BUNDLE_BYTES": "65536",
-    "MAX_ROUTE_STARTS_PER_HOUR": "120"
+    "MAX_ROUTE_STARTS_PER_HOUR": "1200",
+    "ROUTING_BUDGET_EPOCH": "rcc-v5"
   },
   "observability": {
     "enabled": true,
