@@ -230,6 +230,12 @@ async function subjectKey(subject: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(subject));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
+async function budgetObjectName(env: Env, subject: string): Promise<string> {
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(env.ROUTING_BUDGET_EPOCH)) {
+    throw new Error("invalid private configuration");
+  }
+  return `${env.ROUTING_BUDGET_EPOCH}:${await subjectKey(subject)}`;
+}
 function positiveInteger(value: string): number {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("invalid private configuration");
@@ -250,13 +256,16 @@ async function evaluate(env: Env, body: unknown): Promise<{ outcome: "pass" | "f
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const stage = { current: "request" };
     try {
       if (request.method !== "POST" || new URL(request.url).pathname !== "/decide") throw new Error("denied");
+      stage.current = "parse";
       const body = await request.json<unknown>();
       if (!record(body) || !exact(body, body.task === undefined ? ["execution_id", "previous", "version"] : ["execution_id", "principal", "task", "version"]) ||
         body.version !== 3 || typeof body.execution_id !== "string" || !UUID.test(body.execution_id)) throw new Error("denied");
       const state = env.ROUTES.getByName(body.execution_id);
       if (record(body.task)) {
+        stage.current = "validate_start";
         const task = body.task;
         if (!exact(task, ["available_codex_models", "capacity_plan", "content", "executor_contract_sha256", "executor_contract_version", "provider_preference", "trust"]) ||
           task.trust !== "untrusted_user_data" || typeof task.content !== "string" || task.content.length < 1 || task.content.length > 48_000 ||
@@ -268,8 +277,10 @@ export default {
         if (plan.codex < 0 || plan.codex > 100 || plan.claude < 0 || plan.claude > 100 || plan.codex + plan.claude === 0) throw new Error("denied");
         if (!record(body.principal) || !exact(body.principal, ["device_id", "subject"]) ||
           typeof body.principal.subject !== "string" || body.principal.subject.length < 1 || typeof body.principal.device_id !== "string") throw new Error("denied");
-        const budget = env.ROUTING_BUDGETS.getByName(await subjectKey(body.principal.subject));
+        stage.current = "budget";
+        const budget = env.ROUTING_BUDGETS.getByName(await budgetObjectName(env, body.principal.subject));
         if (!(await budget.consumeStart(positiveInteger(env.MAX_ROUTE_STARTS_PER_HOUR)))) throw new Error("denied");
+        stage.current = "policy";
         const bundle = await loadPolicyBundle(env);
         const executorContract = bundle.executor_contracts.find((contract) => contract.version === task.executor_contract_version && contract.sha256 === task.executor_contract_sha256);
         if (!executorContract) throw new Error("denied");
@@ -277,14 +288,18 @@ export default {
           task: task.content, provider_preference: task.provider_preference as ProviderPreference,
           capacity_plan: plan, available_codex_models: task.available_codex_models, attempt: 1,
         };
+        stage.current = "route";
         const selected = await routeWithRcc(env, bundle, context);
+        stage.current = "usage";
         if (selected.provider !== "local") await budget.record(selected.provider);
+        stage.current = "persist";
         if ((await state.begin({ ...selected, ...context, policy_version: bundle.policy_version,
           policy_sha256: env.POLICY_BUNDLE_SHA256, rcc_policy_sha256: bundle.rcc.policy_sha256,
           executor_contract_version: executorContract.version, executor_contract_sha256: executorContract.sha256,
           execution_profiles: bundle.execution_profiles })) !== "created") throw new Error("denied");
         return stepResponse(selected);
       }
+      stage.current = "validate_result";
       if (!record(body.previous) || !exact(body.previous, ["artifact_ref", "expected_artifact_hash", "sequence"]) ||
         !Number.isSafeInteger(body.previous.sequence) || typeof body.previous.artifact_ref !== "string" || !ARTIFACT_REF.test(body.previous.artifact_ref) ||
         typeof body.previous.expected_artifact_hash !== "string" || !SHA256.test(body.previous.expected_artifact_hash)) throw new Error("denied");
@@ -315,6 +330,7 @@ export default {
       const decision = await state.advance(sequence, evaluated.outcome, evaluated.verified_artifact_hash, next);
       return decision.status === "step" ? stepResponse(decision) : Response.json(decision);
     } catch {
+      console.error(JSON.stringify({ event: "private_route_denied", stage: stage.current }));
       return Response.json({ error: "denied" }, { status: 400 });
     }
   },

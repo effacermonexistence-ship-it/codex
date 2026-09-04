@@ -1238,7 +1238,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         _ = try request(
             "initialize",
             params: [
-                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.9.0"],
+                "clientInfo": ["name": "Open OS-1 Codex", "version": "0.9.1"],
                 "capabilities": ["experimentalApi": true],
             ],
             deadline: deadline
@@ -1358,8 +1358,25 @@ final class CodexAppServerClient: @unchecked Sendable {
         workspace: String,
         model: String?,
         effort: String,
+        permissionProfile: String,
         deadline: Date
     ) throws -> CodexTurnOutput {
+        let sandboxPolicy: [String: Any]
+        switch permissionProfile {
+        case "read_only":
+            sandboxPolicy = [
+                "type": "readOnly",
+                "networkAccess": true,
+            ]
+        case "workspace_write":
+            sandboxPolicy = [
+                "type": "workspaceWrite",
+                "writableRoots": [workspace],
+                "networkAccess": true,
+            ]
+        default:
+            throw OS1Error.message("Server ticket permission profile rejected")
+        }
         var params: [String: Any] = [
             "threadId": threadID,
             "input": [["type": "text", "text": prompt]],
@@ -1367,6 +1384,8 @@ final class CodexAppServerClient: @unchecked Sendable {
             "effort": effort,
             "approvalPolicy": "never",
             "approvalsReviewer": "auto_review",
+            "sandboxPolicy": sandboxPolicy,
+            "runtimeWorkspaceRoots": [workspace],
             "turnTrigger": "os1",
         ]
         if let model { params["model"] = model }
@@ -1848,6 +1867,7 @@ func execute(
             workspace: workspace,
             model: model,
             effort: effort,
+            permissionProfile: ticket.permissionProfile,
             deadline: deadline
         )
         var recordPath: String?
@@ -2896,7 +2916,7 @@ struct OS1Main {
             let arguments = Array(CommandLine.arguments.dropFirst())
             guard let command = arguments.first else { usage(); return }
             switch command {
-            case "version", "--version", "-V": print("OS-1 Runtime 0.9.0")
+            case "version", "--version", "-V": print("OS-1 Runtime 0.9.1")
             case "doctor": try doctor()
             case "self-test": try selfTest()
             case "register":
