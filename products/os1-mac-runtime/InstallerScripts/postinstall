@@ -9,4 +9,32 @@ if [[ -d "$legacy_core" && ! -L "$legacy_core" ]]; then
   /usr/bin/find -x "$legacy_core" -depth -delete
 fi
 
+# Keep the command-line entry point deterministic on clean and upgraded Macs.
+# The signed runtime is also embedded in the fixed application bundle, so copy
+# that exact product-owned binary into /usr/local/bin after Installer has laid
+# down the payload. This avoids relying on package component relocation rules
+# for a non-bundle executable.
+target_root="${3:-/}"
+case "$target_root" in
+  /*) ;;
+  *) echo "Refusing non-absolute installer target: $target_root" >&2; exit 1 ;;
+esac
+case "$target_root" in
+  *"/../"*|*/..) echo "Refusing traversing installer target: $target_root" >&2; exit 1 ;;
+esac
+
+root_prefix="${target_root%/}"
+bundled_runtime="$root_prefix/Applications/Open OS-1 Codex.app/Contents/Resources/os1"
+runtime_dir="$root_prefix/usr/local/bin"
+installed_runtime="$runtime_dir/os1"
+
+if [[ ! -x "$bundled_runtime" ]]; then
+  echo "OS-1 bundled runtime is missing after payload installation." >&2
+  exit 1
+fi
+
+/usr/bin/install -d -o root -g wheel -m 0755 "$runtime_dir"
+/usr/bin/install -o root -g wheel -m 0755 "$bundled_runtime" "$installed_runtime"
+/usr/bin/codesign --verify --strict "$installed_runtime"
+
 exit 0
