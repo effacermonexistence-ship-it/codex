@@ -131,18 +131,21 @@ jobs:
         run: |
           set -euo pipefail
           products/os1-mac-runtime/scripts/make-beta-bundle.sh
+          release_version="$(plutil -extract version raw -o - products/os1-mac-runtime/release/latest.json)"
+          [[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          beta_name="OS-1-${release_version}-macOS-beta"
           beta_test_dir="$(mktemp -d /tmp/os1-beta-ci.XXXXXX)"
           ditto -x -k \
-            products/os1-mac-runtime/release/OS-1-0.9.0-macOS-beta.zip \
+            "products/os1-mac-runtime/release/${beta_name}.zip" \
             "$beta_test_dir"
           OS1_VERIFY_ONLY=1 \
           OS1_SKIP_PREREQUISITES=1 \
           OS1_SKIP_LOGIN=1 \
-            bash "$beta_test_dir/OS-1-0.9.0-macOS-beta/Install OS-1 Beta.command"
+            bash "$beta_test_dir/${beta_name}/Install OS-1 Beta.command"
           (cd products/os1-mac-runtime/release && \
-            shasum -a 256 -c OS-1-0.9.0-macOS-beta.zip.sha256)
+            shasum -a 256 -c "${beta_name}.zip.sha256")
           sudo installer \
-            -pkg "$beta_test_dir/OS-1-0.9.0-macOS-beta/OS-1.pkg" \
+            -pkg "$beta_test_dir/${beta_name}/OS-1.pkg" \
             -target /
           test -x /usr/local/bin/os1
           test -x "/Applications/Open OS-1 Codex.app/Contents/MacOS/OS1App"
@@ -155,12 +158,13 @@ jobs:
         run: |
           set -euo pipefail
           cp products/os1-mac-runtime/release/latest.json /tmp/os1-invalid-beta-manifest.json
-          plutil -replace version -string 0.9.1 /tmp/os1-invalid-beta-manifest.json
-          plutil -replace object_key -string os1/releases/0.9.1/OS-1-0.9.1.pkg \
+          release_version="$(plutil -extract version raw -o - products/os1-mac-runtime/release/latest.json)"
+          plutil -replace version -string 0.0.0 /tmp/os1-invalid-beta-manifest.json
+          plutil -replace object_key -string os1/releases/0.0.0/OS-1-0.0.0.pkg \
             /tmp/os1-invalid-beta-manifest.json
           set +e
           OS1_ALLOW_UNNOTARIZED_BETA=1 \
-          OS1_BETA_PACKAGE_PATH="$PWD/products/os1-mac-runtime/release/OS-1-0.9.0.pkg" \
+          OS1_BETA_PACKAGE_PATH="$PWD/products/os1-mac-runtime/release/OS-1-${release_version}.pkg" \
           OS1_BETA_MANIFEST_PATH=/tmp/os1-invalid-beta-manifest.json \
           OS1_VERIFY_ONLY=1 \
           OS1_SKIP_PREREQUISITES=1 \
@@ -176,9 +180,10 @@ jobs:
       - name: Reject an allowlist violation even with a matching manifest
         run: |
           set -euo pipefail
+          release_version="$(plutil -extract version raw -o - products/os1-mac-runtime/release/latest.json)"
           tamper_root="$(mktemp -d /tmp/os1-beta-tamper.XXXXXX)"
           pkgutil --expand-full \
-            products/os1-mac-runtime/release/OS-1-0.9.0.pkg \
+            "products/os1-mac-runtime/release/OS-1-${release_version}.pkg" \
             "$tamper_root/expanded"
           touch "$tamper_root/expanded/OS-1-component.pkg/Payload/unexpected-client-secret.txt"
           pkgutil --flatten "$tamper_root/expanded" "$tamper_root/tampered.pkg"
