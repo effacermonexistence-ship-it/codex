@@ -72,7 +72,7 @@ jobs:
         run: pnpm --dir "products/${{ matrix.worker }}" check
 
       - name: Run adversarial contract tests
-        if: matrix.worker == 'os1-route-core' || matrix.worker == 'os1-private-route-core'
+        if: matrix.worker == 'os1-route-core' || matrix.worker == 'os1-private-route-core' || matrix.worker == 'os1-result-evaluator'
         run: pnpm --dir "products/${{ matrix.worker }}" test
 
       - name: Build Cloudflare dry-run bundle
@@ -107,9 +107,97 @@ jobs:
         run: |
           bash -n products/os1-mac-runtime/scripts/build-release.sh
           bash -n products/os1-mac-runtime/scripts/install-os1.sh
+          bash -n products/os1-mac-runtime/scripts/install-local-beta.command
+          bash -n products/os1-mac-runtime/scripts/make-beta-bundle.sh
+          bash -n products/os1-mac-runtime/scripts/archive-private-release.sh
+          bash -n products/os1-mac-runtime/InstallerScripts/postinstall
 
       - name: Test Claude EXO hook safeguards
         run: swift run --package-path products/os1-mac-runtime os1-hook-tests
 
-      - name: Build, sign, package, and scan universal release
+      - name: Assert Apple distribution credentials are mandatory
+        run: |
+          if OS1_RELEASE_MODE=distribution products/os1-mac-runtime/scripts/build-release.sh; then
+            echo "Distribution build unexpectedly accepted missing Apple credentials." >&2
+            exit 1
+          fi
+
+      - name: Build, package, unpack, and scan universal public release
+        env:
+          OS1_RELEASE_MODE: development
         run: products/os1-mac-runtime/scripts/build-release.sh
+
+      - name: Build and verify explicit unnotarized beta bundle
+        run: |
+          set -euo pipefail
+          products/os1-mac-runtime/scripts/make-beta-bundle.sh
+          beta_test_dir="$(mktemp -d /tmp/os1-beta-ci.XXXXXX)"
+          ditto -x -k \
+            products/os1-mac-runtime/release/OS-1-0.9.0-macOS-beta.zip \
+            "$beta_test_dir"
+          OS1_VERIFY_ONLY=1 \
+          OS1_SKIP_PREREQUISITES=1 \
+          OS1_SKIP_LOGIN=1 \
+            bash "$beta_test_dir/OS-1-0.9.0-macOS-beta/Install OS-1 Beta.command"
+          (cd products/os1-mac-runtime/release && \
+            shasum -a 256 -c OS-1-0.9.0-macOS-beta.zip.sha256)
+          sudo installer \
+            -pkg "$beta_test_dir/OS-1-0.9.0-macOS-beta/OS-1.pkg" \
+            -target /
+          test -x /usr/local/bin/os1
+          test -x "/Applications/Open OS-1 Codex.app/Contents/MacOS/OS1App"
+          codesign --verify --strict /usr/local/bin/os1
+          codesign --verify --deep --strict "/Applications/Open OS-1 Codex.app"
+          /usr/local/bin/os1 self-test
+          "/Applications/Open OS-1 Codex.app/Contents/MacOS/OS1App" --self-test
+
+      - name: Reject a beta manifest that disagrees with the package
+        run: |
+          set -euo pipefail
+          cp products/os1-mac-runtime/release/latest.json /tmp/os1-invalid-beta-manifest.json
+          plutil -replace version -string 0.9.1 /tmp/os1-invalid-beta-manifest.json
+          plutil -replace object_key -string os1/releases/0.9.1/OS-1-0.9.1.pkg \
+            /tmp/os1-invalid-beta-manifest.json
+          set +e
+          OS1_ALLOW_UNNOTARIZED_BETA=1 \
+          OS1_BETA_PACKAGE_PATH="$PWD/products/os1-mac-runtime/release/OS-1-0.9.0.pkg" \
+          OS1_BETA_MANIFEST_PATH=/tmp/os1-invalid-beta-manifest.json \
+          OS1_VERIFY_ONLY=1 \
+          OS1_SKIP_PREREQUISITES=1 \
+          OS1_SKIP_LOGIN=1 \
+            products/os1-mac-runtime/scripts/install-os1.sh
+          invalid_status=$?
+          set -e
+          if [[ "$invalid_status" == "0" ]]; then
+            echo "Mismatched beta manifest unexpectedly passed verification." >&2
+            exit 1
+          fi
+
+      - name: Reject an allowlist violation even with a matching manifest
+        run: |
+          set -euo pipefail
+          tamper_root="$(mktemp -d /tmp/os1-beta-tamper.XXXXXX)"
+          pkgutil --expand-full \
+            products/os1-mac-runtime/release/OS-1-0.9.0.pkg \
+            "$tamper_root/expanded"
+          touch "$tamper_root/expanded/OS-1-component.pkg/Payload/unexpected-client-secret.txt"
+          pkgutil --flatten "$tamper_root/expanded" "$tamper_root/tampered.pkg"
+          cp products/os1-mac-runtime/release/latest.json "$tamper_root/tampered.json"
+          tampered_sha="$(shasum -a 256 "$tamper_root/tampered.pkg" | awk '{print $1}')"
+          tampered_size="$(stat -f '%z' "$tamper_root/tampered.pkg")"
+          plutil -replace sha256 -string "$tampered_sha" "$tamper_root/tampered.json"
+          plutil -replace size -integer "$tampered_size" "$tamper_root/tampered.json"
+          set +e
+          OS1_ALLOW_UNNOTARIZED_BETA=1 \
+          OS1_BETA_PACKAGE_PATH="$tamper_root/tampered.pkg" \
+          OS1_BETA_MANIFEST_PATH="$tamper_root/tampered.json" \
+          OS1_VERIFY_ONLY=1 \
+          OS1_SKIP_PREREQUISITES=1 \
+          OS1_SKIP_LOGIN=1 \
+            products/os1-mac-runtime/scripts/install-os1.sh
+          tampered_status=$?
+          set -e
+          if [[ "$tampered_status" == "0" ]]; then
+            echo "Tampered beta payload unexpectedly passed verification." >&2
+            exit 1
+          fi

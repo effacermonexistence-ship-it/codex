@@ -2,11 +2,13 @@
 
 ## Status
 
-**FUNCTIONAL RELEASE CANDIDATE — deployed end to end; Developer ID signing and Apple notarization remain pending.**
+**SERVER CORE DEPLOYED; UNSIGNED 0.9.0 MAC BETA VERIFIED — Apple distribution signing remains pending.**
 
-This branch implements and deploys the public gateway, four private services,
+This branch implements the public gateway, five private services,
 private R2 result storage, universal Mac Runtime, GUI application, package
-builder, public release download, and one-command installer. It does not claim
+builder, public release download, and one-command installer. The source-locked
+RCC v26 Python Worker, evaluator, private route core, and gateway are deployed;
+the unsigned 0.9.0 package is for explicit local beta use only. It does not claim
 that OS-1 is unhackable or that black-box behavioral extraction is eliminated.
 
 ## Implemented architecture
@@ -18,7 +20,8 @@ Universal Mac Runtime (Apple Silicon + Intel)
 OS-1 Route Gateway (this package)
   ├── AUTH_SERVICE              identity + device binding
   ├── DEVICE_REGISTRY           registered P-256 public key
-  ├── PRIVATE_ROUTE_CORE        SHA-pinned RCC/REVAS decision service
+  ├── PRIVATE_ROUTE_CORE        SHA-pinned orchestration and route state
+  │     ├── RCC_V26             source-locked Python route/verify service
   │     ├── private policy R2   immutable bundle in omar-active-vault
   │     └── RESULT_EVALUATOR    independent artifact verification
   └── EXECUTIONS Durable Object nonce/sequence/result state
@@ -28,7 +31,8 @@ Production resources:
 
 - gateway: `os1-route-gateway`;
 - internal Workers: `os1-auth-service`, `os1-device-registry`,
-  `os1-private-route-core`, and `os1-result-evaluator`;
+  `os1-private-route-core`, `os1-result-evaluator`, and
+  `os1-rcc-v26-private`;
 - private policy bundles: `omar-active-vault`;
 - private artifacts: `os1-private-results`;
 - public signed-hash release objects: `os1-public-releases`.
@@ -56,10 +60,10 @@ or failed marker.
 2. Verify the authenticated device and its P-256 result signature.
 3. Atomically claim the ticket nonce and sequence in a per-execution Durable
    Object.
-4. Ask `PRIVATE_ROUTE_CORE` to resolve the stored route and send its private,
-   version-pinned REVAS contract to `RESULT_EVALUATOR` over a service binding.
+4. Ask `PRIVATE_ROUTE_CORE` to resolve the stored route and send its bound
+   artifact expectations to `RESULT_EVALUATOR` over a service binding.
 5. Have the evaluator fetch the original R2 artifact and bind its hash,
-   metadata, provider, action, permission, effort, and executor-contract
+   metadata, provider, action, permission, exact model, effort, and executor-contract
    provenance to the stored route.
 6. Return only the evaluator's bounded outcome to the owning private core.
 7. Persist the next ticket or completion response before returning it. An
@@ -70,15 +74,15 @@ or failed marker.
 
 | Requirement | Implemented evidence | Remaining release blocker |
 | --- | --- | --- |
-| P1-1 delivery hygiene / T1 | Runtime delivers the user task plus a generic SHA-pinned executor contract; the gateway emits only the eight ticket fields; policy/scoring content stays server-side. | Retain packet/process-capture evidence per production release. |
+| P1-1 delivery hygiene / T1 | The public builder no longer copies a local private core and rejects legacy core filenames before and after packaging; runtime delivery remains user task plus generic SHA-pinned contract. | Retain packet/process-capture evidence per production release. |
 | P1-2 injection isolation / T4 | Codex uses a developer-instruction channel and Claude uses an appended system-prompt channel; user/session text remains untrusted data. A deployed exfiltration probe returned only the ticket schema, and a live provider probe refused disclosure. | Continue the injection corpus as policies evolve. |
 | P1-3 opaque egress / T3 | One 197-byte fixed-shape error; bounded exact JSON; eleven deployed malformed/auth cases passed. | Success response size and latency normalization remain P2 work. |
-| P1-4 result integrity / T5 | Secure Enclave P-256 signing, Ed25519 tickets, private R2 artifacts, independent evaluator, timing-safe hashes, and atomic nonce/sequence state are deployed. | A rooted owner can still fabricate client-observed output; cryptographic possession is not proof of honest execution. This is a documented structural residual risk. |
-| P1-5 build hygiene / T7 | Universal app/CLI and package build passed exact-content and Mach-O cstring entropy scanning with zero findings. CI rebuilds both architectures and repeats the gate. | Developer ID signing/notarization awaits an Apple distribution identity. |
+| P1-4 result integrity / T5 | Secure Enclave P-256 signing, Ed25519 tickets, private R2 artifacts, independent evaluator, atomic nonce/sequence state, and exact model/effort binding are deployed. | A rooted owner can still fabricate client-observed output; cryptographic possession is not proof of honest execution. This is a documented structural residual risk. |
+| P1-5 build hygiene / T7 | Universal app/CLI and package build use an explicit allowlist and scan the expanded package. CI rebuilds both architectures and repeats the gate. | Developer ID signing/notarization awaits Apple distribution identities. |
 | P2-1 device binding | Secure Enclave non-extractable P-256 key on supported Macs; Keychain fallback on older Intel hardware; immutable device registry. | Apple attestation validation, user-visible device revocation, and DPoP/mTLS. |
 | P2-2 asymmetric tickets | Deployed Ed25519 PKCS#8/SPKI split; only the raw public key is in the client config. | Rotation with overlapping public keys. |
 | P2-3 atomic result submission | Deployed SQLite Durable Objects enforce sequence, nonce, result hash, and one stored response; live E2E passed. | Add sustained concurrency/load evidence. |
-| P2-4 extraction resistance | None claimed. | Account/global budgets, distributed/Sybil detection, cost-bound identity and measured extraction-query threshold. |
+| P2-4 extraction resistance | A subject-scoped, atomic hourly execution-start budget is implemented. | Distributed/Sybil detection, cost-bound identity and a measured extraction-query threshold. |
 | P2-5 side-channel normalization | Fixed error status/body and no diagnostic headers. | Success payload bucketing and measured response-time/size normalization. |
 
 ## Automated and live evidence in this branch
@@ -100,16 +104,18 @@ CI regenerates bindings and type-checks/dry-bundles all five Workers. A macOS
 job builds both architectures, creates the application and package, validates
 code signatures and payloads, and runs the artifact scanner.
 
-The live acceptance run completed this sequence on 2026-09-01:
+The 0.9.0 live acceptance run on 2026-09-03 completed this sequence:
 
 1. generated and registered a Secure Enclave P-256 device key;
 2. received and verified an Ed25519 server ticket;
-3. exercised Codex standard/medium, Claude deep/xhigh/read-only, and
-   capacity-relieved Claude efficient/low routes;
-4. resumed the same native Codex and Claude sessions by exact session ID;
+3. exercised the server-selected local deterministic lane, Codex
+   `gpt-5.6-luna/low`, and Claude `sonnet/medium` routes;
+4. verified native Codex and Claude JSONL records while both Desktop backends
+   remained in the background;
 5. uploaded the signed artifact to private R2;
 6. completed server evaluation and atomic finalization; and
-7. downloaded the public package and matched its manifest SHA-256 exactly.
+7. rebuilt the unsigned universal package locally and matched it against its
+   generated manifest SHA-256 exactly.
 
 ## Private service contracts
 
@@ -129,17 +135,16 @@ The service must keep all RCC/REVAS material internally and return one of:
 {
   "status": "step",
   "provider": "codex",
-  "action": "agent_run",
+  "action": "cx_56terra_medium",
   "permission_profile": "workspace_write"
 }
 ```
 
-`action` is allowlisted to `agent_run`, `agent_run_efficient`, or
-`agent_run_deep`. These are execution tiers carried inside the same eight-field
-ticket, not extra rationale. The Mac runtime maps the selected tier to a
-provider-specific model and reasoning-effort profile (`low`, `medium`, or
-`xhigh`) while the private rule match, capacity ledger, weights, and decision
-reason remain server-only.
+`action` is an opaque allowlisted identifier whose public profile contains only
+the provider, model and effort needed to invoke the selected backend. Those
+three facts are observable on the owner-controlled Mac. The rule match,
+capacity ledger, weights, thresholds, verification profile, decision reason,
+future route and full graph remain only in service-bound private Workers.
 
 Reasoning, scores, candidates, policy identifiers, thresholds, prompts,
 versions, and future steps are prohibited. The gateway rejects rather than
@@ -148,11 +153,13 @@ redacts an over-broad response so a regression cannot become a silent leak.
 ### `RESULT_EVALUATOR`
 
 The evaluator is callable by the private route core, not by the public gateway.
-It receives the server-stored expected route, private REVAS policy, R2 reference
-and expected SHA-256 hash, fetches the artifact itself, and returns only a
-bounded outcome and its independently verified hash. It never accepts a client
-`success` boolean or client score as authoritative. Exhausted retries return an
-opaque failed marker; they are never labeled complete.
+It receives the server-stored expected route, R2 reference, expected SHA-256
+hash, route identity, and opaque verification profile. It fetches the artifact
+itself and calls the source-locked RCC v26 verifier over a private service
+binding. Only a bounded outcome, next-provider class, and independently
+verified hash return to the route core. It never accepts a client `success`
+boolean or client score as authoritative. Exhausted retries return an opaque
+failed marker; they are never labeled complete.
 
 ## Client artifact gate
 
@@ -175,9 +182,34 @@ commit that private policy to this repository.
 
 ## Release decision
 
-The shell installation path is functional now. Finder double-click distribution
-must not be described as production-signed until a Developer ID Installer and
-Developer ID Application identity are used and the package is notarized and
-stapled. Behavioral surrogate routing, client-output fabrication on an
-owner-controlled Mac, and decision-boundary approximation remain structural
-residual risks and must be measured and documented rather than marked resolved.
+Neither the public gateway shell path nor Finder distribution may publish the
+development package: the default installer refuses any package that fails
+Apple signature and Gatekeeper assessment. A separate offline beta bundle is
+available only through an explicit opt-in terminal command. Before invoking
+the system installer, that beta path checks the manifest SHA-256, package
+identifier/version, exact payload allowlist, executable code integrity, and
+universal architectures; it does not disable Gatekeeper globally. Distribution
+mode still requires a Developer ID Installer and Developer ID Application
+identity, then notarizes, staples, and assesses the package. Behavioral
+surrogate routing, client-output fabrication on an owner-controlled Mac, and
+decision-boundary approximation remain structural residual risks and must be
+measured and documented rather than marked resolved.
+
+Each timestamped private R2 recovery set stores the source snapshot, unsigned
+development package, explicit terminal beta ZIP, release manifest, policy
+candidate, and a hash manifest tied to the exact Git revision. The beta ZIP is
+recovery material only; archiving it does not activate a public release.
+
+After both Developer ID identities are installed in the login keychain and a
+notarytool keychain profile has been created, the release builder is invoked as:
+
+```bash
+OS1_RELEASE_MODE=distribution \
+OS1_CODESIGN_IDENTITY="Developer ID Application: …" \
+OS1_INSTALLER_IDENTITY="Developer ID Installer: …" \
+OS1_NOTARY_PROFILE="os1-notary" \
+products/os1-mac-runtime/scripts/build-release.sh
+```
+
+The build fails before staging if any value is absent. It does not print or
+archive notarization credentials.

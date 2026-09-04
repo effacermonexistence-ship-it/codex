@@ -14,7 +14,11 @@ let package = Package(
         .executableTarget(name: "OS1", dependencies: ["OS1HookSupport"]),
         .executableTarget(
             name: "OS1App",
-            linkerSettings: [.linkedLibrary("sqlite3")]
+            linkerSettings: [
+                .linkedLibrary("sqlite3"),
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("Speech"),
+            ]
         ),
         .executableTarget(
             name: "OS1HookTests",

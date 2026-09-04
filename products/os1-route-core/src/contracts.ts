@@ -1,22 +1,27 @@
 import { reject } from "./errors";
+import runtimeConfig from "../../os1-mac-runtime/Config/production.json";
 
-export const PROVIDERS = ["codex", "claude"] as const;
-export const ACTIONS = [
-  "agent_run",
-  "agent_run_efficient",
-  "agent_run_deep",
-] as const;
+export const PROVIDERS = ["local", "codex", "claude"] as const;
+export const BACKEND_PROVIDERS = ["codex", "claude"] as const;
+export const ACTIONS = Object.freeze(Object.keys(runtimeConfig.execution_profiles));
+const ACTION_PROVIDERS = runtimeConfig.execution_profiles as Record<string, { provider: string }>;
 export const PERMISSION_PROFILES = [
   "read_only",
   "workspace_write",
-  "full_access",
 ] as const;
 
 export type Provider = (typeof PROVIDERS)[number];
-export type Action = (typeof ACTIONS)[number];
+export type BackendProvider = (typeof BACKEND_PROVIDERS)[number];
+export type Action = string;
 export type PermissionProfile = (typeof PERMISSION_PROFILES)[number];
-export type ProviderPreference = "auto" | Provider;
+export type ProviderPreference = "auto" | BackendProvider;
 export type CapacityPlan = { codex: number; claude: number };
+export type CodexModelCapability = {
+  slug: string;
+  default_effort: string;
+  supported_efforts: string[];
+  priority: number;
+};
 
 export type TicketUnsigned = {
   execution_id: string;
@@ -148,15 +153,18 @@ export function parseStartRequest(value: unknown): {
   capacity_plan: CapacityPlan;
   executor_contract_version: string;
   executor_contract_sha256: string;
+  available_codex_models: CodexModelCapability[];
 } {
   const capacityAware = isRecord(value) && hasExactKeys(value, [
     "capacity_plan",
+    "available_codex_models",
     "executor_contract_sha256",
     "executor_contract_version",
     "provider_preference",
     "task",
   ]);
   const capacity = isRecord(value) ? value.capacity_plan : undefined;
+  const availableModels = isRecord(value) ? value.available_codex_models : undefined;
   const validCapacity = isRecord(capacity) &&
     hasExactKeys(capacity, ["claude", "codex"]) &&
     Number.isSafeInteger(capacity.codex) &&
@@ -166,14 +174,30 @@ export function parseStartRequest(value: unknown): {
     (capacity.claude as number) >= 0 &&
     (capacity.claude as number) <= 100 &&
     (capacity.codex as number) + (capacity.claude as number) > 0;
+  const validModels = Array.isArray(availableModels) && availableModels.length >= 1 &&
+    availableModels.length <= 32 && new Set(availableModels.map((candidate) =>
+      isRecord(candidate) ? candidate.slug : undefined)).size === availableModels.length &&
+    availableModels.every((candidate) => isRecord(candidate) &&
+      hasExactKeys(candidate, ["default_effort", "priority", "slug", "supported_efforts"]) &&
+      boundedString(candidate.slug, 1, 128, /^[A-Za-z0-9][A-Za-z0-9._:-]*$/) &&
+      boundedString(candidate.default_effort, 3, 8) &&
+      ["low", "medium", "high", "xhigh", "max", "ultra"].includes(candidate.default_effort) &&
+      Array.isArray(candidate.supported_efforts) && candidate.supported_efforts.length >= 1 &&
+      candidate.supported_efforts.length <= 6 &&
+      new Set(candidate.supported_efforts).size === candidate.supported_efforts.length &&
+      candidate.supported_efforts.every((effort) => typeof effort === "string" &&
+        ["low", "medium", "high", "xhigh", "max", "ultra"].includes(effort)) &&
+      candidate.supported_efforts.includes(candidate.default_effort) &&
+      Number.isSafeInteger(candidate.priority) && (candidate.priority as number) >= 0 &&
+      (candidate.priority as number) <= 10_000);
   if (
     !isRecord(value) ||
     !capacityAware ||
     !boundedString(value.task, 1, 48_000) ||
-    !oneOf(value.provider_preference, ["auto", ...PROVIDERS] as const) ||
+    !oneOf(value.provider_preference, ["auto", ...BACKEND_PROVIDERS] as const) ||
     !boundedString(value.executor_contract_version, 8, 96, /^[A-Za-z0-9._-]+$/) ||
     !boundedString(value.executor_contract_sha256, 64, 64, SHA256) ||
-    !validCapacity
+    !validCapacity || !validModels
   ) {
     reject();
   }
@@ -186,6 +210,7 @@ export function parseStartRequest(value: unknown): {
     },
     executor_contract_version: value.executor_contract_version,
     executor_contract_sha256: value.executor_contract_sha256,
+    available_codex_models: availableModels as CodexModelCapability[],
   };
 }
 
@@ -207,7 +232,7 @@ export function parseTicket(value: unknown): Ticket {
     !Number.isSafeInteger(value.sequence) ||
     (value.sequence as number) < 1 ||
     !oneOf(value.provider, PROVIDERS) ||
-    !oneOf(value.action, ACTIONS) ||
+    !oneOf(value.action, ACTIONS) || ACTION_PROVIDERS[value.action]?.provider !== value.provider ||
     !oneOf(value.permission_profile, PERMISSION_PROFILES) ||
     !boundedString(value.expires_at, 20, 32) ||
     !Number.isFinite(Date.parse(value.expires_at)) ||
@@ -364,7 +389,7 @@ export function parsePrivateDecision(value: unknown): PrivateDecision {
       "permission_profile",
     ]) ||
     !oneOf(value.provider, PROVIDERS) ||
-    !oneOf(value.action, ACTIONS) ||
+    !oneOf(value.action, ACTIONS) || ACTION_PROVIDERS[value.action]?.provider !== value.provider ||
     !oneOf(value.permission_profile, PERMISSION_PROFILES)
   ) {
     reject();

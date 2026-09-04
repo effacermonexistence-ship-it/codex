@@ -1,6 +1,8 @@
 import AppKit
+@preconcurrency import AVFoundation
 import Foundation
 import SQLite3
+@preconcurrency import Speech
 import SwiftUI
 
 private enum ProviderChoice: String, CaseIterable, Codable, Identifiable, Sendable {
@@ -76,6 +78,10 @@ private func explicitlyRequestedProvider(in request: String) -> ProviderChoice? 
     }
 }
 
+private func providerDisplayName(_ provider: String?) -> String {
+    provider == "local" ? "OS-1" : (provider ?? "OS-1").uppercased()
+}
+
 private func providerIntentSelfTest() throws {
     let codexRequests = [
         "코덱스한테 말시켜봐",
@@ -103,6 +109,654 @@ private func providerIntentSelfTest() throws {
             ? [] : ["last directed provider"])
     guard failures.isEmpty else {
         throw RunnerError.message("OS-1 provider intent self-test failed: \(failures.joined(separator: " | "))")
+    }
+
+    guard providerDisplayName("local") == "OS-1",
+          providerDisplayName("codex") == "CODEX" else {
+        throw RunnerError.message("OS-1 provider display-name self-test failed.")
+    }
+
+    guard composerReturnAction(shiftPressed: false) == .send,
+          composerReturnAction(shiftPressed: true) == .newline else {
+        throw RunnerError.message("OS-1 composer keyboard self-test failed.")
+    }
+
+    var queue = ["first", "second", "third"]
+    let drained = [queue.removeFirst(), queue.removeFirst(), queue.removeFirst()]
+    guard drained == ["first", "second", "third"], queue.isEmpty else {
+        throw RunnerError.message("OS-1 queued submission FIFO self-test failed.")
+    }
+
+    guard composerText(base: "", dictated: "안녕하세요") == "안녕하세요",
+          composerText(base: "기존 작업", dictated: "계속해") == "기존 작업 계속해",
+          composerText(base: "first line\n", dictated: "둘째 줄") == "first line\n둘째 줄",
+          dictationText(committed: "첫 문장.", current: "둘째 문장") == "첫 문장. 둘째 문장",
+          composerText(
+            base: "이미 적은 내용",
+            dictated: dictationText(committed: "첫 구간", current: "둘째 구간")
+          ) == "이미 적은 내용 첫 구간 둘째 구간" else {
+        throw RunnerError.message("OS-1 voice dictation composer merge self-test failed.")
+    }
+
+    let localStep = AppRunStep(
+        sequence: 1,
+        provider: "local",
+        action: "deterministic_compute",
+        model: "local-deterministic",
+        effort: "none",
+        revasDisposition: "adopted",
+        sessionID: "8eaa48c6-af59-4f4c-a2be-9a0ec3b6fc21",
+        permissionProfile: "read_only",
+        exitCode: 0,
+        output: "2",
+        stderr: "",
+        durationMS: 1,
+        nativeRecord: AppNativeRecord(
+            turnID: "rcc-local-8eaa48c6af594f4ca2be9a0ec3b6fc21",
+            recordPath: "/tmp/exact.json",
+            persistence: "verified",
+            desktopVisibility: "local_only"
+        )
+    )
+    guard backendTierLabel(action: localStep.action, provider: localStep.provider) == "OS-1",
+          nativeRecordReceipt(localStep).contains("local exact receipt persisted") else {
+        throw RunnerError.message("OS-1 local exact execution UI self-test failed.")
+    }
+}
+
+private enum ComposerReturnAction: Equatable {
+    case send
+    case newline
+}
+
+private func composerReturnAction(shiftPressed: Bool) -> ComposerReturnAction {
+    shiftPressed ? .newline : .send
+}
+
+private func composerText(base: String, dictated transcript: String) -> String {
+    guard !transcript.isEmpty else { return base }
+    guard !base.isEmpty else { return transcript }
+    guard let last = base.last, !last.isWhitespace else { return base + transcript }
+    return base + " " + transcript
+}
+
+private func dictationText(committed: String, current: String) -> String {
+    composerText(base: committed, dictated: current)
+}
+
+private enum VoiceDictationPhase: Equatable {
+    case idle
+    case authorizing
+    case listening
+    case finalizing
+    case transcribing
+}
+
+private struct LocalWhisperConfiguration: Sendable {
+    let executableURL: URL
+    let modelID: String
+}
+
+private struct LocalWhisperResult: Decodable {
+    let text: String
+}
+
+/// AVAudioEngine calls its tap on a realtime queue. This explicitly Sendable
+/// bridge owns either the live Speech request or the local recording file and
+/// prevents the controller's MainActor isolation from leaking into that queue.
+private final class SpeechAudioBufferSink: @unchecked Sendable {
+    private let request: SFSpeechAudioBufferRecognitionRequest?
+    private let audioFile: AVAudioFile?
+    private let onLevel: @Sendable (CGFloat) -> Void
+    private var lastLevelUpdate = Date.distantPast
+
+    init(
+        request: SFSpeechAudioBufferRecognitionRequest? = nil,
+        audioFile: AVAudioFile? = nil,
+        onLevel: @escaping @Sendable (CGFloat) -> Void
+    ) {
+        self.request = request
+        self.audioFile = audioFile
+        self.onLevel = onLevel
+    }
+
+    nonisolated func append(_ buffer: AVAudioPCMBuffer) {
+        request?.append(buffer)
+        try? audioFile?.write(from: buffer)
+        guard Date().timeIntervalSince(lastLevelUpdate) >= 0.075,
+              let samples = buffer.floatChannelData?[0] else { return }
+        lastLevelUpdate = Date()
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return }
+        var sum: Float = 0
+        for index in 0..<frameCount {
+            let sample = samples[index]
+            sum += sample * sample
+        }
+        let rms = sqrt(sum / Float(frameCount))
+        let decibels = 20 * log10(max(rms, 0.000_01))
+        let normalized = CGFloat(max(0, min(1, (decibels + 52) / 52)))
+        onLevel(normalized)
+    }
+}
+
+@MainActor
+private final class VoiceDictationController: ObservableObject {
+    @Published private(set) var phase: VoiceDictationPhase = .idle
+    @Published private(set) var level: CGFloat = 0
+    @Published private(set) var elapsedSeconds = 0
+
+    private let audioEngine = AVAudioEngine()
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var audioBufferSink: SpeechAudioBufferSink?
+    private var elapsedTimer: Timer?
+    private var finishTimeoutTask: Task<Void, Never>?
+    private var restartTask: Task<Void, Never>?
+    private var localTranscriptionTask: Task<Void, Never>?
+    private var localWhisper: LocalWhisperConfiguration?
+    private var localRecordingURL: URL?
+    private var baseText = ""
+    private var committedTranscript = ""
+    private var currentTranscript = ""
+    private var onTranscript: ((String) -> Void)?
+    private var onFailure: ((String) -> Void)?
+    private var onFinish: (() -> Void)?
+    private var tapInstalled = false
+    private var wantsRecording = false
+    private var recognitionGeneration = 0
+    private var consecutiveRecoveryCount = 0
+
+    var isActive: Bool { phase != .idle }
+    var isRecording: Bool { phase == .listening }
+    var isAuthorizing: Bool { phase == .authorizing }
+    var isFinalizing: Bool { phase == .finalizing || phase == .transcribing }
+    var engineLabel: String { localWhisper == nil ? "Apple speech" : "Local Whisper" }
+    var statusLabel: String {
+        switch phase {
+        case .idle: return "Voice"
+        case .authorizing: return "Starting…"
+        case .listening: return "Listening"
+        case .finalizing: return "Finishing…"
+        case .transcribing: return "Transcribing…"
+        }
+    }
+    var elapsedLabel: String {
+        String(format: "%d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
+    }
+
+    func toggle(
+        initialText: String,
+        onTranscript: @escaping (String) -> Void,
+        onFailure: @escaping (String) -> Void
+    ) {
+        if isActive {
+            finish()
+            return
+        }
+        baseText = initialText
+        committedTranscript = ""
+        currentTranscript = ""
+        localWhisper = localWhisperConfiguration()
+        localRecordingURL = nil
+        self.onTranscript = onTranscript
+        self.onFailure = onFailure
+        self.onFinish = nil
+        wantsRecording = true
+        phase = .authorizing
+        elapsedSeconds = 0
+        startElapsedTimer()
+        Task { await authorizeAndStart() }
+    }
+
+    /// Finish keeps the recognition task alive briefly so the final spoken
+    /// words reach the composer. This is deliberately different from cancel.
+    func finish(onComplete: (() -> Void)? = nil) {
+        if let onComplete { onFinish = onComplete }
+        guard isActive, !isFinalizing else { return }
+        wantsRecording = false
+        if let configuration = localWhisper, let recordingURL = localRecordingURL {
+            phase = .transcribing
+            stopAudioCapture()
+            transcribeLocally(configuration: configuration, recordingURL: recordingURL)
+            return
+        }
+        phase = .finalizing
+        stopAudioCapture()
+        let generation = recognitionGeneration
+        finishTimeoutTask?.cancel()
+        finishTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard !Task.isCancelled, let self,
+                  self.phase == .finalizing,
+                  self.recognitionGeneration == generation else { return }
+            self.completeFinalization()
+        }
+    }
+
+    /// Cancel is lossless: it restores the exact text that existed before the
+    /// microphone was started.
+    func cancel() {
+        guard isActive else { return }
+        let restore = baseText
+        let transcriptHandler = onTranscript
+        resetRecognition(cancelTask: true)
+        phase = .idle
+        level = 0
+        elapsedSeconds = 0
+        transcriptHandler?(restore)
+        clearCallbacks()
+    }
+
+    /// Session changes and view teardown use cancellation so a late Speech
+    /// callback can never write into a different composer.
+    func stop() {
+        cancel()
+    }
+
+    private func stopAudioCapture() {
+        if audioEngine.isRunning { audioEngine.stop() }
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        recognitionRequest?.endAudio()
+        audioBufferSink = nil
+    }
+
+    private func resetRecognition(cancelTask: Bool) {
+        wantsRecording = false
+        recognitionGeneration += 1
+        restartTask?.cancel()
+        restartTask = nil
+        finishTimeoutTask?.cancel()
+        finishTimeoutTask = nil
+        localTranscriptionTask?.cancel()
+        localTranscriptionTask = nil
+        stopAudioCapture()
+        if cancelTask { recognitionTask?.cancel() }
+        recognitionTask = nil
+        recognitionRequest = nil
+        audioBufferSink = nil
+        elapsedTimer?.invalidate()
+        elapsedTimer = nil
+        removeLocalRecording()
+    }
+
+    private func authorizeAndStart() async {
+        let microphoneGranted: Bool
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .notDetermined:
+            microphoneGranted = await AVCaptureDevice.requestAccess(for: .audio)
+        case .authorized:
+            microphoneGranted = true
+        default:
+            microphoneGranted = false
+        }
+        guard phase == .authorizing, wantsRecording else { return }
+        guard microphoneGranted else {
+            fail("Microphone access is off. Allow Open OS-1 Codex in System Settings → Privacy & Security → Microphone.")
+            return
+        }
+
+        if let configuration = localWhisper ?? localWhisperConfiguration() {
+            do {
+                localWhisper = configuration
+                try startLocalWhisperCapture()
+                return
+            } catch {
+                localWhisper = nil
+                removeLocalRecording()
+            }
+        }
+
+        let speechStatus: SFSpeechRecognizerAuthorizationStatus
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .notDetermined:
+            speechStatus = await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { status in
+                    continuation.resume(returning: status)
+                }
+            }
+        case let existing:
+            speechStatus = existing
+        }
+        guard phase == .authorizing, wantsRecording else { return }
+        guard speechStatus == .authorized else {
+            fail("Local Whisper is unavailable and Speech Recognition access is off. Install Handy or allow Open OS-1 Codex in System Settings → Privacy & Security → Speech Recognition.")
+            return
+        }
+
+        do {
+            try startRecognition()
+        } catch {
+            fail("Voice input could not start: \(error.localizedDescription)")
+        }
+    }
+
+    private func localWhisperConfiguration() -> LocalWhisperConfiguration? {
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser
+        let executableCandidates = [
+            URL(fileURLWithPath: "/Applications/Handy.app/Contents/MacOS/handy"),
+            home.appendingPathComponent("Applications/Handy.app/Contents/MacOS/handy"),
+        ]
+        guard let executableURL = executableCandidates.first(where: {
+            fileManager.isExecutableFile(atPath: $0.path)
+        }) else { return nil }
+
+        let support = home.appendingPathComponent("Library/Application Support/com.pais.handy")
+        let settingsURL = support.appendingPathComponent("settings_store.json")
+        guard let data = try? Data(contentsOf: settingsURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let settings = root["settings"] as? [String: Any],
+              let modelID = settings["selected_model"] as? String,
+              !modelID.isEmpty else { return nil }
+        let modelURL = support.appendingPathComponent("models").appendingPathComponent(
+            URL(fileURLWithPath: modelID).lastPathComponent
+        )
+        guard fileManager.fileExists(atPath: modelURL.path) else { return nil }
+        return LocalWhisperConfiguration(executableURL: executableURL, modelID: modelID)
+    }
+
+    private func startLocalWhisperCapture() throws {
+        let inputNode = audioEngine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw RunnerError.message("No microphone audio format is available.")
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("os1-dictation-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let recordingURL = directory.appendingPathComponent("recording.caf")
+        let audioFile = try AVAudioFile(forWriting: recordingURL, settings: format.settings)
+        localRecordingURL = recordingURL
+        let bufferSink = SpeechAudioBufferSink(audioFile: audioFile) { @Sendable [weak self] value in
+            Task { @MainActor [weak self] in
+                guard let self, self.phase == .listening else { return }
+                self.level = max(value, self.level * 0.62)
+            }
+        }
+        audioBufferSink = bufferSink
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: 1_024,
+            format: format,
+            block: { @Sendable [bufferSink] buffer, _ in
+                bufferSink.append(buffer)
+            }
+        )
+        tapInstalled = true
+        audioEngine.prepare()
+        try audioEngine.start()
+        phase = .listening
+        recognitionGeneration += 1
+    }
+
+    private func startRecognition() throws {
+        let locale = preferredDictationLocale()
+        guard let recognizer = SFSpeechRecognizer(locale: locale),
+              recognizer.isAvailable else {
+            throw RunnerError.message("Speech recognition is not available on this Mac right now.")
+        }
+
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.taskHint = .dictation
+        request.contextualStrings = [
+            "OS-1", "OmarAGI", "Codex", "Claude Code", "RCC", "REVAS",
+            "Luna", "Terra", "Sol", "GitHub", "Cloudflare", "레바스", "코덱스", "클로드"
+        ]
+        if #available(macOS 13.0, *) {
+            request.addsPunctuation = true
+        }
+        recognitionRequest = request
+        let bufferSink = SpeechAudioBufferSink(request: request) { @Sendable [weak self] value in
+            Task { @MainActor [weak self] in
+                guard let self, self.phase == .listening else { return }
+                self.level = max(value, self.level * 0.62)
+            }
+        }
+        audioBufferSink = bufferSink
+
+        let inputNode = audioEngine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw RunnerError.message("No microphone audio format is available.")
+        }
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: 1_024,
+            format: format,
+            block: { @Sendable [bufferSink] buffer, _ in
+                bufferSink.append(buffer)
+            }
+        )
+        tapInstalled = true
+        audioEngine.prepare()
+        try audioEngine.start()
+        phase = .listening
+
+        recognitionGeneration += 1
+        let generation = recognitionGeneration
+        recognitionTask = recognizer.recognitionTask(with: request) { @Sendable [weak self] result, error in
+            let transcript = result?.bestTranscription.formattedString
+            let isFinal = result?.isFinal ?? false
+            let errorMessage = error?.localizedDescription
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.phase != .idle,
+                      self.recognitionGeneration == generation else { return }
+                if let transcript, !transcript.isEmpty {
+                    self.currentTranscript = transcript
+                    self.consecutiveRecoveryCount = 0
+                    self.publishTranscript()
+                }
+                if isFinal {
+                    self.commitCurrentSegment()
+                    if self.wantsRecording {
+                        self.restartAfterFinalResult()
+                    } else {
+                        self.completeFinalization()
+                    }
+                } else if let errorMessage {
+                    if self.wantsRecording, self.consecutiveRecoveryCount < 3 {
+                        self.consecutiveRecoveryCount += 1
+                        self.commitCurrentSegment()
+                        self.restartAfterFinalResult(delayNanoseconds: 220_000_000)
+                    } else if self.phase == .finalizing {
+                        self.completeFinalization()
+                    } else {
+                        self.fail("Voice input stopped: \(errorMessage)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Speech may finalize a segment after a pause. Keep the microphone UI and
+    /// user intent active while transparently rolling into a fresh segment.
+    private func restartAfterFinalResult(delayNanoseconds: UInt64 = 120_000_000) {
+        guard wantsRecording else { return }
+        recognitionGeneration += 1
+        stopAudioCapture()
+        recognitionTask = nil
+        recognitionRequest = nil
+        phase = .listening
+        restartTask?.cancel()
+        restartTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard !Task.isCancelled, let self, self.wantsRecording else { return }
+            do {
+                try self.startRecognition()
+            } catch {
+                self.fail("Voice input could not continue: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func transcribeLocally(
+        configuration: LocalWhisperConfiguration,
+        recordingURL: URL
+    ) {
+        let generation = recognitionGeneration
+        localTranscriptionTask?.cancel()
+        localTranscriptionTask = Task { [weak self] in
+            do {
+                let transcript = try await Task.detached(priority: .userInitiated) {
+                    try Self.performLocalWhisperTranscription(
+                        configuration: configuration,
+                        recordingURL: recordingURL
+                    )
+                }.value
+                guard !Task.isCancelled, let self,
+                      self.phase == .transcribing,
+                      self.recognitionGeneration == generation else { return }
+                self.currentTranscript = transcript
+                self.publishTranscript()
+                self.completeFinalization()
+            } catch {
+                guard !Task.isCancelled, let self,
+                      self.phase == .transcribing,
+                      self.recognitionGeneration == generation else { return }
+                self.fail("Local Whisper could not transcribe this recording: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    nonisolated private static func performLocalWhisperTranscription(
+        configuration: LocalWhisperConfiguration,
+        recordingURL: URL
+    ) throws -> String {
+        let waveURL = recordingURL.deletingLastPathComponent().appendingPathComponent("recording.wav")
+        defer { try? FileManager.default.removeItem(at: recordingURL.deletingLastPathComponent()) }
+
+        _ = try runProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/afconvert"),
+            arguments: [
+                "-f", "WAVE", "-d", "LEI16@16000", "-c", "1",
+                recordingURL.path, waveURL.path,
+            ]
+        )
+        let output = try runProcess(
+            executableURL: configuration.executableURL,
+            arguments: [
+                "--transcribe-file", waveURL.path,
+                "--model", configuration.modelID,
+                "--json",
+            ]
+        )
+        let decoder = JSONDecoder()
+        let result: LocalWhisperResult
+        if let decoded = try? decoder.decode(LocalWhisperResult.self, from: output) {
+            result = decoded
+        } else if let line = String(data: output, encoding: .utf8)?
+            .split(separator: "\n")
+            .reversed()
+            .first(where: { $0.first == "{" }),
+            let data = String(line).data(using: .utf8) {
+            result = try decoder.decode(LocalWhisperResult.self, from: data)
+        } else {
+            throw RunnerError.message("Handy returned an unreadable transcription result.")
+        }
+        let transcript = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !transcript.isEmpty else {
+            throw RunnerError.message("No speech was detected.")
+        }
+        return transcript
+    }
+
+    nonisolated private static func runProcess(
+        executableURL: URL,
+        arguments: [String]
+    ) throws -> Data {
+        let process = Process()
+        let standardOutput = Pipe()
+        let standardError = Pipe()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardOutput = standardOutput
+        process.standardError = standardError
+        try process.run()
+        process.waitUntilExit()
+        let output = standardOutput.fileHandleForReading.readDataToEndOfFile()
+        let errorOutput = standardError.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else {
+            let detail = String(data: errorOutput, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw RunnerError.message(detail?.isEmpty == false ? detail! : "Voice engine exited unexpectedly.")
+        }
+        return output
+    }
+
+    private func removeLocalRecording() {
+        guard let localRecordingURL else { return }
+        try? FileManager.default.removeItem(at: localRecordingURL.deletingLastPathComponent())
+        self.localRecordingURL = nil
+    }
+
+    private func preferredDictationLocale() -> Locale {
+        let preferred = Locale.preferredLanguages
+        if let korean = preferred.first(where: { $0.lowercased().hasPrefix("ko") }) {
+            return Locale(identifier: korean)
+        }
+        return Locale.current
+    }
+
+    private func publishTranscript() {
+        let dictated = dictationText(committed: committedTranscript, current: currentTranscript)
+        onTranscript?(composerText(base: baseText, dictated: dictated))
+    }
+
+    private func commitCurrentSegment() {
+        guard !currentTranscript.isEmpty else { return }
+        committedTranscript = dictationText(committed: committedTranscript, current: currentTranscript)
+        currentTranscript = ""
+        publishTranscript()
+    }
+
+    private func completeFinalization() {
+        guard phase != .idle else { return }
+        commitCurrentSegment()
+        let completion = onFinish
+        resetRecognition(cancelTask: true)
+        phase = .idle
+        level = 0
+        clearCallbacks()
+        completion?()
+    }
+
+    private func startElapsedTimer() {
+        elapsedTimer?.invalidate()
+        elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.phase != .idle else { return }
+                self.elapsedSeconds += 1
+            }
+        }
+    }
+
+    private func clearCallbacks() {
+        onTranscript = nil
+        onFailure = nil
+        onFinish = nil
+        baseText = ""
+        committedTranscript = ""
+        currentTranscript = ""
+        localWhisper = nil
+        consecutiveRecoveryCount = 0
+    }
+
+    private func fail(_ message: String) {
+        commitCurrentSegment()
+        let failure = onFailure
+        resetRecognition(cancelTask: true)
+        phase = .idle
+        level = 0
+        clearCallbacks()
+        failure?(message)
     }
 }
 
@@ -461,6 +1115,9 @@ private struct ChatMessage: Codable, Identifiable, Sendable {
     let provider: String?
     let permissionProfile: String?
     let timestamp: Date
+    /// Receipt-only: whether the native backend record was read back after the
+    /// step. Absent on receipts written before OS-1 verified persistence.
+    let nativeRecordVerified: Bool?
 
     init(
         id: UUID = UUID(),
@@ -468,7 +1125,8 @@ private struct ChatMessage: Codable, Identifiable, Sendable {
         text: String,
         provider: String? = nil,
         permissionProfile: String? = nil,
-        timestamp: Date = Date()
+        timestamp: Date = Date(),
+        nativeRecordVerified: Bool? = nil
     ) {
         self.id = id
         self.role = role
@@ -476,6 +1134,7 @@ private struct ChatMessage: Codable, Identifiable, Sendable {
         self.provider = provider
         self.permissionProfile = permissionProfile
         self.timestamp = timestamp
+        self.nativeRecordVerified = nativeRecordVerified
     }
 }
 
@@ -527,25 +1186,103 @@ private struct SessionEnvelope: Codable {
     let sessions: [ConversationSession]
 }
 
+private struct PendingSubmission: Identifiable, Sendable {
+    let id: UUID
+    let sessionID: UUID
+    let userMessageID: UUID
+    let request: String
+    let provider: ProviderChoice
+    let workspace: String
+    let codexCapacity: Int
+    let claudeCapacity: Int
+
+    init(
+        id: UUID = UUID(),
+        sessionID: UUID,
+        userMessageID: UUID,
+        request: String,
+        provider: ProviderChoice,
+        workspace: String,
+        codexCapacity: Int,
+        claudeCapacity: Int
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.userMessageID = userMessageID
+        self.request = request
+        self.provider = provider
+        self.workspace = workspace
+        self.codexCapacity = codexCapacity
+        self.claudeCapacity = claudeCapacity
+    }
+}
+
+private struct AppNativeRecord: Decodable, Sendable {
+    let turnID: String?
+    let recordPath: String?
+    let persistence: String
+    let desktopVisibility: String
+
+    enum CodingKeys: String, CodingKey {
+        case turnID = "turn_id"
+        case recordPath = "record_path"
+        case persistence
+        case desktopVisibility = "desktop_visibility"
+    }
+
+    var isVerified: Bool { persistence == "verified" }
+}
+
 private struct AppRunStep: Decodable, Sendable {
     let sequence: Int
     let provider: String
     let action: String
+    let model: String?
     let effort: String
+    let revasDisposition: String
     let sessionID: String
     let permissionProfile: String
     let exitCode: Int32
     let output: String
     let stderr: String
     let durationMS: Int64
+    let nativeRecord: AppNativeRecord?
 
     enum CodingKeys: String, CodingKey {
-        case sequence, provider, action, effort, output, stderr
+        case sequence, provider, action, model, effort, output, stderr
+        case revasDisposition = "revas_disposition"
         case sessionID = "session_id"
         case permissionProfile = "permission_profile"
         case exitCode = "exit_code"
         case durationMS = "duration_ms"
+        case nativeRecord = "native_record"
     }
+}
+
+/// Receipt wording is derived from evidence the runtime actually gathered, so
+/// the receipt never says more than what was read back from the backend.
+private func nativeRecordReceipt(_ step: AppRunStep) -> String {
+    guard let record = step.nativeRecord else { return "native session linked (unverified)" }
+    var parts: [String] = []
+    if record.isVerified {
+        let file = record.recordPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "record"
+        parts.append("native record verified · \(file)")
+    } else {
+        parts.append("native record \(record.persistence)")
+    }
+    switch record.desktopVisibility {
+    case "local_only": parts.append("local exact receipt persisted")
+    case "revealed": parts.append("Codex Desktop: synced and opened")
+    case "claude_revealed": parts.append("Claude Desktop: synced and opened")
+    case "registered_in_background": parts.append("Codex Desktop: synced in background")
+    case "claude_registered_in_background": parts.append("Claude Desktop: synced in background")
+    case "not_revealed": parts.append("\(step.provider == "claude" ? "Claude" : "Codex") Desktop: kept in background")
+    case "desktop_not_running": parts.append("Codex Desktop: lists on launch")
+    case let value where value.hasPrefix("reveal_failed"): parts.append("Codex Desktop: open failed")
+    case let value where value.hasPrefix("claude_reveal_failed"): parts.append("Claude Desktop: sync failed")
+    default: break
+    }
+    return parts.joined(separator: " · ")
 }
 
 private struct AppRunSummary: Decodable, Sendable {
@@ -562,6 +1299,9 @@ private enum RunnerError: LocalizedError {
 }
 
 private func backendTierLabel(action: String, provider: String) -> String {
+    if provider == "local" || action == "deterministic_compute" || action == "os1_exact" {
+        return "OS-1"
+    }
     let engine = provider == "codex" ? "Codex" : "Claude"
     switch action {
     case "agent_run_efficient": return "Efficient \(engine) backend"
@@ -669,6 +1409,9 @@ private enum OS1Runner {
         arguments += [
             "--codex-capacity", String(codexCapacity),
             "--claude-capacity", String(claudeCapacity),
+            // Codex and Claude stay behind OS-1, while their native session
+            // indexes are still updated for explicit backend inspection.
+            "--desktop-reveal", "background",
         ]
 
         let process = Process()
@@ -731,9 +1474,13 @@ private final class SessionStore: ObservableObject {
     @Published var nativeMessages: [NativeSessionMessage] = []
     @Published var isLoadingNativeSessions = false
     @Published var isRunning = false
+    @Published private(set) var activeSessionID: UUID?
     @Published var pendingProvider: ProviderChoice?
+    @Published private(set) var queuedSubmissions: [PendingSubmission] = []
     @Published var statusText = "Ready"
     @Published var alertMessage: String?
+
+    let voiceDictation = VoiceDictationController()
 
     private let fileManager = FileManager.default
 
@@ -753,6 +1500,15 @@ private final class SessionStore: ObservableObject {
     var selectedSession: ConversationSession? {
         guard let index = selectedIndex else { return nil }
         return sessions[index]
+    }
+
+    var selectedSessionQueueCount: Int {
+        guard let selectedSessionID else { return 0 }
+        return queuedSubmissions.lazy.filter { $0.sessionID == selectedSessionID }.count
+    }
+
+    func isSessionRunning(_ sessionID: UUID) -> Bool {
+        isRunning && activeSessionID == sessionID
     }
 
     var filteredSessions: [ConversationSession] {
@@ -779,6 +1535,7 @@ private final class SessionStore: ObservableObject {
     }
 
     func createSession(provider: ProviderChoice? = nil) {
+        voiceDictation.stop()
         let inherited = provider ?? selectedSession?.provider ?? .auto
         let session = ConversationSession(
             workspace: fileManager.homeDirectoryForCurrentUser.path,
@@ -792,6 +1549,7 @@ private final class SessionStore: ObservableObject {
     }
 
     func select(_ id: UUID) {
+        voiceDictation.stop()
         selectedSessionID = id
         composer = ""
         statusText = "Ready"
@@ -819,15 +1577,17 @@ private final class SessionStore: ObservableObject {
     }
 
     func showClaudexHome() {
-        guard !isRunning else { return }
         surface = .auto
         chooseProvider(.auto)
-        statusText = "Claudex home · RCC auto routing"
+        statusText = isRunning
+            ? "Claudex home · a governed task is running"
+            : "Claudex home · RCC auto routing"
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func inspectBackend(_ provider: ProviderChoice) {
-        guard !isRunning, provider != .auto else { return }
+        guard provider != .auto else { return }
+        voiceDictation.stop()
         surface = provider
         nativeSearch = ""
         let preferredID = provider == .codex
@@ -873,6 +1633,42 @@ private final class SessionStore: ObservableObject {
     func refreshNativeSessions() {
         guard surface != .auto else { return }
         inspectBackend(surface)
+    }
+
+    /// The first-party `codex://threads/<id>` deep link makes Codex Desktop
+    /// read the thread through its own app-server and open it, which is the
+    /// only way a running Desktop lists a thread OS-1 persisted separately.
+    /// If Desktop keeps the writer lock, the next OS-1 turn automatically
+    /// forks the complete history and continues in a new visible thread.
+    func openInCodexDesktop() {
+        guard !isRunning, let index = selectedIndex,
+              let id = sessions[index].codexSessionID,
+              let url = URL(string: "codex://threads/\(id)") else { return }
+        NSWorkspace.shared.open(url)
+        sessions[index].messages.append(ChatMessage(
+            role: .system,
+            text: "Opened Codex session \(id) in Codex Desktop. If Desktop owns this thread, the next OS-1 turn will preserve its history in a new linked Codex session automatically."
+        ))
+        sessions[index].updatedAt = Date()
+        statusText = "Opened in Codex Desktop"
+        save()
+    }
+
+    /// Claude Code transcripts remain synchronized in OS-1 without opening
+    /// Claude Desktop. This explicit action imports and opens the linked CLI
+    /// session only when the user asks to inspect the native backend.
+    func openInClaudeDesktop() {
+        guard !isRunning, let index = selectedIndex,
+              let id = sessions[index].claudeSessionID,
+              let url = URL(string: "claude://resume?session=\(id)") else { return }
+        NSWorkspace.shared.open(url)
+        sessions[index].messages.append(ChatMessage(
+            role: .system,
+            text: "Opened Claude session \(id) in Claude Desktop. The next OS-1 Claude turn will continue in a new linked native session so Desktop remains the sole writer for the opened record."
+        ))
+        sessions[index].updatedAt = Date()
+        statusText = "Opened in Claude Desktop"
+        save()
     }
 
     func selectNativeSession(_ id: String) {
@@ -950,9 +1746,40 @@ private final class SessionStore: ObservableObject {
         composer = value
     }
 
+    func toggleVoiceDictation() {
+        voiceDictation.toggle(
+            initialText: composer,
+            onTranscript: { [weak self] value in
+                self?.composer = value
+            },
+            onFailure: { [weak self] message in
+                self?.alertMessage = message
+            }
+        )
+    }
+
+    func finishVoiceDictation() {
+        voiceDictation.finish()
+    }
+
+    @discardableResult
+    func cancelVoiceDictation() -> Bool {
+        guard voiceDictation.isActive else { return false }
+        voiceDictation.cancel()
+        return true
+    }
+
+    func stopVoiceDictation() {
+        voiceDictation.stop()
+    }
+
     func send() {
+        if voiceDictation.isActive {
+            voiceDictation.finish { [weak self] in self?.send() }
+            return
+        }
         let request = composer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !request.isEmpty, !isRunning, let index = selectedIndex else { return }
+        guard !request.isEmpty, let index = selectedIndex else { return }
         var isDirectory: ObjCBool = false
         let workspace = sessions[index].workspace
         guard fileManager.fileExists(atPath: workspace, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -960,49 +1787,90 @@ private final class SessionStore: ObservableObject {
             return
         }
 
-        let sessionID = sessions[index].id
         let configuredProvider = sessions[index].provider
         let provider = configuredProvider == .auto
             ? (explicitlyRequestedProvider(in: request) ?? .auto)
             : configuredProvider
-        let codexSessionID = sessions[index].codexSessionID
-        let claudeSessionID = sessions[index].claudeSessionID
-        let context = handoffContext(for: sessions[index], nextProvider: provider)
         if sessions[index].messages.isEmpty {
             sessions[index].title = title(for: request)
         }
-        sessions[index].messages.append(ChatMessage(role: .user, text: request))
+        let userMessage = ChatMessage(role: .user, text: request)
         sessions[index].updatedAt = Date()
         composer = ""
+
+        let submission = PendingSubmission(
+            sessionID: sessions[index].id,
+            userMessageID: userMessage.id,
+            request: request,
+            provider: provider,
+            workspace: workspace,
+            codexCapacity: sessions[index].effectiveCodexCapacity,
+            claudeCapacity: sessions[index].effectiveClaudeCapacity
+        )
+        if isRunning {
+            queuedSubmissions.append(submission)
+            statusText = "Task queued · \(queuedSubmissions.count) waiting"
+            save()
+            return
+        }
+        sessions[index].messages.append(userMessage)
+        start(submission)
+    }
+
+    private func start(_ submission: PendingSubmission) {
+        guard !isRunning,
+              let index = sessions.firstIndex(where: { $0.id == submission.sessionID }) else {
+            runNextQueuedSubmissionIfNeeded()
+            return
+        }
+        let existingUserMessage = sessions[index].messages.contains { $0.id == submission.userMessageID }
+        let context = handoffContext(
+            for: sessions[index],
+            nextProvider: submission.provider,
+            before: existingUserMessage ? submission.userMessageID : nil
+        )
+        if !existingUserMessage {
+            sessions[index].messages.append(ChatMessage(
+                id: submission.userMessageID,
+                role: .user,
+                text: submission.request
+            ))
+            sessions[index].updatedAt = Date()
+        }
+        let codexSessionID = sessions[index].codexSessionID
+        let claudeSessionID = sessions[index].claudeSessionID
         isRunning = true
-        pendingProvider = provider == .auto ? nil : provider
-        statusText = provider == .auto
+        activeSessionID = submission.sessionID
+        pendingProvider = submission.provider == .auto ? nil : submission.provider
+        statusText = submission.provider == .auto
             ? "RCC is choosing the best engine…"
-            : "\(provider.title) is working…"
+            : "\(submission.provider.title) is working…"
         save()
 
         Task {
             do {
                 let summary = try await OS1Runner.run(
-                    workspace: workspace,
-                    prompt: request,
-                    provider: provider,
+                    workspace: submission.workspace,
+                    prompt: submission.request,
+                    provider: submission.provider,
                     context: context,
                     codexSessionID: codexSessionID,
                     claudeSessionID: claudeSessionID,
-                    codexCapacity: sessions[index].effectiveCodexCapacity,
-                    claudeCapacity: sessions[index].effectiveClaudeCapacity
+                    codexCapacity: submission.codexCapacity,
+                    claudeCapacity: submission.claudeCapacity
                 )
-                guard let target = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+                guard let target = sessions.firstIndex(where: { $0.id == submission.sessionID }) else {
+                    throw RunnerError.message("The queued OS-1 session no longer exists.")
+                }
                 if summary.status != "complete" {
                     throw RunnerError.message("OS-1 did not return a completed governed run.")
                 }
-                if provider != .auto, summary.steps.isEmpty {
-                    throw RunnerError.message("OS-1 did not create or resume the requested \(provider.title) backend session.")
+                if submission.provider != .auto, summary.steps.isEmpty {
+                    throw RunnerError.message("OS-1 did not create or resume the requested \(submission.provider.title) backend session.")
                 }
-                if provider != .auto,
-                   summary.steps.contains(where: { $0.provider != provider.rawValue }) {
-                    throw RunnerError.message("OS-1 rejected a backend mismatch. The request targeted \(provider.title), but a different backend answered.")
+                if submission.provider != .auto,
+                   summary.steps.contains(where: { $0.provider != submission.provider.rawValue }) {
+                    throw RunnerError.message("OS-1 rejected a backend mismatch. The request targeted \(submission.provider.title), but a different backend answered.")
                 }
                 if summary.steps.contains(where: { UUID(uuidString: $0.sessionID) == nil }) {
                     throw RunnerError.message("OS-1 rejected an invalid native backend session link.")
@@ -1011,7 +1879,7 @@ private final class SessionStore: ObservableObject {
                     sessions[target].messages.append(ChatMessage(
                         role: .assistant,
                         text: "The governed route completed without an additional model step.",
-                        provider: provider.rawValue
+                        provider: submission.provider.rawValue
                     ))
                 }
                 for step in summary.steps {
@@ -1033,26 +1901,43 @@ private final class SessionStore: ObservableObject {
                     ))
                     sessions[target].messages.append(ChatMessage(
                         role: .receipt,
-                        text: "\(backendTierLabel(action: step.action, provider: step.provider)) · \(step.effort) reasoning · native session linked · step \(step.sequence) · \(step.durationMS / 1_000)s · exit \(step.exitCode)",
+                        text: "\(backendTierLabel(action: step.action, provider: step.provider)) · \(step.model ?? "provider default") · \(step.effort) reasoning · REVAS \(step.revasDisposition) · \(nativeRecordReceipt(step)) · step \(step.sequence) · \(step.durationMS / 1_000)s · exit \(step.exitCode)",
                         provider: step.provider,
-                        permissionProfile: step.permissionProfile
+                        permissionProfile: step.permissionProfile,
+                        nativeRecordVerified: (step.nativeRecord?.isVerified ?? false) && step.revasDisposition == "adopted"
                     ))
                 }
                 sessions[target].updatedAt = Date()
-                statusText = "Native session linked · evidence recorded"
+                let allVerified = summary.steps.allSatisfy { $0.nativeRecord?.isVerified == true }
+                statusText = allVerified
+                    ? "Native record verified · evidence recorded"
+                    : "Native record unverified · check the receipt"
             } catch {
-                guard let target = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
-                sessions[target].messages.append(ChatMessage(
-                    role: .system,
-                    text: error.localizedDescription
-                ))
-                sessions[target].updatedAt = Date()
+                if let target = sessions.firstIndex(where: { $0.id == submission.sessionID }) {
+                    sessions[target].messages.append(ChatMessage(
+                        role: .system,
+                        text: error.localizedDescription
+                    ))
+                    sessions[target].updatedAt = Date()
+                }
                 statusText = "Needs attention"
             }
             isRunning = false
+            activeSessionID = nil
             pendingProvider = nil
             save()
+            runNextQueuedSubmissionIfNeeded()
         }
+    }
+
+    private func runNextQueuedSubmissionIfNeeded() {
+        guard !isRunning, !queuedSubmissions.isEmpty else { return }
+        let next = queuedSubmissions.removeFirst()
+        guard sessions.contains(where: { $0.id == next.sessionID }) else {
+            runNextQueuedSubmissionIfNeeded()
+            return
+        }
+        start(next)
     }
 
     private func title(for request: String) -> String {
@@ -1060,14 +1945,25 @@ private final class SessionStore: ObservableObject {
         return String(firstLine.prefix(48))
     }
 
-    private func handoffContext(for session: ConversationSession, nextProvider: ProviderChoice) -> String {
+    private func handoffContext(
+        for session: ConversationSession,
+        nextProvider: ProviderChoice,
+        before userMessageID: UUID? = nil
+    ) -> String {
         guard !session.messages.isEmpty else { return "" }
         if nextProvider != .auto, session.lastProvider == nextProvider.rawValue { return "" }
-        let relevant = session.messages.filter { $0.role == .user || $0.role == .assistant }.suffix(16)
+        let boundedMessages: ArraySlice<ChatMessage>
+        if let userMessageID,
+           let messageIndex = session.messages.firstIndex(where: { $0.id == userMessageID }) {
+            boundedMessages = session.messages[..<messageIndex]
+        } else {
+            boundedMessages = session.messages[...]
+        }
+        let relevant = boundedMessages.filter { $0.role == .user || $0.role == .assistant }.suffix(16)
         let text = relevant.map { message in
             let speaker = message.role == .user
                 ? "USER"
-                : (message.provider?.uppercased() ?? "ASSISTANT")
+                : providerDisplayName(message.provider)
             return "\(speaker):\n\(String(message.text.prefix(12_000)))"
         }.joined(separator: "\n\n")
         return String(text.suffix(180_000))
@@ -1112,7 +2008,8 @@ private final class SessionStore: ObservableObject {
                         text: String(message.text.prefix(120_000)),
                         provider: message.provider,
                         permissionProfile: message.permissionProfile,
-                        timestamp: message.timestamp
+                        timestamp: message.timestamp,
+                        nativeRecordVerified: message.nativeRecordVerified
                     )
                 }
                 return copy
@@ -1137,6 +2034,67 @@ private enum Theme {
     static let pink = Color(red: 0.93, green: 0.70, blue: 0.80)
     static let pinkDeep = Color(red: 0.22, green: 0.10, blue: 0.16)
     static let green = Color(red: 0.28, green: 0.93, blue: 0.55)
+    static let radiusShell: CGFloat = 22
+    static let radiusPanel: CGFloat = 18
+    static let radiusControl: CGFloat = 13
+    static let radiusMessage: CGFloat = 16
+    static let radiusComposer: CGFloat = 22
+}
+
+private struct OmarAGILogo: View {
+    let size: CGFloat
+
+    var body: some View {
+        Group {
+            if let url = Bundle.main.url(forResource: "OmarAGI", withExtension: "png"),
+               let image = NSImage(contentsOf: url) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .antialiased(true)
+                    .scaledToFit()
+            } else {
+                ZStack {
+                    Circle().stroke(Theme.pink, lineWidth: max(4, size * 0.18))
+                    Circle().fill(Color.white.opacity(0.94)).frame(width: max(4, size * 0.12))
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .contentShape(Circle())
+    }
+}
+
+private struct ProviderBrandIcon: View {
+    let provider: ProviderChoice
+    let size: CGFloat
+    var filled = true
+
+    private var resourceName: String {
+        provider == .claude ? "ClaudeCode" : "Codex"
+    }
+
+    var body: some View {
+        Group {
+            if let url = Bundle.main.url(forResource: resourceName, withExtension: "png"),
+               let image = NSImage(contentsOf: url) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .antialiased(true)
+                    .scaledToFit()
+            } else {
+                Image(systemName: provider == .claude ? "sun.max.fill" : "chevron.left.forwardslash.chevron.right")
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(provider.tint)
+                    .padding(size * 0.2)
+            }
+        }
+        .frame(width: size, height: size)
+        .opacity(filled ? 1 : 0.96)
+        .accessibilityHidden(true)
+    }
 }
 
 @main
@@ -1147,7 +2105,7 @@ private struct OS1DesktopApp: App {
         if CommandLine.arguments.contains("--self-test") {
             do {
                 try providerIntentSelfTest()
-                print("OS-1 app provider intent and native dispatch self-test: OK")
+                print("OS-1 app provider intent, native dispatch, and voice dictation self-test: OK")
                 exit(EXIT_SUCCESS)
             } catch {
                 fputs("\(error.localizedDescription)\n", stderr)
@@ -1169,6 +2127,18 @@ private struct OS1DesktopApp: App {
                 Button("New session pair") { store.createSession() }
                     .keyboardShortcut("n", modifiers: [.command])
             }
+            CommandMenu("Voice") {
+                Button(store.voiceDictation.isActive ? "Finish Dictation" : "Start Dictation") {
+                    store.toggleVoiceDictation()
+                }
+                .keyboardShortcut(.space, modifiers: [.command, .shift])
+
+                Button("Cancel Dictation") {
+                    _ = store.cancelVoiceDictation()
+                }
+                .keyboardShortcut(.escape, modifiers: [])
+                .disabled(!store.voiceDictation.isActive)
+            }
         }
     }
 }
@@ -1177,25 +2147,20 @@ private struct RootView: View {
     @ObservedObject var store: SessionStore
 
     var body: some View {
-        ZStack {
-            CosmicBackdrop()
-            HStack(spacing: 0) {
-                ProviderRail(store: store)
+        HStack(spacing: 0) {
+            ProviderRail(store: store)
+            Rectangle().fill(Theme.border).frame(width: 1)
+            if store.surface == .auto {
+                SessionSidebar(store: store)
                 Rectangle().fill(Theme.border).frame(width: 1)
-                if store.surface == .auto {
-                    SessionSidebar(store: store)
-                    Rectangle().fill(Theme.border).frame(width: 1)
-                    ConversationView(store: store)
-                } else {
-                    NativeSessionBrowser(store: store, provider: store.surface)
-                }
+                ConversationView(store: store)
+            } else {
+                NativeSessionBrowser(store: store, provider: store.surface)
             }
-            .background(Theme.background.opacity(0.97))
-            .overlay(Rectangle().stroke(Theme.borderStrong, lineWidth: 1))
-            .padding(12)
         }
-        .frame(minWidth: 1_100, minHeight: 680)
+        .frame(minWidth: 1_100, maxWidth: .infinity, minHeight: 680, maxHeight: .infinity)
         .background(Theme.background)
+        .ignoresSafeArea()
         .alert("OS-1 Claudex", isPresented: Binding(
             get: { store.alertMessage != nil },
             set: { if !$0 { store.alertMessage = nil } }
@@ -1207,60 +2172,15 @@ private struct RootView: View {
     }
 }
 
-private struct CosmicBackdrop: View {
-    var body: some View {
-        Canvas { context, size in
-            let width = max(size.width, 1)
-            let height = max(size.height, 1)
-            for index in 0..<82 {
-                let x = CGFloat((index * 83 + 17) % 997) / 997 * width
-                let y = CGFloat((index * 47 + 31) % 991) / 991 * height
-                let diameter = CGFloat(index % 4 == 0 ? 1.4 : 0.8)
-                let tint = index % 5 == 0 ? Theme.pink : Color.white
-                context.fill(
-                    Path(ellipseIn: CGRect(x: x, y: y, width: diameter, height: diameter)),
-                    with: .color(tint.opacity(index % 5 == 0 ? 0.16 : 0.10))
-                )
-            }
-            for index in stride(from: 0, to: 28, by: 4) {
-                var path = Path()
-                let start = CGPoint(
-                    x: CGFloat((index * 97 + 23) % 997) / 997 * width,
-                    y: CGFloat((index * 61 + 19) % 991) / 991 * height
-                )
-                let end = CGPoint(
-                    x: min(width, start.x + CGFloat(90 + index * 7)),
-                    y: min(height, start.y + CGFloat(42 + index * 3))
-                )
-                path.move(to: start)
-                path.addLine(to: end)
-                context.stroke(path, with: .color(Theme.pink.opacity(0.035)), lineWidth: 0.6)
-            }
-        }
-        .background(Color.black)
-        .allowsHitTesting(false)
-    }
-}
-
 private struct ProviderRail: View {
     @ObservedObject var store: SessionStore
 
     var body: some View {
         VStack(spacing: 22) {
             Button { store.showClaudexHome() } label: {
-                ZStack {
-                    Circle()
-                        .fill(AngularGradient(
-                            colors: [Theme.pink, .pink, .red, Theme.pink],
-                            center: .center
-                        ))
-                    Circle().fill(Theme.background).padding(8)
-                    Circle().fill(Color.white.opacity(0.94)).frame(width: 6, height: 6)
-                }
-                .frame(width: 43, height: 43)
+                OmarAGILogo(size: 48)
             }
             .buttonStyle(.plain)
-            .disabled(store.isRunning)
             .help("Claudex home")
             .accessibilityLabel("Claudex home")
             .padding(.bottom, 8)
@@ -1273,7 +2193,7 @@ private struct ProviderRail: View {
                     linked: provider == .codex
                         ? store.selectedSession?.codexSessionID != nil
                         : store.selectedSession?.claudeSessionID != nil,
-                    disabled: store.isRunning
+                    disabled: false
                 ) { store.inspectBackend(provider) }
             }
 
@@ -1306,12 +2226,7 @@ private struct BackendStatus: View {
     var body: some View {
         Button(action: action) {
             VStack(spacing: 9) {
-                Image(systemName: provider.symbol)
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(selected ? Color.black.opacity(0.82) : provider.tint)
-                    .frame(width: 27, height: 27)
-                    .background(selected ? provider.tint : provider.tint.opacity(0.16))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                ProviderBrandIcon(provider: provider, size: 28)
                 Text(provider == .claude ? "CLAUDE" : "CODEX")
                     .font(.system(size: 7, weight: .bold, design: .rounded))
                     .tracking(1.1)
@@ -1327,9 +2242,10 @@ private struct BackendStatus: View {
             .frame(width: 58, height: 80)
             .background(linked ? provider.tint.opacity(selected ? 0.13 : (active ? 0.08 : 0.025)) : Color.black.opacity(0.25))
             .overlay(
-                Rectangle()
+                RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
                     .stroke(linked ? provider.tint.opacity(selected || active ? 0.75 : 0.25) : Theme.border, lineWidth: selected ? 1.3 : 1)
             )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
         }
         .buttonStyle(.plain)
         .disabled(disabled)
@@ -1384,7 +2300,11 @@ private struct NativeSessionBrowser: View {
                 .padding(.horizontal, 16)
                 .frame(height: 48)
                 .background(Color.black.opacity(0.24))
-                .overlay(Rectangle().stroke(Theme.borderStrong))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                        .stroke(Theme.borderStrong)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
                 .padding(.horizontal, 20)
                 .padding(.bottom, 16)
 
@@ -1576,7 +2496,11 @@ private struct NativeMessageCard: View {
             if message.role == .user { Spacer(minLength: 100) }
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 7) {
-                    Image(systemName: message.role == .user ? "person.crop.circle.fill" : provider.symbol)
+                    if message.role == .user {
+                        Image(systemName: "person.crop.circle.fill")
+                    } else {
+                        ProviderBrandIcon(provider: provider, size: 14, filled: false)
+                    }
                     Text(message.role == .user ? "YOU" : (provider == .claude ? "CLAUDE CODE" : "CODEX"))
                     Spacer()
                     if let timestamp = message.timestamp {
@@ -1594,9 +2518,10 @@ private struct NativeMessageCard: View {
             .padding(16)
             .background(message.role == .user ? Color.black.opacity(0.5) : provider.tint.opacity(0.025))
             .overlay(
-                Rectangle()
+                RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous)
                     .stroke(message.role == .user ? Theme.borderStrong : provider.tint.opacity(0.18))
             )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous))
             if message.role != .user { Spacer(minLength: 60) }
         }
     }
@@ -1611,8 +2536,7 @@ private struct RailButton: View {
     var body: some View {
         Button(action: action) {
             VStack(spacing: 7) {
-                Image(systemName: provider.symbol)
-                    .font(.system(size: 17, weight: .semibold))
+                ProviderBrandIcon(provider: provider, size: 24)
                 Text(provider.title.uppercased())
                     .font(.system(size: 8, weight: .bold, design: .rounded))
             }
@@ -1655,7 +2579,11 @@ private struct SessionSidebar: View {
                     .padding(.horizontal, 16)
                     .frame(height: 54)
                     .background(Color.black.opacity(0.24))
-                    .overlay(Rectangle().stroke(Theme.borderStrong))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                            .stroke(Theme.borderStrong)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 20)
@@ -1668,7 +2596,11 @@ private struct SessionSidebar: View {
             .padding(.horizontal, 16)
             .frame(height: 48)
             .background(Color.black.opacity(0.24))
-            .overlay(Rectangle().stroke(Theme.borderStrong))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                    .stroke(Theme.borderStrong)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
             .padding(.horizontal, 20)
             .padding(.top, 12)
 
@@ -1769,7 +2701,11 @@ private struct ConversationView: View {
                 if session.messages.isEmpty {
                     WelcomeView(store: store, session: session)
                 } else {
-                    MessageTimeline(session: session, isRunning: store.isRunning)
+                    MessageTimeline(
+                        session: session,
+                        isRunning: store.isSessionRunning(session.id),
+                        queuedSubmissions: store.queuedSubmissions.filter { $0.sessionID == session.id }
+                    )
                 }
                 ComposerView(store: store, session: session)
             }
@@ -1781,10 +2717,20 @@ private struct ConversationView: View {
 private struct ConversationHeader: View {
     @ObservedObject var store: SessionStore
 
+    private var providerLabel: String {
+        let value: String
+        if store.activeSessionID == store.selectedSessionID {
+            value = store.pendingProvider?.rawValue ?? store.selectedSession?.lastProvider ?? "RCC"
+        } else {
+            value = store.selectedSession?.lastProvider ?? "RCC"
+        }
+        return providerDisplayName(value)
+    }
+
     var body: some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("\((store.pendingProvider?.rawValue ?? store.selectedSession?.lastProvider ?? "RCC").uppercased()) · \(store.selectedSession?.title ?? "OS-1 CLAUDEX")")
+                Text("\(providerLabel) · \(store.selectedSession?.title ?? "OS-1 CLAUDEX")")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
@@ -1824,7 +2770,11 @@ private struct ConversationHeader: View {
                     Divider()
                     Button("Inspect Codex backend") { store.inspectBackend(.codex) }
                         .disabled(session.codexSessionID == nil)
+                    Button("Open in Codex Desktop") { store.openInCodexDesktop() }
+                        .disabled(session.codexSessionID == nil)
                     Button("Inspect Claude backend") { store.inspectBackend(.claude) }
+                        .disabled(session.claudeSessionID == nil)
+                    Button("Open in Claude Desktop") { store.openInClaudeDesktop() }
                         .disabled(session.claudeSessionID == nil)
                 } label: {
                     Label(
@@ -1838,7 +2788,11 @@ private struct ConversationHeader: View {
                     .padding(.horizontal, 10)
                     .frame(height: 35)
                     .background(Color.black.opacity(0.3))
-                    .overlay(Rectangle().stroke(Theme.border))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                            .stroke(Theme.border)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
@@ -1855,7 +2809,11 @@ private struct ConversationHeader: View {
                     .padding(.horizontal, 11)
                     .frame(height: 35)
                     .background(Color.black.opacity(0.3))
-                    .overlay(Rectangle().stroke(Theme.border))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                            .stroke(Theme.border)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .disabled(store.isRunning)
@@ -1926,7 +2884,11 @@ private struct WelcomeView: View {
                             .padding(.horizontal, 14)
                             .frame(height: 46)
                             .background(Color.black.opacity(0.3))
-                            .overlay(Rectangle().stroke(Theme.border))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous)
+                                    .stroke(Theme.border)
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusControl, style: .continuous))
                         }
                         .buttonStyle(.plain)
                     }
@@ -1961,13 +2923,18 @@ private struct WelcomeStep: View {
         .padding(14)
         .frame(maxWidth: .infinity, minHeight: 108, alignment: .topLeading)
         .background(Color.black.opacity(0.3))
-        .overlay(Rectangle().stroke(Theme.border))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.radiusPanel, style: .continuous)
+                .stroke(Theme.border)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: Theme.radiusPanel, style: .continuous))
     }
 }
 
 private struct MessageTimeline: View {
     let session: ConversationSession
     let isRunning: Bool
+    let queuedSubmissions: [PendingSubmission]
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -1976,12 +2943,44 @@ private struct MessageTimeline: View {
                     ForEach(session.messages) { message in
                         MessageView(message: message).id(message.id)
                     }
+                    ForEach(queuedSubmissions) { submission in
+                        HStack {
+                            Spacer(minLength: 100)
+                            VStack(alignment: .trailing, spacing: 7) {
+                                Text(submission.request)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(Theme.text.opacity(0.72))
+                                    .multilineTextAlignment(.trailing)
+                                Label("QUEUED", systemImage: "text.line.last.and.arrowtriangle.forward")
+                                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                                    .foregroundStyle(Theme.pink)
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 13)
+                            .background(Theme.panelRaised.opacity(0.72))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous)
+                                    .stroke(Theme.pink.opacity(0.24))
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous))
+                        }
+                        .id(submission.id)
+                    }
                     if isRunning {
                         HStack(spacing: 10) {
                             ProgressView().controlSize(.small)
                             Text("Working in \(session.workspace)…")
                                 .font(.system(size: 12))
                                 .foregroundStyle(Theme.muted)
+                            if !queuedSubmissions.isEmpty {
+                                Text("\(queuedSubmissions.count) queued")
+                                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                                    .foregroundStyle(Theme.pink)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 5)
+                                    .background(Theme.pinkDeep)
+                                    .clipShape(Capsule())
+                            }
                             Spacer()
                         }
                         .padding(.vertical, 12)
@@ -2020,24 +3019,34 @@ private struct MessageView: View {
                     .padding(.horizontal, 18)
                     .padding(.vertical, 16)
                     .background(Color.black.opacity(0.28))
-                    .overlay(Rectangle().stroke(Theme.borderStrong))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous)
+                            .stroke(Theme.borderStrong)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous))
             }
         case .assistant:
             VStack(alignment: .leading, spacing: 9) {
                 HStack(spacing: 7) {
-                    Image(systemName: message.provider == "claude"
-                        ? ProviderChoice.claude.symbol
-                        : ProviderChoice.codex.symbol)
-                    Text((message.provider ?? "OS-1").uppercased())
+                    if message.provider == "local" {
+                        OmarAGILogo(size: 14)
+                    } else {
+                        ProviderBrandIcon(
+                            provider: message.provider == "claude" ? .claude : .codex,
+                            size: 14,
+                            filled: false
+                        )
+                    }
+                    Text(providerDisplayName(message.provider))
                     if let permission = message.permissionProfile {
                         Text("· \(permission.replacingOccurrences(of: "_", with: " "))")
                             .foregroundStyle(Theme.muted)
                     }
                 }
                 .font(.system(size: 10, weight: .bold, design: .rounded))
-                .foregroundStyle(message.provider == "claude"
-                    ? ProviderChoice.claude.tint
-                    : ProviderChoice.codex.tint)
+                .foregroundStyle(message.provider == "local"
+                    ? Theme.green
+                    : (message.provider == "claude" ? ProviderChoice.claude.tint : ProviderChoice.codex.tint))
                 Text(message.text)
                     .font(.system(size: 13))
                     .foregroundStyle(Theme.text)
@@ -2053,10 +3062,12 @@ private struct MessageView: View {
                         .tracking(1.3)
                         .foregroundStyle(Theme.pink)
                     Spacer()
-                    Text("VERIFIED")
+                    // Receipts saved before native-record verification existed
+                    // carry no flag and keep their historical label.
+                    Text(message.nativeRecordVerified == false ? "UNVERIFIED" : "VERIFIED")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
                         .tracking(1.1)
-                        .foregroundStyle(Theme.green)
+                        .foregroundStyle(message.nativeRecordVerified == false ? Theme.pink : Theme.green)
                 }
                 Text(message.text)
                     .font(.system(size: 10, design: .monospaced))
@@ -2066,7 +3077,11 @@ private struct MessageView: View {
             .padding(16)
             .frame(maxWidth: .infinity, minHeight: 70, alignment: .leading)
             .background(Color.black.opacity(0.36))
-            .overlay(Rectangle().stroke(Theme.borderStrong))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous)
+                    .stroke(Theme.borderStrong)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusMessage, style: .continuous))
         case .system:
             HStack(spacing: 8) {
                 Image(systemName: "diamond")
@@ -2086,23 +3101,187 @@ private struct MessageView: View {
     }
 }
 
+/// Keeps SwiftUI's native focus, accessibility, undo, and IME behavior while
+/// applying Codex's Return-to-send convention only to the focused composer.
+@MainActor
+private final class ComposerKeyMonitor: ObservableObject {
+    var isFocused = false
+    var submit: (() -> Void)?
+    var cancelVoice: (() -> Bool)?
+    private var eventMonitor: Any?
+
+    func start() {
+        guard eventMonitor == nil else { return }
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.isFocused else { return event }
+            if event.keyCode == 53, self.cancelVoice?() == true {
+                return nil
+            }
+            let isReturn = event.keyCode == 36 || event.keyCode == 76
+            guard isReturn,
+                  composerReturnAction(shiftPressed: event.modifierFlags.contains(.shift)) == .send else {
+                return event
+            }
+            if let textView = NSApp.keyWindow?.firstResponder as? NSTextView,
+               textView.hasMarkedText() {
+                return event
+            }
+            self.submit?()
+            return nil
+        }
+    }
+
+    func stop() {
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+        eventMonitor = nil
+    }
+
+}
+
+private struct ClaudexComposerEditor: View {
+    @Binding var text: String
+    let onSubmit: () -> Void
+    let onCancelVoice: () -> Bool
+    @StateObject private var keyMonitor = ComposerKeyMonitor()
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        TextEditor(text: $text)
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(Theme.text)
+            .scrollContentBackground(.hidden)
+            .focused($isFocused)
+            .onAppear {
+                keyMonitor.submit = onSubmit
+                keyMonitor.cancelVoice = onCancelVoice
+                isFocused = true
+                keyMonitor.isFocused = true
+                keyMonitor.start()
+            }
+            .onChange(of: isFocused) { focused in
+                keyMonitor.isFocused = focused
+            }
+            .onDisappear {
+                keyMonitor.isFocused = false
+                keyMonitor.stop()
+            }
+    }
+}
+
+private struct VoiceWaveform: View {
+    let level: CGFloat
+
+    private let weights: [CGFloat] = [0.44, 0.72, 1, 0.62, 0.86]
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 3) {
+            ForEach(Array(weights.enumerated()), id: \.offset) { _, weight in
+                Capsule()
+                    .fill(Theme.pink)
+                    .frame(width: 3, height: 6 + (max(0.12, level) * 17 * weight))
+            }
+        }
+        .frame(width: 28, height: 28)
+        .animation(.easeOut(duration: 0.09), value: level)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct VoiceDictationControl: View {
+    @ObservedObject var controller: VoiceDictationController
+    let start: () -> Void
+    let finish: () -> Void
+    let cancel: () -> Void
+
+    var body: some View {
+        Group {
+            if controller.isActive {
+                HStack(spacing: 6) {
+                    Button(action: cancel) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                            .frame(width: 30, height: 30)
+                            .foregroundStyle(Theme.muted)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Cancel and restore the previous text (Esc)")
+                    .accessibilityLabel("Cancel voice input")
+
+                    if controller.isAuthorizing || controller.isFinalizing {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(Theme.pink)
+                            .frame(width: 28, height: 28)
+                    } else {
+                        VoiceWaveform(level: controller.level)
+                    }
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(controller.statusLabel)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Theme.text)
+                        Text("\(controller.engineLabel) · \(controller.elapsedLabel)")
+                            .font(.system(size: 9, weight: .medium, design: .rounded))
+                            .foregroundStyle(Theme.muted)
+                            .fixedSize()
+                    }
+                    .frame(minWidth: 52, alignment: .leading)
+
+                    Button(action: finish) {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(Color.black.opacity(0.86))
+                            .frame(width: 32, height: 32)
+                            .background(Theme.pink)
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(controller.isFinalizing)
+                    .help("Use this transcript")
+                    .accessibilityLabel("Finish voice input")
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
+                .background(Theme.panelRaised)
+                .overlay(
+                    Capsule().stroke(Theme.pink.opacity(0.56), lineWidth: 1)
+                )
+                .clipShape(Capsule())
+                .transition(.opacity.combined(with: .scale(scale: 0.94)))
+            } else {
+                Button(action: start) {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                        .frame(width: 44, height: 44)
+                        .background(Theme.panelRaised)
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(Theme.borderStrong))
+                }
+                .buttonStyle(.plain)
+                .help("Dictate task (⌘⇧Space)")
+                .accessibilityLabel("Start voice input")
+            }
+        }
+        .animation(.easeInOut(duration: 0.16), value: controller.isActive)
+    }
+}
+
 private struct ComposerView: View {
     @ObservedObject var store: SessionStore
     let session: ConversationSession
-    @FocusState private var focused: Bool
 
     var body: some View {
         VStack(spacing: 10) {
             HStack(alignment: .bottom, spacing: 12) {
-                TextEditor(text: $store.composer)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(Theme.text)
-                    .scrollContentBackground(.hidden)
-                    .focused($focused)
+                ClaudexComposerEditor(
+                    text: $store.composer,
+                    onSubmit: store.send,
+                    onCancelVoice: store.cancelVoiceDictation
+                )
                     .frame(minHeight: 70, maxHeight: 130)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
-                    .disabled(store.isRunning)
                     .overlay(alignment: .topLeading) {
                         if store.composer.isEmpty {
                             Text("Route a governed task through OS-1…")
@@ -2114,8 +3293,15 @@ private struct ComposerView: View {
                         }
                     }
 
+                VoiceDictationControl(
+                    controller: store.voiceDictation,
+                    start: store.toggleVoiceDictation,
+                    finish: store.finishVoiceDictation,
+                    cancel: { _ = store.cancelVoiceDictation() }
+                )
+
                 Button { store.send() } label: {
-                    Image(systemName: store.isRunning ? "hourglass" : "arrow.up")
+                    Image(systemName: "arrow.up")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(Color.black.opacity(0.86))
                         .frame(width: 44, height: 44)
@@ -2123,12 +3309,17 @@ private struct ComposerView: View {
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .disabled(store.isRunning || store.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(store.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help(store.isRunning ? "Add this task to the queue" : "Send task")
             }
             .padding(12)
             .background(Color.black.opacity(0.5))
-            .overlay(Rectangle().stroke(Theme.borderStrong))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.radiusComposer, style: .continuous)
+                    .stroke(Theme.borderStrong)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: Theme.radiusComposer, style: .continuous))
+            .shadow(color: Color.black.opacity(0.32), radius: 16, y: 8)
 
             HStack {
                 Label(URL(fileURLWithPath: session.workspace).lastPathComponent, systemImage: "folder")
@@ -2140,8 +3331,21 @@ private struct ComposerView: View {
                 Text("Codex \(session.codexSessionID == nil ? "not linked" : "linked")")
                 Text("·")
                 Text("Claude \(session.claudeSessionID == nil ? "not linked" : "linked")")
+                if store.selectedSessionQueueCount > 0 {
+                    Text("·")
+                    Label("\(store.selectedSessionQueueCount) queued", systemImage: "text.line.last.and.arrowtriangle.forward")
+                        .foregroundStyle(Theme.pink)
+                }
+                if store.voiceDictation.isActive {
+                    Text("·")
+                    Label(
+                        "\(store.voiceDictation.statusLabel) · \(store.voiceDictation.engineLabel) · \(store.voiceDictation.elapsedLabel)",
+                        systemImage: "waveform"
+                    )
+                        .foregroundStyle(Theme.pink)
+                }
                 Spacer()
-                Text("⌘↩ send")
+                Text("⌘⇧Space dictate · Esc cancel · ↩ send · ⇧↩ newline")
             }
             .font(.system(size: 9, weight: .medium, design: .rounded))
             .foregroundStyle(Theme.muted)
@@ -2150,5 +3354,6 @@ private struct ComposerView: View {
         .padding(.top, 12)
         .padding(.bottom, 18)
         .background(Theme.background)
+        .onDisappear { store.stopVoiceDictation() }
     }
 }
